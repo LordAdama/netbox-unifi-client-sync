@@ -196,7 +196,7 @@ def test_metrics_file_written_when_configured(tmp_path):
 
 def test_stale_client_marked_offline():
     netbox = FakeNetboxGateway()
-    stale_device, _ = netbox.upsert_client_device(
+    stale_device, _, _ = netbox.upsert_client_device(
         "99:88:77:66:55:44", "old-laptop", "main", "unifi-client", "generic-network-client", "unifi-sync"
     )
     unifi = FakeUnifiClient(clients=[])  # UniFi no longer reports this client

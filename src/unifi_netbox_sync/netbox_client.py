@@ -25,9 +25,20 @@ class NetboxGateway(Protocol):
 
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool: ...
 
+    def find_site(self, site_slug: str) -> Any | None: ...
+
+    def ensure_site(self, site_slug: str, policy: str) -> tuple[Any, bool]: ...
+
     def upsert_client_device(
-        self, mac: str, name: str, site_slug: str, role_slug: str, device_type_slug: str, tag_slug: str
-    ) -> tuple[Any, bool]: ...
+        self,
+        mac: str,
+        name: str,
+        site_slug: str,
+        role_slug: str,
+        device_type_slug: str,
+        tag_slug: str,
+        update_policy: str = "sync",
+    ) -> tuple[Any, bool, bool]: ...
 
     def ensure_interface(self, device: Any, name: str, wired: bool) -> Any: ...
 
@@ -136,16 +147,52 @@ class PynetboxGateway:
     def list_synced_client_devices(self, tag_slug: str) -> list[Any]:
         return list(self.api.dcim.devices.filter(tag=tag_slug))
 
+    def find_site(self, site_slug: str) -> Any | None:
+        return self.api.dcim.sites.get(slug=site_slug)
+
     # -- mutations -----------------------------------------------------------
 
+    def ensure_site(self, site_slug: str, policy: str) -> tuple[Any, bool]:
+        """Resolve the NetBox site, honoring SITE_POLICY.
+
+        "create" makes a minimal site if missing; any other value (the
+        default, "require") raises. Either way, an *existing* site's
+        attributes are never modified — this only ever creates, never
+        updates.
+        """
+        site = self.find_site(site_slug)
+        if site is not None:
+            return site, False
+        if policy != "create":
+            raise LookupError(
+                f"NetBox site '{site_slug}' does not exist (SITE_POLICY={policy!r}); "
+                "set SITE_POLICY=create to let this tool create it, or create it yourself"
+            )
+        site = self.api.dcim.sites.create(
+            name=site_slug.replace("-", " ").title(), slug=site_slug, status="active"
+        )
+        logger.info("Created NetBox site %r (SITE_POLICY=create)", site_slug)
+        return site, True
+
     def upsert_client_device(
-        self, mac: str, name: str, site_slug: str, role_slug: str, device_type_slug: str, tag_slug: str
-    ) -> tuple[Any, bool]:
+        self,
+        mac: str,
+        name: str,
+        site_slug: str,
+        role_slug: str,
+        device_type_slug: str,
+        tag_slug: str,
+        update_policy: str = "sync",
+    ) -> tuple[Any, bool, bool]:
+        """Returns (device, created, update_skipped_by_policy)."""
         device = self.find_client_device_by_mac(mac)
         device_type = self.api.dcim.device_types.get(slug=device_type_slug)
         role = self.api.dcim.device_roles.get(slug=role_slug)
-        site = self.api.dcim.sites.get(slug=site_slug)
+        site = self.find_site(site_slug)
         if site is None:
+            # Defensive: SyncEngine.run() already resolves the site via
+            # ensure_site() before any client is synced, so this shouldn't
+            # be reachable in normal use.
             raise LookupError(f"NetBox site '{site_slug}' does not exist")
 
         if device is None:
@@ -158,7 +205,11 @@ class PynetboxGateway:
                 custom_fields={"unifi_mac": mac},
                 tags=[{"slug": tag_slug}],
             )
-            return device, True
+            return device, True, False
+
+        would_change = device.name != name or device.status.value != "active"
+        if update_policy == "create-only":
+            return device, False, would_change
 
         updated = False
         if device.name != name:
@@ -169,7 +220,7 @@ class PynetboxGateway:
             updated = True
         if updated:
             device.save()
-        return device, False
+        return device, False, False
 
     def ensure_interface(self, device: Any, name: str, wired: bool) -> Any:
         iface = self.api.dcim.interfaces.get(device_id=device.id, name=name)

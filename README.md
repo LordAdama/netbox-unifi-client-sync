@@ -205,6 +205,8 @@ full list and defaults. Key ones:
 | `UNIFI_SITE` | UniFi site name to sync (default `default`) |
 | `NETBOX_URL` / `NETBOX_TOKEN` | NetBox API endpoint and token |
 | `NETBOX_SITE_SLUG` | NetBox site clients should be placed in |
+| `SITE_POLICY` | `require` (default) or `create` — see "Site & update policies" |
+| `DEVICE_UPDATE_POLICY` | `sync` (default) or `create-only` — see "Site & update policies" |
 | `NETBOX_IP_STATUS` | Status set on IP addresses this tool creates (default `active`) |
 | `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order |
 | `CABLE_CONFLICT_POLICY` | `skip` (default, non-destructive) or `replace` when a target port is already cabled to something else |
@@ -215,6 +217,37 @@ full list and defaults. Key ones:
 | `SYNC_INTERVAL_SECONDS` | Docker only — `0`/unset runs once and exits, a positive number loops forever on that interval |
 | `LOCK_FILE` | Docker only, optional — `flock` path to avoid two instances racing on the same NetBox (see "Known limitations") |
 | `HEARTBEAT_FILE` | Docker only — path the healthcheck reads (default `/tmp/last-sync-ok`); override if `/tmp` is constrained in your setup |
+
+### Site & update policies
+
+Two independent, conservative-by-default policy knobs:
+
+- **`SITE_POLICY`** governs what happens if `NETBOX_SITE_SLUG` doesn't
+  exist. `require` (default) fails the run with a clear error — the safest
+  choice, since a typo'd slug shouldn't silently spawn a new site. `create`
+  creates a minimal site (name/slug/status only) if it's missing. Neither
+  setting ever modifies an *existing* site's attributes — this tool only
+  ever creates a site, never updates one.
+- **`DEVICE_UPDATE_POLICY`** governs what happens to a client device's
+  `name`/`status` on every run *after* it was first created. `sync`
+  (default) keeps them matched to what UniFi currently reports — the same
+  behavior as before this setting existed. `create-only` sets them once at
+  creation and leaves them alone from then on, so if you (or another admin)
+  rename a device or change its status by hand in NetBox, this tool won't
+  overwrite that on the next run. This only covers the device's name and
+  status; interfaces, IP addresses, and cables are still kept in sync
+  either way — that's the tool's actual purpose and isn't gated by this
+  setting.
+
+Both apply in dry-run too (as previews, not real writes), and every
+decision — site created vs. reused, an update skipped by policy — is
+logged and counted in the run summary (`site_created`,
+`devices_update_skipped`) for auditability.
+
+A single `NETBOX_SITE_SLUG` covers the common case (one UniFi site → one
+NetBox site). If you're syncing multiple UniFi sites into different NetBox
+sites, that needs a site-name mapping this version doesn't have — a
+natural next step if/when that's needed, not implemented here.
 
 ### NetBox compatibility
 
@@ -293,7 +326,11 @@ every push/PR.
 - `sync.py` — orchestrates the sync; all mutating NetBox calls are skipped
   in dry-run mode, with planned actions logged instead. Per-client errors
   are caught narrowly (see "Known limitations") so a real bug isn't masked
-  as a routine sync failure.
+  as a routine sync failure. `SITE_POLICY`/`DEVICE_UPDATE_POLICY` are
+  resolved here — `ensure_site()` runs once at the top of `run()` (not
+  per-client), and a `LookupError` from a `require`d missing site
+  propagates uncaught, failing the whole run immediately rather than once
+  per client.
 - `naming.py` — device-name sanitization and the deterministic
   MAC-suffix collision fallback.
 - `metrics.py` — the JSON run-summary log line and optional Prometheus

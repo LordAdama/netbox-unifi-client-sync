@@ -71,6 +71,7 @@ write_env() {
     printf '%s\n' "NETBOX_TOKEN=$8" >> .env
     printf '%s\n' "NETBOX_VERIFY_SSL=true" >> .env
     printf '%s\n' "NETBOX_SITE_SLUG=$9" >> .env
+    printf '%s\n' "SITE_POLICY=require" >> .env
     printf '%s\n' "NETBOX_IP_STATUS=active" >> .env
     printf '%s\n' "DRY_RUN=false" >> .env
     printf '%s\n' "LOG_LEVEL=INFO" >> .env
@@ -82,6 +83,7 @@ write_env() {
     printf '%s\n' "PORT_NAME_TEMPLATES={port},Port {port},GE{port},Gi{port}" >> .env
     printf '%s\n' "CABLE_CONFLICT_POLICY=skip" >> .env
     printf '%s\n' "MARK_STALE_OFFLINE=true" >> .env
+    printf '%s\n' "DEVICE_UPDATE_POLICY=sync" >> .env
     printf '%s\n' "METRICS_FILE=" >> .env
     printf '%s\n' "SYNC_INTERVAL_SECONDS=${10}" >> .env
     printf '%s\n' "LOCK_FILE=" >> .env

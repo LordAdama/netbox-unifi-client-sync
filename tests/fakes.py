@@ -40,6 +40,13 @@ class FakeDevice:
         self.interfaces: dict[str, FakeInterface] = {}
 
 
+class FakeSite:
+    def __init__(self, slug: str) -> None:
+        self.id = next(_id_counter)
+        self.slug = slug
+        self.name = slug
+
+
 class FakeNetboxGateway:
     """In-memory double for NetboxGateway used in unit tests."""
 
@@ -48,6 +55,10 @@ class FakeNetboxGateway:
         self.clients_by_mac: dict[str, FakeDevice] = {}
         self.cables: set[tuple[int, int]] = set()
         self.ensure_prerequisites_called = False
+        # By default a site "exists" for any slug a test uses; add a slug
+        # here to simulate it being absent until ensure_site() creates it.
+        self.missing_sites: set[str] = set()
+        self.created_sites: set[str] = set()
 
     def seed_switch(self, mac: str, name: str, ports: list[str]) -> FakeDevice:
         device = FakeDevice(name=name)
@@ -76,15 +87,32 @@ class FakeNetboxGateway:
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool:
         return any(device.name == name for other_mac, device in self.clients_by_mac.items() if other_mac != mac)
 
-    def upsert_client_device(self, mac, name, site_slug, role_slug, device_type_slug, tag_slug):
+    def find_site(self, site_slug: str):
+        if site_slug in self.missing_sites and site_slug not in self.created_sites:
+            return None
+        return FakeSite(site_slug)
+
+    def ensure_site(self, site_slug: str, policy: str):
+        site = self.find_site(site_slug)
+        if site is not None:
+            return site, False
+        if policy != "create":
+            raise LookupError(f"NetBox site '{site_slug}' does not exist (SITE_POLICY={policy!r})")
+        self.created_sites.add(site_slug)
+        return self.find_site(site_slug), True
+
+    def upsert_client_device(self, mac, name, site_slug, role_slug, device_type_slug, tag_slug, update_policy="sync"):
         existing = self.clients_by_mac.get(mac)
         if existing:
+            would_change = existing.name != name
+            if update_policy == "create-only":
+                return existing, False, would_change
             existing.name = name
-            return existing, False
+            return existing, False, False
         device = FakeDevice(name=name, mac=mac)
         device.tags.append(tag_slug)
         self.clients_by_mac[mac] = device
-        return device, True
+        return device, True, False
 
     def ensure_interface(self, device: FakeDevice, name: str, wired: bool):
         iface = device.interfaces.get(name)

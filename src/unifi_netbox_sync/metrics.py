@@ -13,9 +13,11 @@ _HELP_TEXT = {
     "clients_seen": "Number of UniFi clients seen in the last sync run",
     "devices_created": "NetBox client devices created in the last sync run",
     "devices_updated": "NetBox client devices updated in the last sync run",
+    "devices_update_skipped": "NetBox client device updates skipped by DEVICE_UPDATE_POLICY in the last sync run",
     "cables_created": "NetBox cables created in the last sync run",
     "cables_skipped": "NetBox cables skipped (conflict or no match) in the last sync run",
     "stale_marked_offline": "NetBox client devices marked offline in the last sync run",
+    "site_created": "Whether the last sync run created the NetBox site (SITE_POLICY=create)",
     "errors": "Errors encountered in the last sync run",
     "duration_seconds": "Wall-clock duration of the last sync run, in seconds",
 }
@@ -26,9 +28,11 @@ def summary_as_dict(summary: SyncSummary) -> dict:
         "clients_seen": summary.clients_seen,
         "devices_created": summary.devices_created,
         "devices_updated": summary.devices_updated,
+        "devices_update_skipped": summary.devices_update_skipped,
         "cables_created": summary.cables_created,
         "cables_skipped": summary.cables_skipped,
         "stale_marked_offline": summary.stale_marked_offline,
+        "site_created": int(summary.site_created),
         "errors": len(summary.errors or []),
         "duration_seconds": round(summary.duration_seconds, 3),
     }

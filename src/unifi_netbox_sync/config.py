@@ -37,6 +37,17 @@ class Settings:
     cable_conflict_policy: str = "skip"
     mark_stale_offline: bool = True
     metrics_file: str | None = None
+    # "require" (default, safe): fail if netbox_site_slug doesn't already
+    # exist. "create": create a minimal site if missing; an existing site's
+    # attributes are never modified either way. Any other value behaves as
+    # "require", matching cable_conflict_policy's fail-safe-default style.
+    site_policy: str = "require"
+    # "sync" (default): keep an existing client device's name/status in
+    # sync with UniFi. "create-only": set them once at creation and never
+    # touch them again, so a NetBox admin's manual edits stick. Interfaces,
+    # IPs, and cables are unaffected by this — it only governs the device's
+    # name/status fields. Any other value behaves as "sync".
+    device_update_policy: str = "sync"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -83,4 +94,6 @@ class Settings:
             cable_conflict_policy=os.environ.get("CABLE_CONFLICT_POLICY", "skip"),
             mark_stale_offline=_bool(os.environ.get("MARK_STALE_OFFLINE", "true")),
             metrics_file=os.environ.get("METRICS_FILE") or None,
+            site_policy=os.environ.get("SITE_POLICY", "require"),
+            device_update_policy=os.environ.get("DEVICE_UPDATE_POLICY", "sync"),
         )

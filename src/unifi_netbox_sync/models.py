@@ -44,6 +44,7 @@ class ClientSyncResult:
     ip_assigned: bool = False
     cable_created: bool = False
     cable_skipped_reason: str | None = None
+    device_update_skipped_reason: str | None = None
     error: str | None = None
 
 
@@ -52,9 +53,11 @@ class SyncSummary:
     clients_seen: int = 0
     devices_created: int = 0
     devices_updated: int = 0
+    devices_update_skipped: int = 0
     cables_created: int = 0
     cables_skipped: int = 0
     stale_marked_offline: int = 0
+    site_created: bool = False
     duration_seconds: float = 0.0
     errors: list[str] | None = None
     client_results: list[ClientSyncResult] | None = None
