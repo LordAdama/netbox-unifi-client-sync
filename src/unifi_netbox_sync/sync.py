@@ -54,7 +54,19 @@ class SyncEngine:
         summary = SyncSummary()
         s = self.settings
 
+        logger.info(
+            "Policies: site=%s, device_update=%s, cable_conflict=%s",
+            s.site_policy,
+            s.device_update_policy,
+            s.cable_conflict_policy,
+        )
+
         if not s.dry_run:
+            _site, site_created = self.netbox.ensure_site(s.netbox_site_slug, s.site_policy)
+            summary.site_created = site_created
+            logger.info(
+                "NetBox site '%s': %s", s.netbox_site_slug, "created" if site_created else "reused existing"
+            )
             self.netbox.ensure_prerequisites(
                 s.client_device_role_slug,
                 s.client_manufacturer_slug,
@@ -62,6 +74,18 @@ class SyncEngine:
                 s.sync_tag,
             )
         else:
+            existing_site = self.netbox.find_site(s.netbox_site_slug)
+            if existing_site is None:
+                if s.site_policy == "create":
+                    summary.site_created = True
+                    logger.info("[dry-run] would create NetBox site '%s' (SITE_POLICY=create)", s.netbox_site_slug)
+                else:
+                    logger.warning(
+                        "[dry-run] NetBox site '%s' does not exist and SITE_POLICY=%s; "
+                        "a real run would fail here",
+                        s.netbox_site_slug,
+                        s.site_policy,
+                    )
             logger.info("[dry-run] would ensure NetBox tag/custom-field/role/device-type exist")
 
         clients = self.unifi.get_clients(s.unifi_site)
@@ -79,6 +103,8 @@ class SyncEngine:
                 summary.devices_created += 1
             elif result.device_updated:
                 summary.devices_updated += 1
+            elif result.device_update_skipped_reason:
+                summary.devices_update_skipped += 1
             if result.cable_created:
                 summary.cables_created += 1
             elif result.cable_skipped_reason:
@@ -91,11 +117,12 @@ class SyncEngine:
 
         summary.duration_seconds = time.monotonic() - start
         logger.info(
-            "Sync complete: %d clients, %d created, %d updated, %d cables created, "
-            "%d cables skipped, %d marked offline, %d errors, %.1fs",
+            "Sync complete: %d clients, %d created, %d updated, %d update-skipped (policy), "
+            "%d cables created, %d cables skipped, %d marked offline, %d errors, %.1fs",
             summary.clients_seen,
             summary.devices_created,
             summary.devices_updated,
+            summary.devices_update_skipped,
             summary.cables_created,
             summary.cables_skipped,
             summary.stale_marked_offline,
@@ -135,16 +162,26 @@ class SyncEngine:
                 self._plan_client(client, iface_name, result)
                 return result
 
-            device, created = self.netbox.upsert_client_device(
+            device, created, update_skipped = self.netbox.upsert_client_device(
                 client.mac,
                 device_name,
                 s.netbox_site_slug,
                 s.client_device_role_slug,
                 s.client_device_type_slug,
                 s.sync_tag,
+                s.device_update_policy,
             )
             result.device_created = created
-            result.device_updated = not created
+            result.device_updated = not created and not update_skipped
+            if update_skipped:
+                result.device_update_skipped_reason = (
+                    f"DEVICE_UPDATE_POLICY={s.device_update_policy!r}: existing device left as-is"
+                )
+                logger.info(
+                    "Not updating existing device for %s (DEVICE_UPDATE_POLICY=%s)",
+                    client.mac,
+                    s.device_update_policy,
+                )
 
             iface = self.netbox.ensure_interface(device, iface_name, client.is_wired)
 
@@ -161,7 +198,12 @@ class SyncEngine:
     def _plan_client(self, client: UnifiClient, iface_name: str, result: ClientSyncResult) -> None:
         existing = self.netbox.find_client_device_by_mac(client.mac)
         result.device_created = existing is None
-        result.device_updated = existing is not None
+        if existing is not None and self.settings.device_update_policy == "create-only":
+            result.device_update_skipped_reason = (
+                f"DEVICE_UPDATE_POLICY={self.settings.device_update_policy!r}: existing device left as-is"
+            )
+        else:
+            result.device_updated = existing is not None
         if client.is_wired and client.switch_mac and client.switch_port:
             switch_device = self.netbox.find_switch_device_by_mac(client.switch_mac)
             if switch_device is None:
