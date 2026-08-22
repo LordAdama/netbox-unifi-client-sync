@@ -73,6 +73,9 @@ class FakeNetboxGateway:
     def find_client_device_by_mac(self, mac: str):
         return self.clients_by_mac.get(mac)
 
+    def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool:
+        return any(device.name == name for other_mac, device in self.clients_by_mac.items() if other_mac != mac)
+
     def upsert_client_device(self, mac, name, site_slug, role_slug, device_type_slug, tag_slug):
         existing = self.clients_by_mac.get(mac)
         if existing:

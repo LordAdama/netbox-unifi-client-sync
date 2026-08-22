@@ -1,5 +1,7 @@
 # netbox-unifi-client-sync
 
+[![Tests](https://github.com/LordAdama/netbox-unifi-client-sync/actions/workflows/tests.yml/badge.svg)](https://github.com/LordAdama/netbox-unifi-client-sync/actions/workflows/tests.yml)
+
 Syncs client devices and their switch-port cable connections from a
 [Ubiquiti UniFi Network Controller](https://ui.com) into
 [NetBox](https://netboxlabs.com/), so NetBox stays an accurate source of
@@ -10,7 +12,12 @@ truth for what's actually plugged into the network.
 For every active client the UniFi controller reports:
 
 - Creates or updates a NetBox device (role `unifi-client` by default) with
-  an interface (`eth0` for wired, `wlan0` for wireless).
+  an interface (`eth0` for wired, `wlan0` for wireless). The device name is
+  sanitized (control characters stripped, truncated to NetBox's 64-char
+  limit) and, if it collides with a *different* device already using that
+  name in the same NetBox site, disambiguated by appending the last 4 hex
+  digits of the client's MAC (e.g. `laptop` → `laptop-5566`) — deterministic
+  across runs, so the same client always resolves to the same name.
 - Assigns the client's current IP address and sets it as the device's
   primary IP.
 - For **wired** clients, looks up the switch (by MAC address, matched
@@ -98,6 +105,19 @@ If you'd rather read the script before running it (sensible, given it's
 piped into `bash`): clone the repo yourself and run `bash install.sh` from
 inside it — same behavior, no curl-pipe required.
 
+For automation (CI, IaC, config management), pass `--non-interactive` with
+the config as environment variables instead of prompts — see the comment
+at the top of `install.sh` for the full variable list:
+
+```bash
+UNIFI_HOST=https://192.168.1.1 UNIFI_API_KEY=... \
+NETBOX_URL=https://netbox.example.com NETBOX_TOKEN=... NETBOX_SITE_SLUG=main \
+bash install.sh --non-interactive
+```
+
+This skips every prompt and starts the container immediately after a
+successful dry-run (no confirmation step, since there's nobody to ask).
+
 ### Option A: Docker, step by step
 
 Prefer to see/control each step yourself rather than run the installer:
@@ -143,7 +163,20 @@ non-root user and, in long-running mode, ships a `HEALTHCHECK` that reports
 unhealthy if a sync hasn't completed successfully within roughly two
 intervals — `docker ps` / `docker inspect` will show that status, and an
 orchestrator (Compose, Swarm, Kubernetes via a translated probe) can act on
-it.
+it. The heartbeat file the healthcheck reads lives at `/tmp/last-sync-ok`
+by default; override its path with `HEARTBEAT_FILE` if `/tmp` in your setup
+is a small tmpfs or shared with other processes.
+
+`docker stop` (SIGTERM) on a long-running container is handled gracefully:
+if a sync is in progress, it's allowed to finish before the container
+exits; if it's between cycles, the container exits within about a second
+instead of waiting out the rest of `SYNC_INTERVAL_SECONDS`.
+
+If you set `LOCK_FILE`, the entrypoint checks for `flock` up front and
+fails immediately with a clear error if it's missing, rather than silently
+skipping the lock — this only matters if you build on a different base
+image than the provided Dockerfile's `python:3.12-slim` (which includes it
+via `util-linux`).
 
 ### Option B: Plain Python
 
@@ -181,6 +214,7 @@ full list and defaults. Key ones:
 | `METRICS_FILE` | If set, write Prometheus textfile-collector metrics to this path after every run |
 | `SYNC_INTERVAL_SECONDS` | Docker only — `0`/unset runs once and exits, a positive number loops forever on that interval |
 | `LOCK_FILE` | Docker only, optional — `flock` path to avoid two instances racing on the same NetBox (see "Known limitations") |
+| `HEARTBEAT_FILE` | Docker only — path the healthcheck reads (default `/tmp/last-sync-ok`); override if `/tmp` is constrained in your setup |
 
 ### NetBox compatibility
 
@@ -239,7 +273,13 @@ pytest
 
 Tests mock both the UniFi HTTP API (via `responses`) and NetBox (via an
 in-memory fake gateway in `tests/fakes.py`), so no live controller or
-NetBox instance is required to run the suite.
+NetBox instance is required to run the suite. A GitHub Actions workflow
+(`.github/workflows/tests.yml`) runs the suite on Python 3.10–3.12 for
+every push/PR.
+
+## License
+
+[MIT](LICENSE).
 
 ## Design notes
 
@@ -254,6 +294,8 @@ NetBox instance is required to run the suite.
   in dry-run mode, with planned actions logged instead. Per-client errors
   are caught narrowly (see "Known limitations") so a real bug isn't masked
   as a routine sync failure.
+- `naming.py` — device-name sanitization and the deterministic
+  MAC-suffix collision fallback.
 - `metrics.py` — the JSON run-summary log line and optional Prometheus
   textfile-collector output.
 - `logging_utils.py` — the `text`/`json` log formatter selected by

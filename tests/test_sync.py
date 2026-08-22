@@ -43,6 +43,36 @@ def test_wired_client_creates_device_and_cable():
     assert device.interfaces["eth0"].cable is not None
 
 
+def test_name_collision_with_different_mac_gets_disambiguated():
+    netbox = FakeNetboxGateway()
+    netbox.upsert_client_device(
+        "aa:aa:aa:aa:aa:aa", "laptop", "main", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    client = make_unifi_client(mac="11:22:33:44:55:66", name="laptop", is_wired=False)
+    unifi = FakeUnifiClient(clients=[client])
+    engine = SyncEngine(unifi=unifi, netbox=netbox, settings=make_settings())
+
+    summary = engine.run()
+
+    assert summary.devices_created == 1
+    new_device = netbox.clients_by_mac["11:22:33:44:55:66"]
+    assert new_device.name == "laptop-5566"
+    assert netbox.clients_by_mac["aa:aa:aa:aa:aa:aa"].name == "laptop"  # untouched
+
+
+def test_same_client_keeps_its_own_name_across_runs():
+    netbox = FakeNetboxGateway()
+    client = make_unifi_client(mac="11:22:33:44:55:66", name="laptop", is_wired=False)
+    unifi = FakeUnifiClient(clients=[client])
+    engine = SyncEngine(unifi=unifi, netbox=netbox, settings=make_settings())
+
+    engine.run()
+    summary = engine.run()  # second run: same client, same name — not a collision with itself
+
+    assert summary.devices_updated == 1
+    assert netbox.clients_by_mac["11:22:33:44:55:66"].name == "laptop"
+
+
 def test_wireless_client_has_no_cable():
     netbox = FakeNetboxGateway()
     client = make_unifi_client(mac="11:22:33:44:55:77", name="phone", is_wired=False)

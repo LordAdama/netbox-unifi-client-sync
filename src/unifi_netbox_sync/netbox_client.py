@@ -23,6 +23,8 @@ class NetboxGateway(Protocol):
 
     def find_client_device_by_mac(self, mac: str) -> Any | None: ...
 
+    def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool: ...
+
     def upsert_client_device(
         self, mac: str, name: str, site_slug: str, role_slug: str, device_type_slug: str, tag_slug: str
     ) -> tuple[Any, bool]: ...
@@ -124,6 +126,12 @@ class PynetboxGateway:
 
     def find_client_device_by_mac(self, mac: str) -> Any | None:
         return next(iter(self.api.dcim.devices.filter(cf_unifi_mac=mac)), None)
+
+    def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool:
+        existing = next(iter(self.api.dcim.devices.filter(name=name, site=site_slug)), None)
+        if existing is None:
+            return False
+        return (existing.custom_fields or {}).get("unifi_mac") != mac
 
     def list_synced_client_devices(self, tag_slug: str) -> list[Any]:
         return list(self.api.dcim.devices.filter(tag=tag_slug))

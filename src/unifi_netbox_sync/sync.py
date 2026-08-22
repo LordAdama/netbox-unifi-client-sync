@@ -9,6 +9,7 @@ import requests
 from .config import Settings
 from .metrics import log_json_summary, write_prometheus_textfile
 from .models import ClientSyncResult, SyncSummary, UnifiClient
+from .naming import mac_suffixed_name, sanitize_device_name
 from .netbox_client import NetboxGateway
 from .unifi_client import UnifiClientAPI
 
@@ -106,18 +107,37 @@ class SyncEngine:
             write_prometheus_textfile(summary, s.metrics_file)
         return summary
 
+    def _resolve_device_name(self, client: UnifiClient) -> str:
+        """Sanitize the UniFi-reported name and disambiguate it if some other
+        device (a different MAC) already holds it in this NetBox site — NetBox
+        requires device names to be unique within a site."""
+        base_name = sanitize_device_name(client.display_name, client.mac)
+        if self.netbox.device_name_taken_by_other(base_name, self.settings.netbox_site_slug, client.mac):
+            disambiguated = mac_suffixed_name(base_name, client.mac)
+            logger.info(
+                "Name %r for %s is already used by another device in NetBox; using %r instead",
+                base_name,
+                client.mac,
+                disambiguated,
+            )
+            return disambiguated
+        return base_name
+
     def _sync_client(self, client: UnifiClient) -> ClientSyncResult:
         result = ClientSyncResult(mac=client.mac, name=client.display_name)
         s = self.settings
         iface_name = _interface_name(client)
         try:
+            device_name = self._resolve_device_name(client)
+            result.name = device_name
+
             if s.dry_run:
                 self._plan_client(client, iface_name, result)
                 return result
 
             device, created = self.netbox.upsert_client_device(
                 client.mac,
-                client.display_name,
+                device_name,
                 s.netbox_site_slug,
                 s.client_device_role_slug,
                 s.client_device_type_slug,
