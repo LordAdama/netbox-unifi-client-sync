@@ -90,7 +90,7 @@ class FakeNetboxGateway:
             device.interfaces[name] = iface
         return iface
 
-    def assign_ip(self, device: FakeDevice, interface: FakeInterface, ip: str) -> bool:
+    def assign_ip(self, device: FakeDevice, interface: FakeInterface, ip: str, status: str = "active") -> bool:
         if device.primary_ip4 == ip:
             return False
         device.primary_ip4 = ip

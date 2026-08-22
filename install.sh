@@ -46,8 +46,14 @@ else
     echo "==> First-time setup — answer a few questions (nothing is sent anywhere but your own .env file)"
 
     read -rp "UniFi controller URL (e.g. https://192.168.1.1): " unifi_host <"$TTY"
-    read -rp "UniFi username: " unifi_user <"$TTY"
-    read -rsp "UniFi password: " unifi_pass <"$TTY"; echo
+    read -rsp "UniFi API key (Settings > Control Plane > Integrations), or leave blank to use a username/password: " unifi_api_key <"$TTY"; echo
+    if [ -z "$unifi_api_key" ]; then
+        read -rp "UniFi username: " unifi_user <"$TTY"
+        read -rsp "UniFi password: " unifi_pass <"$TTY"; echo
+    else
+        unifi_user=""
+        unifi_pass=""
+    fi
     read -rp "Is this a UDM/UDM-Pro/CloudKey Gen2+ (UniFi OS)? [Y/n]: " is_udm <"$TTY"
     read -rp "UniFi site name [default]: " unifi_site <"$TTY"
     read -rp "NetBox URL (e.g. https://netbox.example.com): " netbox_url <"$TTY"
@@ -64,6 +70,7 @@ else
 
     : > .env
     printf '%s\n' "UNIFI_HOST=$unifi_host" >> .env
+    printf '%s\n' "UNIFI_API_KEY=$unifi_api_key" >> .env
     printf '%s\n' "UNIFI_USERNAME=$unifi_user" >> .env
     printf '%s\n' "UNIFI_PASSWORD=$unifi_pass" >> .env
     printf '%s\n' "UNIFI_IS_UDM=$is_udm_bool" >> .env
@@ -73,8 +80,10 @@ else
     printf '%s\n' "NETBOX_TOKEN=$netbox_token" >> .env
     printf '%s\n' "NETBOX_VERIFY_SSL=true" >> .env
     printf '%s\n' "NETBOX_SITE_SLUG=$netbox_site_slug" >> .env
+    printf '%s\n' "NETBOX_IP_STATUS=active" >> .env
     printf '%s\n' "DRY_RUN=false" >> .env
     printf '%s\n' "LOG_LEVEL=INFO" >> .env
+    printf '%s\n' "LOG_FORMAT=text" >> .env
     printf '%s\n' "SYNC_TAG=unifi-sync" >> .env
     printf '%s\n' "CLIENT_DEVICE_ROLE_SLUG=unifi-client" >> .env
     printf '%s\n' "CLIENT_MANUFACTURER_SLUG=generic" >> .env
@@ -82,7 +91,9 @@ else
     printf '%s\n' "PORT_NAME_TEMPLATES={port},Port {port},GE{port},Gi{port}" >> .env
     printf '%s\n' "CABLE_CONFLICT_POLICY=skip" >> .env
     printf '%s\n' "MARK_STALE_OFFLINE=true" >> .env
+    printf '%s\n' "METRICS_FILE=" >> .env
     printf '%s\n' "SYNC_INTERVAL_SECONDS=$interval" >> .env
+    printf '%s\n' "LOCK_FILE=" >> .env
     chmod 600 .env
     echo "==> Wrote .env (chmod 600)"
 fi

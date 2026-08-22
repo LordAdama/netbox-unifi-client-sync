@@ -1,3 +1,8 @@
+# All configuration comes from .env (see .env.example) — including
+# SYNC_INTERVAL_SECONDS. Deliberately not duplicated under `environment:`
+# here: Compose applies `environment:` after `env_file:`, so any key set in
+# both places would have its .env value silently overridden by the
+# hardcoded one below, regardless of what you put in .env.
 services:
   unifi-netbox-sync:
     build: .
@@ -6,5 +11,3 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    environment:
-      SYNC_INTERVAL_SECONDS: "3600"

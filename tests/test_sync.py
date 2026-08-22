@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from unifi_netbox_sync.config import Settings
 from unifi_netbox_sync.sync import SyncEngine
 
@@ -110,6 +112,56 @@ def test_dry_run_does_not_mutate_netbox():
     assert summary.cables_created == 1  # planned
     assert netbox.clients_by_mac == {}  # nothing actually written
     assert netbox.ensure_prerequisites_called is False
+
+
+class RaisingNetboxGateway(FakeNetboxGateway):
+    """Fake whose upsert_client_device always raises a given exception."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    def upsert_client_device(self, *args, **kwargs):
+        raise self._exc
+
+
+def test_expected_error_is_captured_per_client():
+    netbox = RaisingNetboxGateway(LookupError("NetBox site 'main' does not exist"))
+    client = make_unifi_client(mac="11:22:33:44:55:66", is_wired=False)
+    unifi = FakeUnifiClient(clients=[client])
+    engine = SyncEngine(unifi=unifi, netbox=netbox, settings=make_settings())
+
+    summary = engine.run()
+
+    assert len(summary.errors) == 1
+    assert "does not exist" in summary.errors[0]
+    assert summary.client_results[0].error is not None
+
+
+def test_unexpected_error_propagates_instead_of_being_swallowed():
+    netbox = RaisingNetboxGateway(TypeError("programming error, not a network/API failure"))
+    client = make_unifi_client(mac="11:22:33:44:55:66", is_wired=False)
+    unifi = FakeUnifiClient(clients=[client])
+    engine = SyncEngine(unifi=unifi, netbox=netbox, settings=make_settings())
+
+    with pytest.raises(TypeError):
+        engine.run()
+
+
+def test_metrics_file_written_when_configured(tmp_path):
+    netbox = FakeNetboxGateway()
+    client = make_unifi_client(mac="11:22:33:44:55:66", is_wired=False)
+    unifi = FakeUnifiClient(clients=[client])
+    metrics_path = tmp_path / "metrics.prom"
+    engine = SyncEngine(
+        unifi=unifi, netbox=netbox, settings=make_settings(metrics_file=str(metrics_path))
+    )
+
+    engine.run()
+
+    content = metrics_path.read_text()
+    assert "unifi_netbox_sync_clients_seen 1" in content
+    assert "unifi_netbox_sync_last_run_success 1" in content
 
 
 def test_stale_client_marked_offline():
