@@ -9,7 +9,7 @@ if [ "$interval" -le 0 ] 2>/dev/null; then
     exit 0
 fi
 
-heartbeat=/tmp/last-sync-ok
+heartbeat="${HEARTBEAT_FILE:-/tmp/last-sync-ok}"
 [ -f "$heartbeat" ] || exit 1
 
 now=$(date +%s)

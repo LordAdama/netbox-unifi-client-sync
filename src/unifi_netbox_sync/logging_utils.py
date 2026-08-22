@@ -25,4 +25,11 @@ def configure_logging(level: str, log_format: str) -> None:
         handler.setFormatter(JsonLogFormatter())
     else:
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), handlers=[handler])
+
+    # Set handlers directly rather than logging.basicConfig(), which is a
+    # no-op once the root logger already has a handler (e.g. under pytest,
+    # or if some imported library configured logging first) — we want our
+    # formatter to take effect unconditionally.
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
