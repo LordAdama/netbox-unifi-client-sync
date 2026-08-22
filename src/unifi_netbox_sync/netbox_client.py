@@ -1,0 +1,212 @@
+from __future__ import annotations
+
+import logging
+from typing import Any, Protocol
+
+import pynetbox
+
+logger = logging.getLogger(__name__)
+
+CLIENT_INTERFACE_NAME = "eth0"
+
+
+class NetboxGateway(Protocol):
+    """Interface the sync engine depends on. Lets tests substitute a fake."""
+
+    def ensure_prerequisites(
+        self, role_slug: str, manufacturer_slug: str, device_type_slug: str, tag_slug: str
+    ) -> None: ...
+
+    def find_switch_device_by_mac(self, mac: str) -> Any | None: ...
+
+    def find_interface_by_name_candidates(self, device: Any, candidates: list[str]) -> Any | None: ...
+
+    def find_client_device_by_mac(self, mac: str) -> Any | None: ...
+
+    def upsert_client_device(
+        self, mac: str, name: str, site_slug: str, role_slug: str, device_type_slug: str, tag_slug: str
+    ) -> tuple[Any, bool]: ...
+
+    def ensure_interface(self, device: Any, name: str, wired: bool) -> Any: ...
+
+    def assign_ip(self, device: Any, interface: Any, ip: str) -> bool: ...
+
+    def ensure_cable(self, interface_a: Any, interface_b: Any, conflict_policy: str) -> tuple[bool, str | None]: ...
+
+    def list_synced_client_devices(self, tag_slug: str) -> list[Any]: ...
+
+    def mark_offline(self, device: Any) -> None: ...
+
+
+class PynetboxGateway:
+    """NetBox gateway backed by the real pynetbox API client."""
+
+    def __init__(self, url: str, token: str, verify_ssl: bool = True) -> None:
+        self.api = pynetbox.api(url, token=token)
+        self.api.http_session.verify = verify_ssl
+
+    # -- setup -----------------------------------------------------------
+
+    def ensure_prerequisites(
+        self, role_slug: str, manufacturer_slug: str, device_type_slug: str, tag_slug: str
+    ) -> None:
+        self.api.extras.tags.get(slug=tag_slug) or self.api.extras.tags.create(
+            name=tag_slug, slug=tag_slug, color="2196f3"
+        )
+
+        if not self.api.extras.custom_fields.get(name="unifi_mac"):
+            self.api.extras.custom_fields.create(
+                object_types=["dcim.device"],
+                type="text",
+                name="unifi_mac",
+                label="UniFi MAC",
+                filter_logic="exact",
+            )
+
+        manufacturer = self.api.dcim.manufacturers.get(slug=manufacturer_slug)
+        if not manufacturer:
+            manufacturer = self.api.dcim.manufacturers.create(
+                name=manufacturer_slug.replace("-", " ").title(), slug=manufacturer_slug
+            )
+
+        if not self.api.dcim.device_types.get(slug=device_type_slug):
+            self.api.dcim.device_types.create(
+                manufacturer=manufacturer.id,
+                model=device_type_slug.replace("-", " ").title(),
+                slug=device_type_slug,
+                u_height=0,
+                is_full_depth=False,
+            )
+
+        self._ensure_device_role(role_slug)
+
+    def _ensure_device_role(self, role_slug: str) -> None:
+        existing = self.api.dcim.device_roles.get(slug=role_slug)
+        if existing:
+            return
+        self.api.dcim.device_roles.create(
+            name=role_slug.replace("-", " ").title(), slug=role_slug, color="9e9e9e"
+        )
+
+    # -- lookups -----------------------------------------------------------
+
+    def find_switch_device_by_mac(self, mac: str) -> Any | None:
+        iface = next(iter(self.api.dcim.interfaces.filter(mac_address=mac)), None)
+        if iface is None:
+            return None
+        return self.api.dcim.devices.get(iface.device.id)
+
+    def find_interface_by_name_candidates(self, device: Any, candidates: list[str]) -> Any | None:
+        for name in candidates:
+            iface = self.api.dcim.interfaces.get(device_id=device.id, name=name)
+            if iface:
+                return iface
+        return None
+
+    def find_client_device_by_mac(self, mac: str) -> Any | None:
+        return next(iter(self.api.dcim.devices.filter(cf_unifi_mac=mac)), None)
+
+    def list_synced_client_devices(self, tag_slug: str) -> list[Any]:
+        return list(self.api.dcim.devices.filter(tag=tag_slug))
+
+    # -- mutations -----------------------------------------------------------
+
+    def upsert_client_device(
+        self, mac: str, name: str, site_slug: str, role_slug: str, device_type_slug: str, tag_slug: str
+    ) -> tuple[Any, bool]:
+        device = self.find_client_device_by_mac(mac)
+        device_type = self.api.dcim.device_types.get(slug=device_type_slug)
+        role = self.api.dcim.device_roles.get(slug=role_slug)
+        site = self.api.dcim.sites.get(slug=site_slug)
+        if site is None:
+            raise LookupError(f"NetBox site '{site_slug}' does not exist")
+
+        if device is None:
+            device = self.api.dcim.devices.create(
+                name=name,
+                device_type=device_type.id,
+                role=role.id,
+                site=site.id,
+                status="active",
+                custom_fields={"unifi_mac": mac},
+                tags=[{"slug": tag_slug}],
+            )
+            return device, True
+
+        updated = False
+        if device.name != name:
+            device.name = name
+            updated = True
+        if device.status.value != "active":
+            device.status = "active"
+            updated = True
+        if updated:
+            device.save()
+        return device, False
+
+    def ensure_interface(self, device: Any, name: str, wired: bool) -> Any:
+        iface = self.api.dcim.interfaces.get(device_id=device.id, name=name)
+        iface_type = "1000base-t" if wired else "ieee802.11ac"
+        if iface is None:
+            return self.api.dcim.interfaces.create(device=device.id, name=name, type=iface_type)
+        if iface.type.value != iface_type:
+            iface.type = iface_type
+            iface.save()
+        return iface
+
+    def assign_ip(self, device: Any, interface: Any, ip: str) -> bool:
+        cidr = ip if "/" in ip else f"{ip}/32"
+        ip_obj = next(iter(self.api.ipam.ip_addresses.filter(address=ip)), None)
+        changed = False
+        if ip_obj is None:
+            ip_obj = self.api.ipam.ip_addresses.create(
+                address=cidr,
+                assigned_object_type="dcim.interface",
+                assigned_object_id=interface.id,
+                status="active",
+            )
+            changed = True
+        elif not ip_obj.assigned_object or ip_obj.assigned_object.id != interface.id:
+            ip_obj.assigned_object_type = "dcim.interface"
+            ip_obj.assigned_object_id = interface.id
+            ip_obj.save()
+            changed = True
+
+        if not device.primary_ip4 or device.primary_ip4.id != ip_obj.id:
+            device.primary_ip4 = ip_obj.id
+            device.save()
+            changed = True
+        return changed
+
+    def ensure_cable(self, interface_a: Any, interface_b: Any, conflict_policy: str) -> tuple[bool, str | None]:
+        interface_a = self.api.dcim.interfaces.get(interface_a.id)
+        if interface_a.cable:
+            peer = next(iter(interface_a.link_peers or []), None)
+            if peer and peer.id == interface_b.id:
+                return False, None
+            if conflict_policy != "replace":
+                return False, (
+                    f"interface {interface_a.device.name}:{interface_a.name} is already cabled "
+                    "to something else"
+                )
+            self.api.dcim.cables.get(interface_a.cable.id).delete()
+
+        interface_b = self.api.dcim.interfaces.get(interface_b.id)
+        if interface_b.cable:
+            if conflict_policy != "replace":
+                return False, (
+                    f"interface {interface_b.device.name}:{interface_b.name} is already cabled "
+                    "to something else"
+                )
+            self.api.dcim.cables.get(interface_b.cable.id).delete()
+
+        self.api.dcim.cables.create(
+            a_terminations=[{"object_type": "dcim.interface", "object_id": interface_a.id}],
+            b_terminations=[{"object_type": "dcim.interface", "object_id": interface_b.id}],
+            status="connected",
+        )
+        return True, None
+
+    def mark_offline(self, device: Any) -> None:
+        device.status = "offline"
+        device.save()
