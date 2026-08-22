@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 
 from .config import Settings
+from .logging_utils import configure_logging
 from .netbox_client import PynetboxGateway
 from .sync import SyncEngine
 from .unifi_client import UnifiClientAPI
@@ -31,15 +31,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.log_level:
         settings.log_level = args.log_level
 
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(settings.log_level, settings.log_format)
 
     with UnifiClientAPI(
         host=settings.unifi_host,
-        username=settings.unifi_username,
-        password=settings.unifi_password,
+        username=settings.unifi_username or None,
+        password=settings.unifi_password or None,
+        api_key=settings.unifi_api_key,
         is_udm=settings.unifi_is_udm,
         verify_ssl=settings.unifi_verify_ssl,
     ) as unifi:

@@ -40,13 +40,33 @@ distinguish from manually-entered NetBox data.
 
 If a switch or matching port can't be found, the client device is still
 synced — only the cable is skipped, and the reason is logged and included
-in the run summary.
+in the run summary. Every switch/port match (including which of the
+candidate name templates matched) and every ambiguous match (a MAC that
+appears on more than one NetBox interface) is logged at INFO/WARNING for
+troubleshooting.
+
+## Authentication
+
+Two ways to authenticate to the UniFi controller — set whichever you use in
+`.env`/the installer prompts:
+
+- **API key** (`UNIFI_API_KEY`, recommended) — a local UniFi OS API key
+  (Settings → Control Plane → Integrations → API Keys). It's sent as an
+  `X-API-KEY` header on every request, so there's no login session to
+  expire and no password stored beyond this one scoped credential. Support
+  depends on your controller's firmware version — verify with `--dry-run`
+  before relying on it.
+- **Username/password** (`UNIFI_USERNAME` / `UNIFI_PASSWORD`) — the
+  original method, works everywhere. Logs in once per run and re-logs-in
+  automatically if the session expires mid-run.
+
+Provide one or the other; the tool refuses to start with neither.
 
 ## Requirements
 
-- Python 3.10+
-- A UniFi controller account with read access (local admin or a
-  read-only role is enough)
+- Python 3.10+ (or Docker — see "Running it" below)
+- A UniFi controller account with read access (local admin, a read-only
+  role, or a scoped API key are all enough)
 - A NetBox API token with permission to manage `dcim` and `ipam` objects
 - A NetBox site (specified by slug) that the client devices should belong to
 
@@ -118,7 +138,12 @@ single sync and exits instead — useful if you'd rather drive the schedule
 yourself with host cron (`docker run --rm --env-file .env ...` as a cron
 job) than run a long-lived container.
 
-Check on it with `docker logs -f unifi-netbox-sync`.
+Check on it with `docker logs -f unifi-netbox-sync`. The image runs as a
+non-root user and, in long-running mode, ships a `HEALTHCHECK` that reports
+unhealthy if a sync hasn't completed successfully within roughly two
+intervals — `docker ps` / `docker inspect` will show that status, and an
+orchestrator (Compose, Swarm, Kubernetes via a translated probe) can act on
+it.
 
 ### Option B: Plain Python
 
@@ -142,15 +167,20 @@ full list and defaults. Key ones:
 | Variable | Purpose |
 | --- | --- |
 | `UNIFI_HOST` | Base URL of the controller, e.g. `https://192.168.1.1` |
+| `UNIFI_API_KEY` | Local UniFi OS API key; leave blank to use username/password instead (see "Authentication") |
 | `UNIFI_IS_UDM` | `true` for UDM/UDM-Pro/CloudKey Gen2+ (UniFi OS), `false` for a classic self-hosted controller |
 | `UNIFI_SITE` | UniFi site name to sync (default `default`) |
 | `NETBOX_URL` / `NETBOX_TOKEN` | NetBox API endpoint and token |
 | `NETBOX_SITE_SLUG` | NetBox site clients should be placed in |
+| `NETBOX_IP_STATUS` | Status set on IP addresses this tool creates (default `active`) |
 | `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order |
 | `CABLE_CONFLICT_POLICY` | `skip` (default, non-destructive) or `replace` when a target port is already cabled to something else |
 | `MARK_STALE_OFFLINE` | Mark client devices no longer seen by UniFi as `offline` instead of leaving them `active` |
 | `DRY_RUN` | Plan only, make no changes (same as `--dry-run`) |
+| `LOG_FORMAT` | `text` (default) or `json` — one JSON object per log line, for log shippers |
+| `METRICS_FILE` | If set, write Prometheus textfile-collector metrics to this path after every run |
 | `SYNC_INTERVAL_SECONDS` | Docker only — `0`/unset runs once and exits, a positive number loops forever on that interval |
+| `LOCK_FILE` | Docker only, optional — `flock` path to avoid two instances racing on the same NetBox (see "Known limitations") |
 
 ### NetBox compatibility
 
@@ -158,6 +188,47 @@ Written against NetBox's generic cable-termination API
 (`a_terminations`/`b_terminations`, NetBox 3.3+) and the `role` field name
 on `dcim.devices` (NetBox 4.x). If you're on NetBox 3.x, rename `role` to
 `device_role` in `netbox_client.py`'s device-creation payload.
+
+## Observability
+
+Every run logs a one-line human-readable summary and, right after it, a
+`sync_summary={...}` JSON line with the same counts plus run duration —
+parse that line if you're shipping logs somewhere (Loki, CloudWatch, etc.)
+regardless of `LOG_FORMAT`. Set `LOG_FORMAT=json` to also make every other
+log line a JSON object instead of plain text.
+
+For Prometheus, set `METRICS_FILE` to a path on a volume the container can
+write to; each run overwrites it (atomically) with textfile-collector
+output — point node_exporter's `--collector.textfile.directory` (or
+equivalent) at that directory rather than running this tool as its own
+metrics server, which doesn't fit a periodic batch job.
+
+## Known limitations
+
+Documented rather than solved, because they're fine at the scale this was
+built for (a home/SMB network) but worth knowing about before relying on it
+for something bigger:
+
+- **No distributed lock.** Two instances syncing the same NetBox
+  concurrently can race on cable creation/deletion. The Docker entrypoint
+  can guard against overlap between instances that share a `LOCK_FILE`
+  path (e.g. two containers with the same bind-mounted volume), but that's
+  opt-in and does nothing for instances that don't share the file — don't
+  run multiple unrelated instances against the same NetBox.
+- **No pagination handling.** UniFi's classic `/stat/sta` endpoint returns
+  the full active-client list in one response, so there's nothing to
+  paginate against today — but this hasn't been exercised at very large
+  (thousands of clients) client counts, where response size/timeouts could
+  become a factor.
+- **IP addresses are plain /32s.** No VRF, tenant, or prefix awareness —
+  addresses land in the global table. If your environment needs any of
+  those, extend `PynetboxGateway.assign_ip`.
+- **Per-client errors are narrowly caught.** The sync loop only catches
+  expected network/API failures (`requests` exceptions, `pynetbox.RequestError`,
+  `LookupError`) per client, logs them, and moves on to the next client. A
+  genuine bug (e.g. an `AttributeError` from bad code) is *not* caught —
+  it propagates and stops the run, on purpose, rather than being silently
+  swallowed alongside real operational failures.
 
 ## Development
 
@@ -180,10 +251,18 @@ NetBox instance is required to run the suite.
   a fake implementing the same interface, so sync logic is tested without
   touching a real NetBox instance.
 - `sync.py` — orchestrates the sync; all mutating NetBox calls are skipped
-  in dry-run mode, with planned actions logged instead.
+  in dry-run mode, with planned actions logged instead. Per-client errors
+  are caught narrowly (see "Known limitations") so a real bug isn't masked
+  as a routine sync failure.
+- `metrics.py` — the JSON run-summary log line and optional Prometheus
+  textfile-collector output.
+- `logging_utils.py` — the `text`/`json` log formatter selected by
+  `LOG_FORMAT`.
 - `cli.py` — entry point (`unifi-netbox-sync`).
-- `Dockerfile` / `docker/entrypoint.sh` — packages the CLI into an image;
-  the entrypoint either runs one sync and exits, or loops on
-  `SYNC_INTERVAL_SECONDS` for a long-running container.
+- `Dockerfile` / `docker/entrypoint.sh` / `docker/healthcheck.sh` —
+  packages the CLI into a non-root image; the entrypoint either runs one
+  sync and exits, or loops on `SYNC_INTERVAL_SECONDS` for a long-running
+  container (writing a heartbeat file the `HEALTHCHECK` reads), optionally
+  serializing runs via `LOCK_FILE`.
 - `install.sh` — clone-or-update, prompt-for-config, build, dry-run,
   launch. The one-command path in "Running it" above.

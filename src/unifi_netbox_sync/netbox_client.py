@@ -29,7 +29,7 @@ class NetboxGateway(Protocol):
 
     def ensure_interface(self, device: Any, name: str, wired: bool) -> Any: ...
 
-    def assign_ip(self, device: Any, interface: Any, ip: str) -> bool: ...
+    def assign_ip(self, device: Any, interface: Any, ip: str, status: str) -> bool: ...
 
     def ensure_cable(self, interface_a: Any, interface_b: Any, conflict_policy: str) -> tuple[bool, str | None]: ...
 
@@ -91,15 +91,34 @@ class PynetboxGateway:
     # -- lookups -----------------------------------------------------------
 
     def find_switch_device_by_mac(self, mac: str) -> Any | None:
-        iface = next(iter(self.api.dcim.interfaces.filter(mac_address=mac)), None)
-        if iface is None:
+        matches = list(self.api.dcim.interfaces.filter(mac_address=mac))
+        if not matches:
+            logger.debug("No NetBox interface found with mac_address=%s", mac)
             return None
+        iface = matches[0]
+        if len(matches) > 1:
+            logger.warning(
+                "MAC %s matched %d NetBox interfaces (%s); using %s:%s",
+                mac,
+                len(matches),
+                ", ".join(f"{m.device.name}:{m.name}" for m in matches),
+                iface.device.name,
+                iface.name,
+            )
+        else:
+            logger.info("Matched switch MAC %s to NetBox interface %s:%s", mac, iface.device.name, iface.name)
         return self.api.dcim.devices.get(iface.device.id)
 
     def find_interface_by_name_candidates(self, device: Any, candidates: list[str]) -> Any | None:
         for name in candidates:
             iface = self.api.dcim.interfaces.get(device_id=device.id, name=name)
             if iface:
+                logger.info(
+                    "Matched switch port on %s using name candidate %r -> interface %s",
+                    device.name,
+                    name,
+                    iface.name,
+                )
                 return iface
         return None
 
@@ -154,7 +173,11 @@ class PynetboxGateway:
             iface.save()
         return iface
 
-    def assign_ip(self, device: Any, interface: Any, ip: str) -> bool:
+    def assign_ip(self, device: Any, interface: Any, ip: str, status: str = "active") -> bool:
+        # NetBox has no signal for the client's real prefix length, VRF, or
+        # tenant, so addresses land as bare /32s in the global table. If your
+        # environment uses VRFs/tenants, extend this to look them up (e.g.
+        # from the client's UniFi network/VLAN) before creating the IP.
         cidr = ip if "/" in ip else f"{ip}/32"
         ip_obj = next(iter(self.api.ipam.ip_addresses.filter(address=ip)), None)
         changed = False
@@ -163,7 +186,7 @@ class PynetboxGateway:
                 address=cidr,
                 assigned_object_type="dcim.interface",
                 assigned_object_id=interface.id,
-                status="active",
+                status=status,
             )
             changed = True
         elif not ip_obj.assigned_object or ip_obj.assigned_object.id != interface.id:

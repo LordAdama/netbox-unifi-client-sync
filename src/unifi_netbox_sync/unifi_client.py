@@ -25,21 +25,33 @@ class UnifiClientAPI:
     def __init__(
         self,
         host: str,
-        username: str,
-        password: str,
+        username: str | None = None,
+        password: str | None = None,
+        api_key: str | None = None,
         is_udm: bool = True,
         verify_ssl: bool = False,
         timeout: float = 15.0,
     ) -> None:
+        if not api_key and not (username and password):
+            raise ValueError("UnifiClientAPI requires either api_key, or both username and password")
+
         self.host = host.rstrip("/")
         self.username = username
         self.password = password
+        self.api_key = api_key
         self.is_udm = is_udm
         self.timeout = timeout
         self.session = requests.Session()
         self.session.verify = verify_ssl
         if not verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        if api_key:
+            # Local UniFi OS API keys (Settings -> Control Plane -> Integrations)
+            # authenticate every request via this header instead of a cookie
+            # session, so there is no login/logout call and no session-expiry
+            # edge case. Support varies by controller firmware version; verify
+            # with --dry-run before relying on it.
+            self.session.headers["X-API-KEY"] = api_key
 
         self._api_prefix = "/proxy/network/api" if is_udm else "/api"
         self._authenticated = False
@@ -48,6 +60,10 @@ class UnifiClientAPI:
         return f"{self.host}{'/api/auth/login' if self.is_udm else '/api/login'}"
 
     def login(self) -> None:
+        if self.api_key:
+            self._authenticated = True
+            logger.info("Using UniFi API key authentication for %s (no session login)", self.host)
+            return
         resp = self.session.post(
             self._login_url(),
             json={"username": self.username, "password": self.password},
@@ -61,7 +77,8 @@ class UnifiClientAPI:
         logger.info("Authenticated to UniFi controller at %s", self.host)
 
     def logout(self) -> None:
-        if not self._authenticated:
+        if self.api_key or not self._authenticated:
+            self._authenticated = False
             return
         url = f"{self.host}{'/api/auth/logout' if self.is_udm else '/api/logout'}"
         try:
@@ -81,8 +98,9 @@ class UnifiClientAPI:
             self.login()
         url = f"{self.host}{self._api_prefix}{path}"
         resp = self.session.get(url, timeout=self.timeout)
-        if resp.status_code == 401:
+        if resp.status_code == 401 and not self.api_key:
             # Session likely expired; retry once after re-authenticating.
+            # (Not applicable to API-key auth: there's no session to expire.)
             self.login()
             resp = self.session.get(url, timeout=self.timeout)
         resp.raise_for_status()

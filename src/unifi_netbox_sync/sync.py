@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import logging
+import time
+
+import pynetbox
+import requests
 
 from .config import Settings
+from .metrics import log_json_summary, write_prometheus_textfile
 from .models import ClientSyncResult, SyncSummary, UnifiClient
 from .netbox_client import NetboxGateway
 from .unifi_client import UnifiClientAPI
 
 logger = logging.getLogger(__name__)
+
+# Exceptions expected from a normal network/API hiccup on a single client.
+# Anything else (AttributeError, TypeError, ...) is a programming error and
+# should propagate and stop the run rather than being silently swallowed
+# per-client.
+EXPECTED_CLIENT_ERRORS = (requests.exceptions.RequestException, pynetbox.RequestError, LookupError)
 
 
 def _interface_name(client: UnifiClient) -> str:
@@ -15,12 +26,30 @@ def _interface_name(client: UnifiClient) -> str:
 
 
 class SyncEngine:
+    """Syncs UniFi clients into NetBox.
+
+    Assumes a single instance runs at a time against a given NetBox: there is
+    no distributed/advisory locking, so running multiple instances
+    concurrently (or against a UniFi site with an overlapping NetBox site)
+    can race on cable creation/deletion. The Docker entrypoint guards against
+    a single instance overlapping itself (a run that outlives its own
+    interval) with a local flock, but that does not protect against separate
+    hosts/containers syncing the same NetBox concurrently — don't do that.
+
+    Also assumes the UniFi controller returns its full active-client list in
+    one `/stat/sta` call (true for the classic controller API this client
+    uses); there is no pagination handling. This is fine at typical
+    homelab/SMB client counts, but hasn't been exercised against very large
+    (thousands of clients) deployments.
+    """
+
     def __init__(self, unifi: UnifiClientAPI, netbox: NetboxGateway, settings: Settings) -> None:
         self.unifi = unifi
         self.netbox = netbox
         self.settings = settings
 
     def run(self) -> SyncSummary:
+        start = time.monotonic()
         summary = SyncSummary()
         s = self.settings
 
@@ -59,9 +88,10 @@ class SyncEngine:
         elif s.mark_stale_offline:
             logger.info("[dry-run] would mark devices missing from UniFi as offline")
 
+        summary.duration_seconds = time.monotonic() - start
         logger.info(
             "Sync complete: %d clients, %d created, %d updated, %d cables created, "
-            "%d cables skipped, %d marked offline, %d errors",
+            "%d cables skipped, %d marked offline, %d errors, %.1fs",
             summary.clients_seen,
             summary.devices_created,
             summary.devices_updated,
@@ -69,7 +99,11 @@ class SyncEngine:
             summary.cables_skipped,
             summary.stale_marked_offline,
             len(summary.errors),
+            summary.duration_seconds,
         )
+        log_json_summary(summary)
+        if s.metrics_file:
+            write_prometheus_textfile(summary, s.metrics_file)
         return summary
 
     def _sync_client(self, client: UnifiClient) -> ClientSyncResult:
@@ -95,11 +129,11 @@ class SyncEngine:
             iface = self.netbox.ensure_interface(device, iface_name, client.is_wired)
 
             if client.ip:
-                result.ip_assigned = self.netbox.assign_ip(device, iface, client.ip)
+                result.ip_assigned = self.netbox.assign_ip(device, iface, client.ip, s.netbox_ip_status)
 
             if client.is_wired and client.switch_mac and client.switch_port:
                 self._wire_cable(client, iface, result)
-        except Exception as exc:  # noqa: BLE001 - surfaced via result.error and summary
+        except EXPECTED_CLIENT_ERRORS as exc:
             logger.exception("Failed syncing client %s (%s)", client.mac, client.display_name)
             result.error = str(exc)
         return result

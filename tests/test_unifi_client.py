@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import responses
 
 from unifi_netbox_sync.unifi_client import UnifiClientAPI
@@ -102,3 +103,46 @@ def test_expired_session_triggers_relogin():
     assert clients == []
     # initial login, first GET (401), re-login, retried GET (200), logout on context exit
     assert len(responses.calls) == 5
+
+
+@responses.activate
+def test_api_key_auth_skips_login_and_sets_header():
+    host = "https://udm.example.com"
+    responses.add(
+        responses.GET,
+        f"{host}/proxy/network/api/s/default/stat/sta",
+        json={"data": []},
+        status=200,
+    )
+
+    client = UnifiClientAPI(host=host, api_key="secret-key", is_udm=True)
+    with client:
+        clients = client.get_clients("default")
+
+    assert clients == []
+    # No login/logout HTTP calls at all with API-key auth: just the one GET.
+    assert len(responses.calls) == 1
+    assert responses.calls[0].request.headers["X-API-KEY"] == "secret-key"
+
+
+@responses.activate
+def test_api_key_auth_does_not_retry_on_401():
+    host = "https://udm.example.com"
+    responses.add(
+        responses.GET,
+        f"{host}/proxy/network/api/s/default/stat/sta",
+        json={},
+        status=401,
+    )
+
+    client = UnifiClientAPI(host=host, api_key="bad-key", is_udm=True)
+    with client, pytest.raises(Exception):
+        client.get_clients("default")
+
+    # A single failed GET, no re-login attempt (there's no session to refresh).
+    assert len(responses.calls) == 1
+
+
+def test_requires_api_key_or_username_and_password():
+    with pytest.raises(ValueError):
+        UnifiClientAPI(host="https://udm.example.com")
