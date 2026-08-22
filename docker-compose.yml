@@ -1,0 +1,10 @@
+services:
+  unifi-netbox-sync:
+    build: .
+    image: netbox-unifi-client-sync:latest
+    container_name: unifi-netbox-sync
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SYNC_INTERVAL_SECONDS: "3600"
