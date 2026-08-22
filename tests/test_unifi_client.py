@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+import responses
+
+from unifi_netbox_sync.unifi_client import UnifiClientAPI
+
+
+@responses.activate
+def test_login_and_get_clients_udm():
+    host = "https://udm.example.com"
+    responses.add(responses.POST, f"{host}/api/auth/login", json={}, status=200)
+    responses.add(responses.POST, f"{host}/api/auth/logout", json={}, status=200)
+    responses.add(
+        responses.GET,
+        f"{host}/proxy/network/api/s/default/stat/sta",
+        json={
+            "data": [
+                {
+                    "mac": "AA:BB:CC:DD:EE:01",
+                    "name": "Laptop",
+                    "ip": "10.0.0.5",
+                    "is_wired": True,
+                    "sw_mac": "11:22:33:44:55:66",
+                    "sw_port": 4,
+                },
+                {
+                    "mac": "AA:BB:CC:DD:EE:02",
+                    "hostname": "phone",
+                    "ip": "10.0.0.6",
+                    "is_wired": False,
+                    "ap_mac": "22:33:44:55:66:77",
+                    "essid": "HomeWiFi",
+                },
+            ]
+        },
+        status=200,
+    )
+
+    client = UnifiClientAPI(host=host, username="admin", password="secret", is_udm=True)
+    with client:
+        clients = client.get_clients("default")
+
+    assert len(clients) == 2
+    wired = clients[0]
+    assert wired.mac == "aa:bb:cc:dd:ee:01"
+    assert wired.is_wired is True
+    assert wired.switch_mac == "11:22:33:44:55:66"
+    assert wired.switch_port == 4
+    assert wired.ap_mac is None
+
+    wireless = clients[1]
+    assert wireless.mac == "aa:bb:cc:dd:ee:02"
+    assert wireless.name == "phone"
+    assert wireless.is_wired is False
+    assert wireless.essid == "HomeWiFi"
+    assert wireless.switch_mac is None
+
+
+@responses.activate
+def test_classic_controller_uses_plain_api_prefix():
+    host = "https://controller.example.com:8443"
+    responses.add(responses.POST, f"{host}/api/login", json={}, status=200)
+    responses.add(responses.POST, f"{host}/api/logout", json={}, status=200)
+    responses.add(
+        responses.GET,
+        f"{host}/api/s/default/stat/device",
+        json={"data": [{"mac": "aa:bb:cc:00:00:01", "name": "core-switch", "model": "USW-24", "type": "usw"}]},
+        status=200,
+    )
+
+    client = UnifiClientAPI(host=host, username="admin", password="secret", is_udm=False)
+    with client:
+        devices = client.get_devices("default")
+
+    assert len(devices) == 1
+    assert devices[0].is_switch is True
+    assert devices[0].name == "core-switch"
+
+
+@responses.activate
+def test_expired_session_triggers_relogin():
+    host = "https://udm.example.com"
+    responses.add(responses.POST, f"{host}/api/auth/login", json={}, status=200)
+    responses.add(responses.POST, f"{host}/api/auth/logout", json={}, status=200)
+    responses.add(
+        responses.GET,
+        f"{host}/proxy/network/api/s/default/stat/sta",
+        json={},
+        status=401,
+    )
+    responses.add(
+        responses.GET,
+        f"{host}/proxy/network/api/s/default/stat/sta",
+        json={"data": []},
+        status=200,
+    )
+
+    client = UnifiClientAPI(host=host, username="admin", password="secret", is_udm=True)
+    with client:
+        clients = client.get_clients("default")
+
+    assert clients == []
+    # initial login, first GET (401), re-login, retried GET (200), logout on context exit
+    assert len(responses.calls) == 5
