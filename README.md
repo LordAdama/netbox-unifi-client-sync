@@ -50,24 +50,66 @@ in the run summary.
 - A NetBox API token with permission to manage `dcim` and `ipam` objects
 - A NetBox site (specified by slug) that the client devices should belong to
 
-## Installation
+## Running it
+
+The sync itself is a one-shot CLI (`unifi-netbox-sync`) — it does one pass
+and exits. To keep NetBox continuously up to date you need to invoke it
+repeatedly, either with Docker (recommended, especially if NetBox itself
+already runs in Docker) or a plain Python install plus cron/systemd.
+
+### Option A: Docker
+
+```bash
+git clone https://github.com/LordAdama/netbox-unifi-client-sync.git
+cd netbox-unifi-client-sync
+cp .env.example .env
+# edit .env with your controller/NetBox details
+
+docker build -t netbox-unifi-client-sync .
+```
+
+**One-off run** (e.g. to dry-run before trusting it with real changes):
+
+```bash
+docker run --rm --env-file .env netbox-unifi-client-sync --dry-run
+docker run --rm --env-file .env netbox-unifi-client-sync
+```
+
+**Run continuously**, syncing on an interval — set `SYNC_INTERVAL_SECONDS`
+in `.env` (defaults to `3600` = hourly in `docker-compose.yml`) and either:
+
+```bash
+docker compose up -d --build
+```
+
+or without compose:
+
+```bash
+docker run -d --name unifi-netbox-sync --restart unless-stopped \
+  --env-file .env \
+  netbox-unifi-client-sync
+```
+
+Leave `SYNC_INTERVAL_SECONDS` unset (or `0`) and the container does a
+single sync and exits instead — useful if you'd rather drive the schedule
+yourself with host cron (`docker run --rm --env-file .env ...` as a cron
+job) than run a long-lived container.
+
+Check on it with `docker logs -f unifi-netbox-sync`.
+
+### Option B: Plain Python
 
 ```bash
 pip install -e .
 cp .env.example .env
 # edit .env with your controller/NetBox details
-```
 
-## Usage
-
-```bash
 set -a; source .env; set +a
 unifi-netbox-sync --dry-run   # see what would change, without writing anything
 unifi-netbox-sync             # perform the sync
 ```
 
-Run it on a schedule (cron, systemd timer, etc.) to keep NetBox continuously
-up to date.
+Run it on a schedule yourself (cron, systemd timer, etc.).
 
 ### Configuration
 
@@ -85,6 +127,7 @@ full list and defaults. Key ones:
 | `CABLE_CONFLICT_POLICY` | `skip` (default, non-destructive) or `replace` when a target port is already cabled to something else |
 | `MARK_STALE_OFFLINE` | Mark client devices no longer seen by UniFi as `offline` instead of leaving them `active` |
 | `DRY_RUN` | Plan only, make no changes (same as `--dry-run`) |
+| `SYNC_INTERVAL_SECONDS` | Docker only — `0`/unset runs once and exits, a positive number loops forever on that interval |
 
 ### NetBox compatibility
 
@@ -116,3 +159,6 @@ NetBox instance is required to run the suite.
 - `sync.py` — orchestrates the sync; all mutating NetBox calls are skipped
   in dry-run mode, with planned actions logged instead.
 - `cli.py` — entry point (`unifi-netbox-sync`).
+- `Dockerfile` / `docker/entrypoint.sh` — packages the CLI into an image;
+  the entrypoint either runs one sync and exits, or loops on
+  `SYNC_INTERVAL_SECONDS` for a long-running container.
