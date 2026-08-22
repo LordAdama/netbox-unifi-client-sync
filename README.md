@@ -57,7 +57,30 @@ and exits. To keep NetBox continuously up to date you need to invoke it
 repeatedly, either with Docker (recommended, especially if NetBox itself
 already runs in Docker) or a plain Python install plus cron/systemd.
 
-### Option A: Docker
+### Quickest path: `install.sh`
+
+One command, with prompts for your UniFi/NetBox settings:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LordAdama/netbox-unifi-client-sync/main/install.sh | bash
+```
+
+This clones the repo into `./netbox-unifi-client-sync`, asks for your
+controller/NetBox details (only on first run — nothing is sent anywhere
+but your own local `.env`, written `chmod 600`), builds the Docker image,
+runs a `--dry-run` for you to sanity-check, and then asks whether to start
+the long-running container (`restart: unless-stopped`, syncing every
+`SYNC_INTERVAL_SECONDS`). Re-running the same command later pulls the
+latest code, rebuilds, and restarts the container — reusing your existing
+`.env` untouched.
+
+If you'd rather read the script before running it (sensible, given it's
+piped into `bash`): clone the repo yourself and run `bash install.sh` from
+inside it — same behavior, no curl-pipe required.
+
+### Option A: Docker, step by step
+
+Prefer to see/control each step yourself rather than run the installer:
 
 ```bash
 git clone https://github.com/LordAdama/netbox-unifi-client-sync.git
@@ -162,3 +185,5 @@ NetBox instance is required to run the suite.
 - `Dockerfile` / `docker/entrypoint.sh` — packages the CLI into an image;
   the entrypoint either runs one sync and exits, or loops on
   `SYNC_INTERVAL_SECONDS` for a long-running container.
+- `install.sh` — clone-or-update, prompt-for-config, build, dry-run,
+  launch. The one-command path in "Running it" above.
