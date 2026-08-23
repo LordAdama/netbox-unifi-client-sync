@@ -31,6 +31,18 @@ def slugify(value: str, max_length: int = 50) -> str:
     return slug[:max_length].rstrip("-")
 
 
+def normalize_key(value: str) -> str:
+    """Fold a site name/slug for comparison: alphanumerics only, lowercased.
+
+    Makes punctuation and separator choices irrelevant, so a UniFi site called
+    "Acme's Depot - North Yard" matches a NetBox site slugged
+    `acmes-depot-north-yard` even though slugifying the apostrophe yields
+    `acme-s-...`. Deliberately exact-after-folding rather than fuzzy: it never
+    binds two genuinely different sites together.
+    """
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
 def mac_suffixed_name(name: str, mac: str) -> str:
     """Disambiguate a name that collides with a different device, deterministically."""
     suffix = "-" + mac.replace(":", "")[-4:]

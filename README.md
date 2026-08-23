@@ -314,6 +314,7 @@ full list and defaults. Key ones:
 | `NETBOX_URL` / `NETBOX_TOKEN` | NetBox API endpoint and token |
 | `NETBOX_SITE_SLUG` | NetBox site clients should be placed in; ignored if `SITE_MAP` is set |
 | `SITE_MAP` | Multi-site: `*` for every site on the controller, and/or `unifi_site:netbox_site_slug` pairs — see "Multi-site sync" |
+| `SITE_MATCH` | `normalized` (default), `name`, or `slug` — how an existing NetBox site is found; see "Linking to sites you already have" |
 | `SITE_POLICY` | `require` (default) or `create` — see "Site & update policies" |
 | `DEVICE_UPDATE_POLICY` | `sync` (default) or `create-only` — see "Site & update policies" |
 | `NETBOX_IP_STATUS` | Status set on IP addresses this tool creates (default `active`) |
@@ -397,6 +398,42 @@ it happens (`Site 'X' -> NetBox 'Y': N clients, ...`).
 Policy settings (`SITE_POLICY`, `DEVICE_UPDATE_POLICY`,
 `CABLE_CONFLICT_POLICY`, etc.) are global — they apply the same way to
 every site pair, not configured per-site.
+
+### Linking to sites you already have
+
+A derived slug is a *guess* at what the site is called in NetBox, and a guess
+that misses creates a duplicate instead of adding to the site you already
+have. Punctuation is the usual culprit — "Acme's Depot - North Yard"
+slugifies to `acme-s-depot-north-yard`, which does not equal an existing
+`acmes-depot-north-yard`.
+
+So before syncing, each UniFi site is resolved against the sites already in
+NetBox, in order:
+
+1. exact slug
+2. exact **name** (the UniFi site description vs the NetBox site name)
+3. both folded to alphanumerics, making apostrophes, dashes, spacing and case
+   irrelevant
+
+Every step is an exact comparison after folding — never fuzzy — so two
+genuinely different sites are not bound together. `SITE_MATCH=name` stops at
+step 2, `SITE_MATCH=slug` restores the original exact-slug-only behavior.
+
+**A matched site is only ever linked to, never modified.** Its name, slug,
+region, tenant and everything else are left alone, whatever is already in it
+stays, and the UniFi devices and clients are added alongside. Each link is
+logged:
+
+```
+Linking UniFi site 'north' to existing NetBox site 'acmes-depot-north-yard'
+("Acme's Depot - North Yard") instead of creating 'acme-s-depot-north-yard';
+its inventory is added to, never overwritten
+```
+
+Resolution happens before sites are grouped for syncing, so if two UniFi
+sites turn out to be the same NetBox site they end up in one group — keeping
+the stale-marking union correct rather than having each pair mark the other's
+clients offline.
 
 ### Site & update policies
 

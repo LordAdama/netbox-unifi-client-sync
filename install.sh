@@ -75,6 +75,7 @@ write_env() {
     printf '%s\n' "NETBOX_VERIFY_SSL=true" >> .env
     printf '%s\n' "NETBOX_SITE_SLUG=$9" >> .env
     printf '%s\n' "SITE_MAP=${11:-}" >> .env
+    printf '%s\n' "SITE_MATCH=normalized" >> .env
     printf '%s\n' "SITE_POLICY=require" >> .env
     printf '%s\n' "NETBOX_IP_STATUS=active" >> .env
     printf '%s\n' "DRY_RUN=false" >> .env

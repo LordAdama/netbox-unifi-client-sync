@@ -119,6 +119,8 @@ class SyncEngine:
         self._hints_lock = threading.Lock()
         # One warning per switch, not one per client behind it.
         self._warned_switches: set[str] = set()
+        # UniFi site id -> human label, for matching NetBox sites by name.
+        self._site_labels: dict[str, str] = {}
 
     # -- orchestration ---------------------------------------------------
 
@@ -158,6 +160,7 @@ class SyncEngine:
                     slug,
                 )
             slug_owners[slug] = site.name
+            self._site_labels[site.name] = site.label
             pairs.append(SitePair(unifi_site=site.name, netbox_site_slug=slug))
 
         logger.info(
@@ -178,6 +181,8 @@ class SyncEngine:
     def run(self) -> SyncSummary:
         start = time.monotonic()
         pairs = self._discover_site_pairs() if self.settings.sync_all_sites else self.settings.site_pairs()
+
+        pairs = self._link_existing_sites(pairs)
 
         groups: dict[str, list[SitePair]] = {}
         for pair in pairs:
@@ -230,6 +235,53 @@ class SyncEngine:
         if self.settings.metrics_file:
             write_prometheus_textfile(summary, self.settings.metrics_file)
         return summary
+
+    def _link_existing_sites(self, pairs: list[SitePair]) -> list[SitePair]:
+        """Bind each pair to the NetBox site that already represents it.
+
+        A derived slug is a guess at what the site is called in NetBox, and a
+        guess that misses creates a duplicate rather than adding to the site
+        you already have. Punctuation is the usual culprit: "Acme's Depot"
+        slugifies to `acme-s-depot`, which does not equal an existing
+        `acmes-depot`.
+
+        Resolution happens here, before grouping, so two UniFi sites that turn
+        out to be the same NetBox site end up in one group — keeping the
+        stale-marking union and single-writer guarantees intact.
+
+        Matched sites are only ever linked to, never modified.
+        """
+        resolved: list[SitePair] = []
+        for pair in pairs:
+            label = self._site_labels.get(pair.unifi_site, "")
+            try:
+                site = self.netbox.resolve_existing_site(
+                    pair.netbox_site_slug, label, self.settings.site_match
+                )
+            except EXPECTED_CLIENT_ERRORS as exc:
+                logger.warning(
+                    "Could not check NetBox for an existing site matching '%s' (%s); "
+                    "continuing with that slug",
+                    pair.netbox_site_slug,
+                    exc,
+                )
+                resolved.append(pair)
+                continue
+
+            if site is None:
+                resolved.append(pair)
+                continue
+            if site.slug != pair.netbox_site_slug:
+                logger.info(
+                    "Linking UniFi site '%s' to existing NetBox site '%s' (%r) instead of "
+                    "creating '%s'; its inventory is added to, never overwritten",
+                    pair.unifi_site,
+                    site.slug,
+                    getattr(site, "name", ""),
+                    pair.netbox_site_slug,
+                )
+            resolved.append(SitePair(unifi_site=pair.unifi_site, netbox_site_slug=site.slug))
+        return resolved
 
     def _run_group(self, netbox_site_slug: str, pairs: list[SitePair]) -> SyncSummary:
         """Sync every UniFi site mapped to one NetBox site, then stale-mark once."""
