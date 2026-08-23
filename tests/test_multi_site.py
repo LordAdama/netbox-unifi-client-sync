@@ -6,6 +6,22 @@ from .fakes import FakeNetboxGateway, FakeUnifiClient, make_unifi_client
 from .test_sync import make_settings
 
 
+class RaisingUnifiClient(FakeUnifiClient):
+    """Fake whose get_clients() raises for one specific site, to simulate a
+    site-level failure (e.g. the controller returning an error) alongside a
+    healthy site."""
+
+    def __init__(self, by_site, raise_for_site: str, exc: Exception) -> None:
+        super().__init__(by_site=by_site)
+        self._raise_for_site = raise_for_site
+        self._exc = exc
+
+    def get_clients(self, site: str):
+        if site == self._raise_for_site:
+            raise self._exc
+        return super().get_clients(site)
+
+
 def test_site_pairs_defaults_to_single_pair():
     settings = make_settings()
     pairs = settings.site_pairs()
@@ -112,6 +128,82 @@ def test_stale_marking_only_affects_devices_in_the_missing_site():
     assert summary.stale_marked_offline == 1
     assert netbox.clients_by_mac["11:11:11:11:11:11"].status.value == "offline"
     assert netbox.clients_by_mac["22:22:22:22:22:22"].status.value == "active"
+
+
+def test_shared_netbox_site_stale_marking_uses_union_of_both_pairs():
+    """Regression guard for the case two UniFi sites map to the same NetBox
+    site: without unioning seen_macs across both pairs first, each pair's
+    stale pass would see the *other* pair's device (same NetBox site, via
+    list_synced_client_devices) as unseen and wrongly mark it offline."""
+    netbox = FakeNetboxGateway()
+    netbox.upsert_client_device(
+        "11:11:11:11:11:11", "device-a", "shared-site", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    netbox.upsert_client_device(
+        "22:22:22:22:22:22", "device-b", "shared-site", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    client_a = make_unifi_client(mac="11:11:11:11:11:11", name="device-a", is_wired=False)
+    client_b = make_unifi_client(mac="22:22:22:22:22:22", name="device-b", is_wired=False)
+    unifi = FakeUnifiClient(by_site={"site-a": [client_a], "site-b": [client_b]})
+    engine = SyncEngine(
+        unifi=unifi,
+        netbox=netbox,
+        settings=make_settings(site_map={"site-a": "shared-site", "site-b": "shared-site"}),
+    )
+
+    summary = engine.run()
+
+    assert netbox.clients_by_mac["11:11:11:11:11:11"].status.value == "active"
+    assert netbox.clients_by_mac["22:22:22:22:22:22"].status.value == "active"
+    assert summary.stale_marked_offline == 0
+
+
+def test_shared_netbox_site_skips_stale_marking_if_one_pair_fails():
+    netbox = FakeNetboxGateway()
+    netbox.upsert_client_device(
+        "11:11:11:11:11:11", "device-a", "shared-site", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    netbox.upsert_client_device(
+        "22:22:22:22:22:22", "device-b", "shared-site", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    client_a = make_unifi_client(mac="11:11:11:11:11:11", name="device-a", is_wired=False)
+    unifi = RaisingUnifiClient(
+        by_site={"site-a": [client_a]}, raise_for_site="site-b", exc=LookupError("simulated failure")
+    )
+    engine = SyncEngine(
+        unifi=unifi,
+        netbox=netbox,
+        settings=make_settings(site_map={"site-a": "shared-site", "site-b": "shared-site"}),
+    )
+
+    summary = engine.run()
+
+    assert len(summary.errors) == 1
+    # site-b's failure means we don't know its clients, so stale-marking for
+    # "shared-site" must be skipped entirely rather than acting on partial data.
+    assert netbox.clients_by_mac["11:11:11:11:11:11"].status.value == "active"
+    assert netbox.clients_by_mac["22:22:22:22:22:22"].status.value == "active"
+    assert summary.stale_marked_offline == 0
+
+
+def test_sites_created_counts_multiple_sites():
+    netbox = FakeNetboxGateway()
+    netbox.missing_sites.add("headquarters")
+    netbox.missing_sites.add("branch-office")
+    hq_client = make_unifi_client(mac="11:11:11:11:11:11", is_wired=False)
+    branch_client = make_unifi_client(mac="22:22:22:22:22:22", is_wired=False)
+    unifi = FakeUnifiClient(by_site={"hq": [hq_client], "branch": [branch_client]})
+    engine = SyncEngine(
+        unifi=unifi,
+        netbox=netbox,
+        settings=make_settings(
+            site_map={"hq": "headquarters", "branch": "branch-office"}, site_policy="create"
+        ),
+    )
+
+    summary = engine.run()
+
+    assert summary.sites_created == 2
 
 
 def test_aggregate_summary_sums_across_sites():
