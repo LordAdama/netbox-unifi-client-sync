@@ -11,6 +11,7 @@ class UnifiSwitchDevice:
     name: str
     model: str
     device_type: str  # "usw", "uap", "ugw", ...
+    serial: str | None = None
 
     @property
     def is_switch(self) -> bool:
@@ -29,6 +30,10 @@ class UnifiClient:
     switch_port: int | None = None
     ap_mac: str | None = None
     essid: str | None = None
+    # Manufacturer as resolved by the controller from the MAC's OUI, e.g.
+    # "Apple, Inc.". Empty for MACs the controller can't attribute (including
+    # randomized/private client MACs).
+    oui: str | None = None
 
     @property
     def display_name(self) -> str:

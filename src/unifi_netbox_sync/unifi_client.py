@@ -120,6 +120,7 @@ class UnifiClientAPI:
                     name=entry.get("name") or entry.get("model", "unnamed"),
                     model=entry.get("model", ""),
                     device_type=entry.get("type", ""),
+                    serial=entry.get("serial") or None,
                 )
             )
         return devices
@@ -142,6 +143,7 @@ class UnifiClientAPI:
                     switch_port=entry.get("sw_port") if is_wired else None,
                     ap_mac=(entry.get("ap_mac") or "").lower() or None if not is_wired else None,
                     essid=entry.get("essid") if not is_wired else None,
+                    oui=(entry.get("oui") or "").strip() or None,
                 )
             )
         return clients

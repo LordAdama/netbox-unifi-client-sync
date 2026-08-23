@@ -10,6 +10,24 @@ def _bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+# Tried in order against the switch's real interface names. Covers the naming
+# used by the NetBox devicetype-library UniFi profiles ("Port 1"), bare-number
+# imports ("1"), and the common vendor abbreviations. All candidates are
+# matched against one cached interface list, so a long list costs nothing
+# extra at runtime.
+DEFAULT_PORT_NAME_TEMPLATES = [
+    "Port {port}",
+    "{port}",
+    "GE{port}",
+    "Gi{port}",
+    "eth{port}",
+    "Ethernet{port}",
+    "GigabitEthernet{port}",
+    "Port{port}",
+    "port{port}",
+]
+
+
 def _positive_int(raw: str, name: str) -> int:
     try:
         value = int(raw)
@@ -92,7 +110,7 @@ class Settings:
     client_manufacturer_slug: str = "generic"
     client_device_type_slug: str = "generic-network-client"
     port_name_templates: list[str] = field(
-        default_factory=lambda: ["{port}", "Port {port}", "GE{port}", "Gi{port}"]
+        default_factory=lambda: DEFAULT_PORT_NAME_TEMPLATES.copy()
     )
     cable_conflict_policy: str = "skip"
     mark_stale_offline: bool = True
@@ -113,6 +131,14 @@ class Settings:
     # sequential behavior. Raise it for many sites; the ceiling is whatever
     # your NetBox and UniFi controller tolerate, not this tool.
     max_workers: int = 1
+    # Give each client a device type carrying its real manufacturer, resolved
+    # from the MAC OUI (the controller reports this per client). Falls back to
+    # client_manufacturer_slug / client_device_type_slug when the vendor is
+    # unknown or the MAC is randomized.
+    use_oui_manufacturer: bool = True
+    # Optional IEEE oui.txt or Wireshark manuf file, consulted only for MACs
+    # the controller did not attribute.
+    oui_file: str | None = None
 
     def site_pairs(self) -> list[SitePair]:
         if self.site_map:
@@ -142,8 +168,10 @@ class Settings:
         if not site_map and not netbox_site_slug:
             raise SystemExit("Provide either NETBOX_SITE_SLUG (single site) or SITE_MAP (multiple sites)")
 
-        templates_raw = os.environ.get("PORT_NAME_TEMPLATES", "{port},Port {port},GE{port},Gi{port}")
-        port_name_templates = [t.strip() for t in templates_raw.split(",") if t.strip()]
+        templates_raw = os.environ.get("PORT_NAME_TEMPLATES", "")
+        port_name_templates = [t.strip() for t in templates_raw.split(",") if t.strip()] or (
+            DEFAULT_PORT_NAME_TEMPLATES.copy()
+        )
 
         return cls(
             unifi_host=unifi_host.rstrip("/"),
@@ -173,4 +201,6 @@ class Settings:
             site_policy=os.environ.get("SITE_POLICY", "require"),
             device_update_policy=os.environ.get("DEVICE_UPDATE_POLICY", "sync"),
             max_workers=_positive_int(os.environ.get("MAX_WORKERS", "1"), "MAX_WORKERS"),
+            use_oui_manufacturer=_bool(os.environ.get("USE_OUI_MANUFACTURER", "true")),
+            oui_file=os.environ.get("OUI_FILE") or None,
         )

@@ -41,7 +41,7 @@ distinguish from manually-entered NetBox data.
 
 | UniFi side | NetBox side |
 | --- | --- |
-| Switch MAC address | Looked up via any NetBox interface whose `mac_address` matches |
+| Switch MAC address | Four strategies, first match wins — see "Finding your switches" |
 | Switch port index (`sw_port`) | Looked up on the matched switch device by trying each of `PORT_NAME_TEMPLATES` in order (e.g. `"4"`, `"Port 4"`, `"GE4"`, `"Gi4"`) until one matches an existing interface name |
 | Client MAC address | Stored in a `unifi_mac` custom field on the NetBox client device, created automatically on first run |
 
@@ -51,6 +51,52 @@ in the run summary. Every switch/port match (including which of the
 candidate name templates matched) and every ambiguous match (a MAC that
 appears on more than one NetBox interface) is logged at INFO/WARNING for
 troubleshooting.
+
+## Finding your switches
+
+Cables can only be created once the tool knows which NetBox device is the
+switch UniFi is reporting. It tries four joins, in descending order of
+precision, and logs which one matched:
+
+1. A NetBox **interface** whose `mac_address` equals the switch MAC.
+2. A NetBox **device** with a `unifi_mac` custom field equal to the switch MAC.
+3. A NetBox **device serial** matching the switch's serial, or its MAC in
+   either `aa:bb:cc:…` or `aabbcc…` form.
+4. A NetBox **device name** equal to the switch's name in UniFi.
+
+Strategy 1 alone was the original behavior, and it is the reason cables were
+often not created despite the switches being present: switch interfaces
+usually have no `mac_address` populated, and where they do, a port's MAC is
+not the chassis MAC UniFi reports. The other three fix that; **naming the
+NetBox device the same as UniFi does is usually all that's needed.**
+
+If a switch still can't be found, the run logs a warning naming it and
+listing what was tried. If the switch is found but a port isn't, the warning
+lists the interface names that device actually has next to the ones that were
+looked for — set `PORT_NAME_TEMPLATES` to match.
+
+## Manufacturers
+
+By default each client gets a NetBox device type carrying its real
+manufacturer (`Apple, Inc. Client`, `Intel Corporate Client`, …) instead of a
+single generic type, so vendor breakdowns in NetBox are meaningful.
+
+The vendor comes from the MAC's OUI as **already resolved by the UniFi
+controller**, which reports it per client — no OUI database to ship, update,
+or fetch at runtime. For the occasional client the controller can't attribute,
+point `OUI_FILE` at an IEEE `oui.txt` or Wireshark `manuf` file and it is
+consulted as a fallback (parsed lazily, so an unused file costs nothing).
+
+Randomized/locally-administered MACs — what modern phones use per-SSID — are
+deliberately *not* attributed to any vendor: their OUI bytes belong to no one,
+so guessing would be wrong rather than merely unknown. Those, and any client
+whose vendor can't be determined, fall back to
+`CLIENT_MANUFACTURER_SLUG`/`CLIENT_DEVICE_TYPE_SLUG`.
+
+Existing devices created before this feature are corrected on the next sync
+(under `DEVICE_UPDATE_POLICY=sync`), so an established install picks up real
+manufacturers without being rebuilt. Set `USE_OUI_MANUFACTURER=false` to keep
+everything on the single generic type.
 
 ## Authentication
 
@@ -214,7 +260,9 @@ full list and defaults. Key ones:
 | `SITE_POLICY` | `require` (default) or `create` — see "Site & update policies" |
 | `DEVICE_UPDATE_POLICY` | `sync` (default) or `create-only` — see "Site & update policies" |
 | `NETBOX_IP_STATUS` | Status set on IP addresses this tool creates (default `active`) |
-| `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order |
+| `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order; blank uses the built-in list |
+| `USE_OUI_MANUFACTURER` | Give clients a device type carrying their real vendor (default `true`) — see "Manufacturers" |
+| `OUI_FILE` | Optional IEEE `oui.txt` / Wireshark `manuf` file, used only when the controller reports no vendor |
 | `CABLE_CONFLICT_POLICY` | `skip` (default, non-destructive) or `replace` when a target port is already cabled to something else |
 | `MARK_STALE_OFFLINE` | Mark client devices no longer seen by UniFi as `offline` instead of leaving them `active` |
 | `DRY_RUN` | Plan only, make no changes (same as `--dry-run`) |
@@ -433,8 +481,10 @@ every push/PR.
   interfaces); deliberately does *not* cache client-device or name-collision
   lookups, which change as the run creates devices. Thread-safe, since
   parallel site workers share one instance.
-- `naming.py` — device-name sanitization and the deterministic
-  MAC-suffix collision fallback.
+- `naming.py` — device-name sanitization, the deterministic MAC-suffix
+  collision fallback, and NetBox slug generation.
+- `oui.py` — locally-administered (randomized) MAC detection and the
+  optional offline IEEE/Wireshark OUI file parser.
 - `metrics.py` — the JSON run-summary log line and optional Prometheus
   textfile-collector output.
 - `logging_utils.py` — the `text`/`json` log formatter selected by

@@ -3,13 +3,27 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import pynetbox
 
+from .naming import slugify
+
 logger = logging.getLogger(__name__)
 
 CLIENT_INTERFACE_NAME = "eth0"
+
+
+@dataclass
+class SwitchHints:
+    """What UniFi knows about a switch, used to find it in NetBox when the
+    interface-MAC join (which needs `mac_address` populated on switch ports)
+    comes up empty — as it does in most deployments."""
+
+    name: str | None = None
+    serial: str | None = None
+    model: str | None = None
 
 
 class NetboxGateway(Protocol):
@@ -19,7 +33,9 @@ class NetboxGateway(Protocol):
         self, role_slug: str, manufacturer_slug: str, device_type_slug: str, tag_slug: str
     ) -> None: ...
 
-    def find_switch_device_by_mac(self, mac: str) -> Any | None: ...
+    def find_switch_device_by_mac(self, mac: str, hints: SwitchHints | None = None) -> Any | None: ...
+
+    def ensure_client_device_type(self, manufacturer_name: str) -> str: ...
 
     def find_interface_by_name_candidates(self, device: Any, candidates: list[str]) -> Any | None: ...
 
@@ -72,6 +88,7 @@ class PynetboxGateway:
         self._device_type_memo: dict[str, Any] = {}
         self._role_memo: dict[str, Any] = {}
         self._site_memo: dict[str, Any] = {}
+        self._client_type_memo: dict[str, str] = {}
 
     def _memoized(self, memo: dict[str, Any], key: str, fetch: Callable[[], Any]) -> Any:
         with self._memo_lock:
@@ -135,10 +152,38 @@ class PynetboxGateway:
 
     # -- lookups -----------------------------------------------------------
 
-    def find_switch_device_by_mac(self, mac: str) -> Any | None:
+    def find_switch_device_by_mac(self, mac: str, hints: SwitchHints | None = None) -> Any | None:
+        """Locate the NetBox device for a UniFi switch.
+
+        Matching on an *interface* MAC alone (the original strategy) fails in
+        most real deployments: switch interfaces usually have no `mac_address`
+        populated at all, and where they do, a port's MAC is not the chassis
+        MAC that UniFi reports as `sw_mac`. So we try several joins in
+        descending order of precision, and say plainly which one worked.
+        """
+        for strategy, finder in (
+            ("interface MAC", lambda: self._switch_by_interface_mac(mac)),
+            ("unifi_mac custom field", lambda: self._first(self.api.dcim.devices.filter(cf_unifi_mac=mac))),
+            ("serial", lambda: self._switch_by_serial(mac, hints)),
+            ("device name", lambda: self._switch_by_name(hints)),
+        ):
+            device = finder()
+            if device is not None:
+                logger.info("Matched UniFi switch %s to NetBox device %r via %s", mac, device.name, strategy)
+                return device
+
+        # The operator-facing warning is emitted by the sync engine, which
+        # owns that guidance for every gateway implementation.
+        logger.debug("No NetBox device matched UniFi switch %s by any strategy", mac)
+        return None
+
+    @staticmethod
+    def _first(results: Any) -> Any | None:
+        return next(iter(results), None)
+
+    def _switch_by_interface_mac(self, mac: str) -> Any | None:
         matches = list(self.api.dcim.interfaces.filter(mac_address=mac))
         if not matches:
-            logger.debug("No NetBox interface found with mac_address=%s", mac)
             return None
         iface = matches[0]
         if len(matches) > 1:
@@ -150,9 +195,24 @@ class PynetboxGateway:
                 iface.device.name,
                 iface.name,
             )
-        else:
-            logger.info("Matched switch MAC %s to NetBox interface %s:%s", mac, iface.device.name, iface.name)
         return self.api.dcim.devices.get(iface.device.id)
+
+    def _switch_by_serial(self, mac: str, hints: SwitchHints | None) -> Any | None:
+        # UniFi imports commonly use the MAC as the serial, in either
+        # colon-separated or bare form; the controller's own serial too.
+        candidates = [mac, mac.replace(":", ""), mac.upper(), mac.replace(":", "").upper()]
+        if hints and hints.serial:
+            candidates.insert(0, hints.serial)
+        for serial in candidates:
+            device = self._first(self.api.dcim.devices.filter(serial=serial))
+            if device is not None:
+                return device
+        return None
+
+    def _switch_by_name(self, hints: SwitchHints | None) -> Any | None:
+        if not hints or not hints.name:
+            return None
+        return self._first(self.api.dcim.devices.filter(name=hints.name))
 
     def find_interface_by_name_candidates(self, device: Any, candidates: list[str]) -> Any | None:
         for name in candidates:
@@ -198,6 +258,40 @@ class PynetboxGateway:
 
     def list_device_interfaces(self, device: Any) -> list[Any]:
         return list(self.api.dcim.interfaces.filter(device_id=device.id))
+
+    def ensure_client_device_type(self, manufacturer_name: str) -> str:
+        """Get (creating if needed) a client device type for this manufacturer.
+
+        NetBox models the manufacturer on the *device type*, not the device, so
+        showing a client's real vendor means one zero-U device type per vendor.
+        Memoized: a run with 500 Apple clients creates this once.
+        """
+        slug = slugify(manufacturer_name)
+        if not slug:
+            raise ValueError(f"Manufacturer name {manufacturer_name!r} does not yield a usable slug")
+        type_slug = f"{slug}-client"
+
+        with self._memo_lock:
+            if type_slug in self._client_type_memo:
+                return self._client_type_memo[type_slug]
+
+        if self.api.dcim.device_types.get(slug=type_slug) is None:
+            manufacturer = self.api.dcim.manufacturers.get(slug=slug)
+            if manufacturer is None:
+                manufacturer = self.api.dcim.manufacturers.create(name=manufacturer_name, slug=slug)
+                logger.info("Created NetBox manufacturer %r", manufacturer_name)
+            self.api.dcim.device_types.create(
+                manufacturer=manufacturer.id,
+                model=f"{manufacturer_name} Client",
+                slug=type_slug,
+                u_height=0,
+                is_full_depth=False,
+            )
+            logger.info("Created NetBox device type %r", f"{manufacturer_name} Client")
+
+        with self._memo_lock:
+            self._client_type_memo[type_slug] = type_slug
+        return type_slug
 
     # -- mutations -----------------------------------------------------------
 
@@ -272,7 +366,13 @@ class PynetboxGateway:
             )
             return device, True, False, False
 
-        would_change = device.name != name or device.status.value != "active"
+        # Correcting the device type is how an existing estate picks up real
+        # manufacturers instead of staying on the generic type it was created
+        # with. Compared by slug so it's a no-op once already right.
+        current_type = getattr(getattr(device, "device_type", None), "slug", None)
+        type_differs = current_type is not None and current_type != device_type_slug
+
+        would_change = device.name != name or device.status.value != "active" or type_differs
         if update_policy == "create-only":
             return device, False, would_change, False
 
@@ -282,6 +382,12 @@ class PynetboxGateway:
             updated = True
         if device.status.value != "active":
             device.status = "active"
+            updated = True
+        if type_differs:
+            device.device_type = self._get_device_type(device_type_slug).id
+            logger.info(
+                "Updating %s device type %s -> %s", device.name, current_type, device_type_slug
+            )
             updated = True
         if updated:
             device.save()

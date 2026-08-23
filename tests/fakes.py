@@ -40,6 +40,8 @@ class FakeDevice:
         self.tags: list[str] = []
         self.interfaces: dict[str, FakeInterface] = {}
         self.site_slug = site_slug
+        self.serial: str | None = None
+        self.device_type = None
 
 
 class FakeSite:
@@ -68,6 +70,8 @@ class FakeNetboxGateway:
         # parallel tests would only pass by luck.
         self._lock = threading.RLock()
         self.switches: dict[str, FakeDevice] = {}
+        self.switches_without_mac: list[FakeDevice] = []
+        self.created_device_types: set[str] = set()
         self.clients_by_mac: dict[str, FakeDevice] = {}
         self.cables: set[tuple[int, int]] = set()
         self.ensure_prerequisites_called = False
@@ -88,8 +92,40 @@ class FakeNetboxGateway:
     def ensure_prerequisites(self, role_slug, manufacturer_slug, device_type_slug, tag_slug) -> None:
         self.ensure_prerequisites_called = True
 
-    def find_switch_device_by_mac(self, mac: str):
-        return self.switches.get(mac)
+    def find_switch_device_by_mac(self, mac: str, hints=None):
+        device = self.switches.get(mac)
+        if device is not None:
+            return device
+        # Mirror the real gateway's name/serial fallbacks, which are the only
+        # way to reach a switch whose interfaces carry no MAC address.
+        if hints is not None:
+            for candidate in list(self.switches.values()) + self.switches_without_mac:
+                if hints.name and candidate.name == hints.name:
+                    return candidate
+                if hints.serial and candidate.serial == hints.serial:
+                    return candidate
+        return None
+
+    def seed_unmatchable_switch(self, name: str, ports: list[str], serial: str | None = None):
+        """A switch present in NetBox but NOT findable by interface MAC — the
+        common real-world case (switch ports rarely have mac_address set)."""
+        device = FakeDevice(name=name)
+        device.serial = serial
+        for port_name in ports:
+            device.interfaces[port_name] = FakeInterface(device, port_name)
+        self.switches_without_mac.append(device)
+        return device
+
+    def ensure_client_device_type(self, manufacturer_name: str) -> str:
+        from unifi_netbox_sync.naming import slugify
+
+        slug = slugify(manufacturer_name)
+        if not slug:
+            raise ValueError(f"unusable manufacturer {manufacturer_name!r}")
+        type_slug = f"{slug}-client"
+        with self._lock:
+            self.created_device_types.add(type_slug)
+        return type_slug
 
     def find_interface_by_name_candidates(self, device: FakeDevice, candidates: list[str]):
         for name in candidates:
@@ -250,6 +286,7 @@ def make_unifi_client(
     is_wired: bool = True,
     switch_mac: str | None = None,
     switch_port: int | None = None,
+    oui: str | None = None,
 ) -> UnifiClient:
     return UnifiClient(
         mac=mac,
@@ -258,6 +295,7 @@ def make_unifi_client(
         is_wired=is_wired,
         switch_mac=switch_mac,
         switch_port=switch_port,
+        oui=oui,
     )
 
 
@@ -267,10 +305,12 @@ class FakeUnifiClient:
         clients: list[UnifiClient] | None = None,
         devices: list[UnifiSwitchDevice] | None = None,
         by_site: dict[str, list[UnifiClient]] | None = None,
+        devices_by_site: dict[str, list[UnifiSwitchDevice]] | None = None,
     ) -> None:
         self._clients = clients or []
         self._devices = devices or []
         self._by_site = by_site
+        self._devices_by_site = devices_by_site
 
     def get_clients(self, site: str) -> list[UnifiClient]:
         if self._by_site is not None:
@@ -278,4 +318,6 @@ class FakeUnifiClient:
         return self._clients
 
     def get_devices(self, site: str) -> list[UnifiSwitchDevice]:
+        if self._devices_by_site is not None:
+            return self._devices_by_site.get(site, [])
         return self._devices
