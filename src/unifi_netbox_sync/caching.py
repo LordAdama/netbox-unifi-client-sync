@@ -179,6 +179,24 @@ class CachingNetboxGateway:
     def list_device_interfaces(self, device: Any) -> list[Any]:
         return self._inner.list_device_interfaces(device)
 
+    def forget_switch(self, mac: str) -> None:
+        """Drop a cached switch lookup, after creating the switch mid-run.
+
+        The cache stores negative results deliberately (see
+        find_switch_device_by_mac), which would otherwise keep a
+        just-created switch invisible for the rest of the run."""
+        with self._lock:
+            self._switches.pop(mac, None)
+
+    def ensure_device_type_from_spec(self, spec: Any) -> str:
+        return self._inner.ensure_device_type_from_spec(spec)
+
+    def ensure_device_role(self, role_slug: str) -> None:
+        self._inner.ensure_device_role(role_slug)
+
+    def upsert_infrastructure_device(self, *args: Any, **kwargs: Any) -> tuple[Any, bool, bool]:
+        return self._inner.upsert_infrastructure_device(*args, **kwargs)
+
     def ensure_client_device_type(self, manufacturer_name: str) -> str:
         # Already memoized inside PynetboxGateway, which is where the
         # create-if-missing has to be atomic anyway.

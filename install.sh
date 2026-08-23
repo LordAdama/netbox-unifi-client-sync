@@ -87,6 +87,9 @@ write_env() {
     printf '%s\n' "PORT_NAME_TEMPLATES=" >> .env
     printf '%s\n' "USE_OUI_MANUFACTURER=true" >> .env
     printf '%s\n' "OUI_FILE=" >> .env
+    printf '%s\n' "SYNC_UNIFI_DEVICES=false" >> .env
+    printf '%s\n' "DEVICETYPE_LIBRARY_PATH=" >> .env
+    printf '%s\n' "UNIFI_DEVICE_ROLE_SLUG=network-device" >> .env
     printf '%s\n' "CABLE_CONFLICT_POLICY=skip" >> .env
     printf '%s\n' "MARK_STALE_OFFLINE=true" >> .env
     printf '%s\n' "DEVICE_UPDATE_POLICY=sync" >> .env

@@ -9,6 +9,7 @@ import pynetbox
 import requests
 
 from .config import Settings
+from .devicetype_library import DeviceTypeLibrary, spec_from_unifi_device
 from .metrics import log_json_summary, write_prometheus_textfile
 from .models import ClientSyncResult, SitePair, SiteSyncStats, SyncSummary, UnifiClient
 from .naming import mac_suffixed_name, sanitize_device_name, slugify
@@ -64,6 +65,8 @@ def _merge_summaries(summaries: list[SyncSummary]) -> SyncSummary:
         merged.cables_created += s.cables_created
         merged.cables_skipped += s.cables_skipped
         merged.sites_created += s.sites_created
+        merged.devices_synced += s.devices_synced
+        merged.infra_created += s.infra_created
         merged.stale_marked_offline += s.stale_marked_offline
         merged.clients_unchanged += s.clients_unchanged
         merged.ips_unchanged += s.ips_unchanged
@@ -108,6 +111,7 @@ class SyncEngine:
         self.netbox = netbox
         self.settings = settings
         self._oui = OuiLookup(settings.oui_file)
+        self._library = DeviceTypeLibrary(settings.devicetype_library_path)
         # UniFi switch MAC -> what UniFi knows about that switch. Populated
         # per site from /stat/device, and used to find the switch in NetBox by
         # name or serial when its interfaces carry no MAC address.
@@ -323,6 +327,11 @@ class SyncEngine:
 
         self._load_switch_hints(pair.unifi_site)
 
+        if s.sync_unifi_devices:
+            # Before clients, so a switch created now is immediately available
+            # to terminate this same run's cables.
+            summary.devices_synced, summary.infra_created = self._sync_unifi_devices(pair)
+
         clients = self.unifi.get_clients(pair.unifi_site)
         summary.clients_seen = len(clients)
         seen_macs: set[str] = set()
@@ -391,6 +400,89 @@ class SyncEngine:
                     )
         logger.info("Loaded %d UniFi device(s) for site '%s' to match switches by name/serial",
                     len(devices), unifi_site)
+
+    # Per-type NetBox roles, so you can filter access points apart from
+    # switches in NetBox. Unrecognised types use unifi_device_role_slug.
+    _ROLE_BY_TYPE = {
+        "usw": "switch",
+        "uap": "wireless-ap",
+        "ugw": "router",
+        "udm": "router",
+        "uxg": "router",
+    }
+
+    def _sync_unifi_devices(self, pair: SitePair) -> tuple[int, int]:
+        """Create/update adopted UniFi infrastructure. Returns (seen, created)."""
+        s = self.settings
+        try:
+            devices = self.unifi.get_devices(pair.unifi_site)
+        except EXPECTED_CLIENT_ERRORS as exc:
+            logger.warning("Could not list UniFi devices for '%s': %s", pair.unifi_site, exc)
+            return 0, 0
+
+        adopted = [d for d in devices if d.adopted and d.mac]
+        if not adopted:
+            return 0, 0
+
+        created_count = 0
+        for device in adopted:
+            role_slug = self._ROLE_BY_TYPE.get(device.device_type, s.unifi_device_role_slug)
+            spec = self._library.lookup(device.model) or spec_from_unifi_device(device)
+            if s.dry_run:
+                logger.info(
+                    "[dry-run] would ensure UniFi %s %r (%s) as NetBox device type %r, role %r, "
+                    "with %d interface(s)",
+                    device.device_type or "device",
+                    device.name,
+                    device.model,
+                    spec.slug,
+                    role_slug,
+                    len(spec.interfaces),
+                )
+                continue
+
+            try:
+                self.netbox.ensure_device_role(role_slug)
+                type_slug = self.netbox.ensure_device_type_from_spec(spec)
+                _dev, created, _updated = self.netbox.upsert_infrastructure_device(
+                    device.mac,
+                    device.name,
+                    pair.netbox_site_slug,
+                    role_slug,
+                    type_slug,
+                    s.sync_tag,
+                    device.serial or "",
+                    s.device_update_policy,
+                )
+                created_count += int(created)
+                if created:
+                    logger.info(
+                        "Created NetBox device %r (%s %s) with %d port(s) from the controller",
+                        device.name,
+                        device.model,
+                        device.device_type,
+                        len(spec.interfaces),
+                    )
+                    # A switch that didn't exist a moment ago is now cabling
+                    # material; drop any cached "not found" for it.
+                    self._forget_switch(device.mac)
+            except EXPECTED_CLIENT_ERRORS as exc:
+                logger.exception("Failed syncing UniFi device %s (%s)", device.mac, device.name)
+                raise LookupError(f"UniFi device {device.name} ({device.mac}): {exc}") from exc
+
+        logger.info(
+            "Site '%s': %d adopted UniFi device(s), %d created in NetBox",
+            pair.unifi_site,
+            len(adopted),
+            created_count,
+        )
+        return len(adopted), created_count
+
+    def _forget_switch(self, mac: str) -> None:
+        """Invalidate a cached negative switch lookup after creating it."""
+        forget = getattr(self.netbox, "forget_switch", None)
+        if forget is not None:
+            forget(mac)
 
     def _hints_for(self, mac: str) -> SwitchHints | None:
         with self._hints_lock:

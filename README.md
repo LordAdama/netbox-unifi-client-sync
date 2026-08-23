@@ -30,12 +30,14 @@ For every active client the UniFi controller reports:
 - Optionally marks previously-synced client devices as `offline` (never
   deletes them) when UniFi stops reporting them.
 
-Switches themselves are **not created** by this tool — it assumes your
-switches are already inventoried in NetBox (matched by the MAC address of
-one of their interfaces) with interfaces named to match your switch's
-physical port labels. Client devices, on the other hand, are fully managed
-by the sync and tagged `unifi-sync` so they're easy to find and safe to
-distinguish from manually-entered NetBox data.
+Your UniFi hardware — switches, APs, gateways — can be created too, with
+`SYNC_UNIFI_DEVICES=true` (off by default; see "Syncing UniFi devices"). With
+it on, an empty NetBox is populated end to end in a single run: the switches
+with their real ports, the clients, and the cables between them. With it off,
+switches must already be inventoried in NetBox and only clients are created.
+
+Everything this tool creates is tagged `unifi-sync`, so it's easy to find and
+safe to distinguish from manually-entered NetBox data.
 
 ## How matching works
 
@@ -52,12 +54,67 @@ candidate name templates matched) and every ambiguous match (a MAC that
 appears on more than one NetBox interface) is logged at INFO/WARNING for
 troubleshooting.
 
+## Syncing UniFi devices (switches, APs, gateways)
+
+By default this tool only creates *clients*, and expects your UniFi hardware
+to already be in NetBox. Set `SYNC_UNIFI_DEVICES=true` and it will create the
+adopted infrastructure too:
+
+```bash
+SYNC_UNIFI_DEVICES=true
+SITE_POLICY=create      # if the NetBox sites don't exist yet either
+```
+
+Each adopted device becomes a NetBox device with:
+
+- **Its real ports**, built from the controller's own `port_table` — so a
+  24-port switch gets 24 interfaces, typed from the reported media and speed
+  (`1000base-t`, `10gbase-x-sfpp`, …). This is more accurate than any static
+  library, because it reflects the hardware actually in front of you.
+- **A per-type role**: `switch`, `wireless-ap` or `router`, so you can filter
+  them apart in NetBox. Anything unrecognised gets `UNIFI_DEVICE_ROLE_SLUG`.
+- **Its serial and a `unifi_mac` custom field**, which is the exact-match key
+  the cable code uses — devices created this way always wire up.
+
+Devices are created **before** clients in each run, so a switch created now
+terminates this same run's cables. Starting from an empty NetBox, one run
+gives you the switch, its ports, the clients, and the cables between them.
+
+Ports are named `Port 1`, `Port 2`, … — which the default
+`PORT_NAME_TEMPLATES` already resolve, so cabling needs no extra setup.
+
+Only *adopted* devices are synced; pending-adoption ones are ignored.
+
+### Nicer model names via devicetype-library
+
+Left alone, a device type is named after the UniFi model code (`USW24POE`).
+Point `DEVICETYPE_LIBRARY_PATH` at a clone of
+[netbox-community/devicetype-library](https://github.com/netbox-community/devicetype-library)
+and it will instead use that project's canonical model name, part number and
+rack height:
+
+```bash
+git clone --depth 1 https://github.com/netbox-community/devicetype-library
+DEVICETYPE_LIBRARY_PATH=/path/to/devicetype-library
+```
+
+Matching is on the model code against each YAML's `part_number`/`model`/`slug`,
+normalized so `USW24POE` finds `USW-24-POE`. If you have **already imported**
+those device types into NetBox, they're reused rather than duplicated.
+
+This is metadata polish, not a requirement: **ports always come from the
+controller**, never from the library, and an unmatched model still syncs with
+its full real port list. The library is only read when the path is set.
+
 ## Finding your switches
 
 Cables can only be created once the tool knows which NetBox device is the
 switch UniFi is reporting. It tries four joins, in descending order of
 precision, and logs which one matched:
 
+0. If `SYNC_UNIFI_DEVICES=true`, the switch was very likely created by this
+   tool with an exact `unifi_mac`, so strategy 2 below matches immediately
+   and none of this is a concern.
 1. A NetBox **interface** whose `mac_address` equals the switch MAC.
 2. A NetBox **device** with a `unifi_mac` custom field equal to the switch MAC.
 3. A NetBox **device serial** matching the switch's serial, or its MAC in
@@ -261,6 +318,9 @@ full list and defaults. Key ones:
 | `DEVICE_UPDATE_POLICY` | `sync` (default) or `create-only` — see "Site & update policies" |
 | `NETBOX_IP_STATUS` | Status set on IP addresses this tool creates (default `active`) |
 | `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order; blank uses the built-in list |
+| `SYNC_UNIFI_DEVICES` | Create adopted UniFi switches/APs/gateways in NetBox (default `false`) — see "Syncing UniFi devices" |
+| `DEVICETYPE_LIBRARY_PATH` | Local devicetype-library clone, for canonical model names/part numbers |
+| `UNIFI_DEVICE_ROLE_SLUG` | Role for created UniFi devices of unrecognised type (default `network-device`) |
 | `USE_OUI_MANUFACTURER` | Give clients a device type carrying their real vendor (default `true`) — see "Manufacturers" |
 | `OUI_FILE` | Optional IEEE `oui.txt` / Wireshark `manuf` file, used only when the controller reports no vendor |
 | `CABLE_CONFLICT_POLICY` | `skip` (default, non-destructive) or `replace` when a target port is already cabled to something else |
@@ -515,6 +575,8 @@ every push/PR.
   parallel site workers share one instance.
 - `naming.py` — device-name sanitization, the deterministic MAC-suffix
   collision fallback, and NetBox slug generation.
+- `devicetype_library.py` — optional index over a devicetype-library clone,
+  plus the UniFi-media/speed to NetBox-interface-type mapping.
 - `oui.py` — locally-administered (randomized) MAC detection and the
   optional offline IEEE/Wireshark OUI file parser.
 - `metrics.py` — the JSON run-summary log line and optional Prometheus

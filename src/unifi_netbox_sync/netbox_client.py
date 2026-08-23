@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 import pynetbox
 
+from .devicetype_library import normalize_model
 from .naming import slugify
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,22 @@ class NetboxGateway(Protocol):
     def find_switch_device_by_mac(self, mac: str, hints: SwitchHints | None = None) -> Any | None: ...
 
     def ensure_client_device_type(self, manufacturer_name: str) -> str: ...
+
+    def ensure_device_type_from_spec(self, spec: Any) -> str: ...
+
+    def ensure_device_role(self, role_slug: str) -> None: ...
+
+    def upsert_infrastructure_device(
+        self,
+        mac: str,
+        name: str,
+        site_slug: str,
+        role_slug: str,
+        device_type_slug: str,
+        tag_slug: str,
+        serial: str = "",
+        update_policy: str = "sync",
+    ) -> tuple[Any, bool, bool]: ...
 
     def find_interface_by_name_candidates(self, device: Any, candidates: list[str]) -> Any | None: ...
 
@@ -89,6 +106,7 @@ class PynetboxGateway:
         self._role_memo: dict[str, Any] = {}
         self._site_memo: dict[str, Any] = {}
         self._client_type_memo: dict[str, str] = {}
+        self._infra_type_memo: dict[str, str] = {}
 
     def _memoized(self, memo: dict[str, Any], key: str, fetch: Callable[[], Any]) -> Any:
         with self._memo_lock:
@@ -258,6 +276,130 @@ class PynetboxGateway:
 
     def list_device_interfaces(self, device: Any) -> list[Any]:
         return list(self.api.dcim.interfaces.filter(device_id=device.id))
+
+    def ensure_device_type_from_spec(self, spec: Any) -> str:
+        """Find or create a NetBox device type, with its interface templates.
+
+        Matching is by slug, then by normalized part number, so a device type
+        already imported from devicetype-library is reused rather than
+        duplicated. Interface *templates* are used (not per-device
+        interfaces): NetBox instantiates them automatically on every device of
+        this type, which is both idiomatic and far fewer API calls.
+        """
+        with self._memo_lock:
+            if spec.slug in self._infra_type_memo:
+                return self._infra_type_memo[spec.slug]
+
+        existing = self.api.dcim.device_types.get(slug=spec.slug)
+        if existing is None and spec.part_number:
+            wanted = normalize_model(spec.part_number)
+            existing = next(
+                (
+                    dt
+                    for dt in self.api.dcim.device_types.filter(manufacturer=slugify(spec.manufacturer))
+                    if normalize_model(getattr(dt, "part_number", "") or "") == wanted
+                ),
+                None,
+            )
+
+        if existing is not None:
+            resolved = existing.slug
+            logger.info("Reusing NetBox device type %r for %s", resolved, spec.part_number or spec.model)
+        else:
+            manufacturer = self._ensure_manufacturer(spec.manufacturer)
+            created = self.api.dcim.device_types.create(
+                manufacturer=manufacturer.id,
+                model=spec.model,
+                slug=spec.slug,
+                part_number=spec.part_number,
+                u_height=spec.u_height,
+                is_full_depth=spec.is_full_depth,
+            )
+            resolved = created.slug
+            if spec.interfaces:
+                self.api.dcim.interface_templates.create(
+                    [
+                        {"device_type": created.id, "name": name, "type": iface_type}
+                        for name, iface_type in spec.interfaces
+                    ]
+                )
+            logger.info(
+                "Created NetBox device type %r with %d interface template(s)",
+                spec.model,
+                len(spec.interfaces),
+            )
+
+        with self._memo_lock:
+            self._infra_type_memo[spec.slug] = resolved
+        return resolved
+
+    def _ensure_manufacturer(self, name: str) -> Any:
+        slug = slugify(name)
+        manufacturer = self.api.dcim.manufacturers.get(slug=slug)
+        if manufacturer is None:
+            manufacturer = self.api.dcim.manufacturers.create(name=name, slug=slug)
+            logger.info("Created NetBox manufacturer %r", name)
+        return manufacturer
+
+    def upsert_infrastructure_device(
+        self,
+        mac: str,
+        name: str,
+        site_slug: str,
+        role_slug: str,
+        device_type_slug: str,
+        tag_slug: str,
+        serial: str = "",
+        update_policy: str = "sync",
+    ) -> tuple[Any, bool, bool]:
+        """Create or update an adopted UniFi device. Returns (device, created, updated).
+
+        The unifi_mac custom field is always set, which makes this device
+        findable by the exact-match strategy the cable code tries second — so
+        devices created here wire up reliably regardless of naming.
+        """
+        device = next(iter(self.api.dcim.devices.filter(cf_unifi_mac=mac)), None)
+        if device is None and name:
+            device = next(iter(self.api.dcim.devices.filter(name=name, site=site_slug)), None)
+        if device is None and serial:
+            device = next(iter(self.api.dcim.devices.filter(serial=serial)), None)
+
+        site = self.find_site(site_slug)
+        if site is None:
+            raise LookupError(f"NetBox site '{site_slug}' does not exist")
+
+        if device is None:
+            device = self.api.dcim.devices.create(
+                name=name,
+                device_type=self._get_device_type(device_type_slug).id,
+                role=self._get_role(role_slug).id,
+                site=site.id,
+                serial=serial,
+                status="active",
+                custom_fields={"unifi_mac": mac},
+                tags=[{"slug": tag_slug}],
+            )
+            return device, True, False
+
+        if update_policy == "create-only":
+            return device, False, False
+
+        updated = False
+        if name and device.name != name:
+            device.name = name
+            updated = True
+        if serial and (device.serial or "") != serial:
+            device.serial = serial
+            updated = True
+        if (device.custom_fields or {}).get("unifi_mac") != mac:
+            device.custom_fields = {**(device.custom_fields or {}), "unifi_mac": mac}
+            updated = True
+        if updated:
+            device.save()
+        return device, False, updated
+
+    def ensure_device_role(self, role_slug: str) -> None:
+        self._ensure_device_role(role_slug)
 
     def ensure_client_device_type(self, manufacturer_name: str) -> str:
         """Get (creating if needed) a client device type for this manufacturer.
