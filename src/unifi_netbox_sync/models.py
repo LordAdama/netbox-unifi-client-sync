@@ -41,6 +41,23 @@ class UnifiClient:
 
 
 @dataclass
+class UnifiSite:
+    """A site on the controller.
+
+    `name` is the opaque id used in API paths (e.g. "7xk2p9qr"); `description`
+    is the human label shown in the UI (e.g. "Head Office"). NetBox slugs are
+    derived from the description, since the id is meaningless to operators.
+    """
+
+    name: str
+    description: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.description or self.name
+
+
+@dataclass
 class SitePair:
     """One UniFi site synced into one NetBox site."""
 

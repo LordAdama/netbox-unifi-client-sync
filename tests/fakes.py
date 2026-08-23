@@ -4,7 +4,7 @@ import threading
 from dataclasses import dataclass, field
 from itertools import count
 
-from unifi_netbox_sync.models import UnifiClient, UnifiSwitchDevice
+from unifi_netbox_sync.models import UnifiClient, UnifiSite, UnifiSwitchDevice
 
 _id_counter = count(1)
 
@@ -306,11 +306,19 @@ class FakeUnifiClient:
         devices: list[UnifiSwitchDevice] | None = None,
         by_site: dict[str, list[UnifiClient]] | None = None,
         devices_by_site: dict[str, list[UnifiSwitchDevice]] | None = None,
+        sites: list[UnifiSite] | None = None,
     ) -> None:
         self._clients = clients or []
         self._devices = devices or []
         self._by_site = by_site
         self._devices_by_site = devices_by_site
+        self._sites = sites
+
+    def get_sites(self) -> list[UnifiSite]:
+        if self._sites is not None:
+            return self._sites
+        # Default: infer from whatever per-site client data the test supplied.
+        return [UnifiSite(name=name) for name in (self._by_site or {})]
 
     def get_clients(self, site: str) -> list[UnifiClient]:
         if self._by_site is not None:
