@@ -59,6 +59,14 @@ class NetboxGateway(Protocol):
     def find_client_device_by_mac(self, mac: str) -> Any | None: ...
 
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool: ...
+    """Is `name` used by a device other than `mac` in this site?
+
+    Implementations must return False for a site that does not exist: an
+    absent site holds no devices, so no name in it can be taken. NetBox's
+    own filters answer an unknown site slug with a 400 rather than an empty
+    list, so this has to be handled rather than passed through — it is the
+    normal state under --dry-run with SITE_POLICY=create.
+    """
 
     def find_site(self, site_slug: str) -> Any | None: ...
 
@@ -107,6 +115,8 @@ class PynetboxGateway:
         self._site_memo: dict[str, Any] = {}
         self._client_type_memo: dict[str, str] = {}
         self._infra_type_memo: dict[str, str] = {}
+        self._site_missing: set[str] = set()
+        self._warned: set[str] = set()
 
     def _memoized(self, memo: dict[str, Any], key: str, fetch: Callable[[], Any]) -> Any:
         with self._memo_lock:
@@ -249,15 +259,68 @@ class PynetboxGateway:
         return next(iter(self.api.dcim.devices.filter(cf_unifi_mac=mac)), None)
 
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool:
-        existing = next(iter(self.api.dcim.devices.filter(name=name, site=site_slug)), None)
+        # NetBox validates ?site=<slug> against existing sites and answers a
+        # unknown slug with 400 "Select a valid choice", not an empty list. A
+        # site that doesn't exist holds no devices, so nothing can be taken —
+        # and this is the normal case under --dry-run with SITE_POLICY=create,
+        # where the sites would only have been created by a real run.
+        if not self._site_exists(site_slug):
+            return False
+        try:
+            existing = next(iter(self.api.dcim.devices.filter(name=name, site=site_slug)), None)
+        except pynetbox.RequestError as exc:
+            if getattr(exc, "req", None) is not None and exc.req.status_code == 400:
+                # A validation error means this NetBox can't answer the query
+                # at all (version differences in the device filters). Treat the
+                # name as free: a genuine duplicate then fails loudly on create
+                # for that one device, rather than every client dying here.
+                self._warn_once(
+                    f"name-filter-400:{site_slug}",
+                    "NetBox rejected the device name-uniqueness filter for site '%s' (%s); "
+                    "assuming names are free. A real collision will surface when the device "
+                    "is created.",
+                    site_slug,
+                    exc,
+                )
+                return False
+            raise
         if existing is None:
             return False
         return (existing.custom_fields or {}).get("unifi_mac") != mac
+
+    def _site_exists(self, site_slug: str) -> bool:
+        """Whether the site is present, with the negative result cached.
+
+        find_site deliberately caches only hits, so a site that is missing
+        would be re-queried for every client. Misses are tracked separately
+        here and cleared by ensure_site when it creates one.
+        """
+        with self._memo_lock:
+            if site_slug in self._site_memo:
+                return True
+            if site_slug in self._site_missing:
+                return False
+        exists = self.find_site(site_slug) is not None
+        if not exists:
+            with self._memo_lock:
+                self._site_missing.add(site_slug)
+        return exists
+
+    def _warn_once(self, key: str, message: str, *args: Any) -> None:
+        with self._memo_lock:
+            if key in self._warned:
+                return
+            self._warned.add(key)
+        logger.warning(message, *args)
 
     def list_synced_client_devices(self, tag_slug: str, site_slug: str) -> list[Any]:
         # Scoped to one NetBox site: with multiple sites synced in a single
         # run, an unscoped query here would see every site's tagged devices
         # and could mark a device stale based on another site's client list.
+        # A site that doesn't exist holds nothing to mark stale, and filtering
+        # on an unknown slug is a 400 rather than an empty list.
+        if not self._site_exists(site_slug):
+            return []
         return list(self.api.dcim.devices.filter(tag=tag_slug, site=site_slug))
 
     def find_site(self, site_slug: str) -> Any | None:
@@ -458,6 +521,7 @@ class PynetboxGateway:
         )
         with self._memo_lock:
             self._site_memo[site_slug] = site
+            self._site_missing.discard(site_slug)
         logger.info("Created NetBox site %r (SITE_POLICY=create)", site_slug)
         return site, True
 

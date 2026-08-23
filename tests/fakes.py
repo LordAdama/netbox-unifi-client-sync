@@ -186,6 +186,11 @@ class FakeNetboxGateway:
             return self.clients_by_mac.get(mac)
 
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool:
+        # Real NetBox 400s on a filter naming a site that doesn't exist, rather
+        # than returning an empty list. Mirrored here so the fake can't pass
+        # where production would fail.
+        if self.find_site(site_slug) is None:
+            return False
         with self._lock:
             entries = list(self.clients_by_mac.items())
         return any(
@@ -271,6 +276,8 @@ class FakeNetboxGateway:
         return True, None
 
     def list_synced_client_devices(self, tag_slug: str, site_slug: str):
+        if self.find_site(site_slug) is None:
+            return []
         with self._lock:
             devices = list(self.clients_by_mac.values())
         return [d for d in devices if tag_slug in d.tags and d.site_slug == site_slug]

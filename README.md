@@ -496,6 +496,31 @@ interface lookup per client, which no amount of caching removes. Getting
 below that needs bulk/`ORM` access — i.e. the NetBox-plugin path — rather
 than more tuning of an API client.
 
+## Troubleshooting
+
+**`--dry-run` reports skipped cables.** The run tells you why, at WARNING
+level, for each distinct switch:
+
+- *"No NetBox device found for UniFi switch …"* — the switch isn't in NetBox
+  under any of the four joins. See "Finding your switches", or turn on
+  `SYNC_UNIFI_DEVICES=true` and let the tool create it.
+- *"UniFi port N on 'X' matched no NetBox interface. Looked for […]; that
+  device's interfaces are named […]"* — a naming mismatch. Copy a pattern
+  from the reported names into `PORT_NAME_TEMPLATES`, e.g. for Junos-style
+  `ge-0/0/1` ports:
+
+  ```bash
+  PORT_NAME_TEMPLATES=ge-0/0/{port}
+  ```
+
+Dry-run emits exactly the same diagnostics a real run would, so you can
+resolve all of this before writing anything.
+
+**A device or site name looks wrong in the plan.** Device names are
+sanitized and de-duplicated per site (see "What it does"); site slugs under
+`SITE_MAP=*` come from the UniFi site *description*. Pin any slug you don't
+like with an explicit `SITE_MAP` entry.
+
 ## Known limitations
 
 Documented rather than solved, because they're fine at the scale this was
