@@ -65,7 +65,7 @@ class SyncSummary:
     cables_created: int = 0
     cables_skipped: int = 0
     stale_marked_offline: int = 0
-    site_created: bool = False
+    sites_created: int = 0
     duration_seconds: float = 0.0
     errors: list[str] | None = None
     client_results: list[ClientSyncResult] | None = None

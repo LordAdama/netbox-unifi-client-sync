@@ -30,7 +30,7 @@ def test_create_policy_creates_missing_site_and_proceeds():
 
     summary = engine.run()
 
-    assert summary.site_created is True
+    assert summary.sites_created == 1
     assert summary.devices_created == 1
     assert "main" in netbox.created_sites
 
@@ -43,7 +43,7 @@ def test_create_policy_does_not_touch_an_existing_site():
 
     summary = engine.run()
 
-    assert summary.site_created is False
+    assert summary.sites_created == 0
     assert "main" not in netbox.created_sites
 
 
@@ -58,7 +58,7 @@ def test_dry_run_warns_but_does_not_raise_when_site_missing_and_policy_require()
 
     summary = engine.run()  # must not raise in dry-run
 
-    assert summary.site_created is False
+    assert summary.sites_created == 0
 
 
 def test_dry_run_previews_site_creation_under_create_policy():
@@ -72,7 +72,7 @@ def test_dry_run_previews_site_creation_under_create_policy():
 
     summary = engine.run()
 
-    assert summary.site_created is True  # planned, not actually created
+    assert summary.sites_created == 1  # planned, not actually created
     assert "main" not in netbox.created_sites  # dry-run: nothing actually written
 
 

@@ -17,7 +17,7 @@ _HELP_TEXT = {
     "cables_created": "NetBox cables created in the last sync run",
     "cables_skipped": "NetBox cables skipped (conflict or no match) in the last sync run",
     "stale_marked_offline": "NetBox client devices marked offline in the last sync run",
-    "site_created": "Whether the last sync run created the NetBox site (SITE_POLICY=create)",
+    "sites_created": "Number of NetBox sites created by the last sync run (SITE_POLICY=create)",
     "errors": "Errors encountered in the last sync run",
     "duration_seconds": "Wall-clock duration of the last sync run, in seconds",
 }
@@ -32,7 +32,7 @@ def summary_as_dict(summary: SyncSummary) -> dict:
         "cables_created": summary.cables_created,
         "cables_skipped": summary.cables_skipped,
         "stale_marked_offline": summary.stale_marked_offline,
-        "site_created": int(summary.site_created),
+        "sites_created": summary.sites_created,
         "errors": len(summary.errors or []),
         "duration_seconds": round(summary.duration_seconds, 3),
     }

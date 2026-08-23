@@ -235,14 +235,23 @@ pairs, which then completely replaces `UNIFI_SITE`/`NETBOX_SITE_SLUG`:
 SITE_MAP=default:main,branch-office:branch
 ```
 
-Each pair is synced independently with its own client list, its own
-`SITE_POLICY`/site-creation check, and its own device-name-collision and
-stale-device scoping — a client in one NetBox site never affects another
-site's devices, and the same device name is fine in two different sites
-(NetBox's uniqueness constraint is per-site, and this tool's collision
-check respects that). The run summary reports totals across all sites
-combined; per-site progress is logged as it happens
-(`Site 'X' -> NetBox 'Y': N clients, ...`).
+Each pair is synced independently with its own client list and its own
+`SITE_POLICY`/site-creation check. Device-name-collision checks and
+stale-device marking are scoped by *NetBox site*, not by UniFi site — a
+client in one NetBox site never affects another site's devices, and the
+same device name is fine in two different sites (NetBox's uniqueness
+constraint is per-site, and this tool's collision check respects that).
+If two UniFi sites happen to map to the *same* NetBox site slug (e.g.
+consolidating them), that's handled correctly too: stale-device marking
+uses the union of both pairs' clients for that shared NetBox site, and if
+one of those pairs fails, stale-marking for the shared site is skipped
+entirely for that run rather than acting on incomplete information — a
+site's clients not being known yet is not the same as a device being
+gone. A site-level failure (e.g. a `require`d NetBox site missing, or the
+UniFi controller erroring for one site) is recorded as an error for that
+pair without stopping the other pairs in the same run. The run summary
+reports totals across all sites combined; per-site progress is logged as
+it happens (`Site 'X' -> NetBox 'Y': N clients, ...`).
 
 Policy settings (`SITE_POLICY`, `DEVICE_UPDATE_POLICY`,
 `CABLE_CONFLICT_POLICY`, etc.) are global — they apply the same way to
@@ -272,7 +281,7 @@ Two independent, conservative-by-default policy knobs:
 
 Both apply in dry-run too (as previews, not real writes), and every
 decision — site created vs. reused, an update skipped by policy — is
-logged and counted in the run summary (`site_created`,
+logged and counted in the run summary (`sites_created`,
 `devices_update_skipped`) for auditability.
 
 ### NetBox compatibility
@@ -352,12 +361,17 @@ every push/PR.
 - `sync.py` — orchestrates the sync; all mutating NetBox calls are skipped
   in dry-run mode, with planned actions logged instead. Loops over
   `Settings.site_pairs()` (one pair for the default single-site case),
-  calling `_run_site()` for each and merging their summaries; a site-level
-  failure (e.g. a `require`d missing NetBox site, an API error during
-  `ensure_site()`/`ensure_prerequisites()`) is caught and recorded as an
-  error for that site without stopping the others. Per-client errors within
-  a site are caught the same way (see "Known limitations") — narrowly, so a
-  real bug isn't masked as a routine sync failure.
+  calling `_run_site()` for each; a site-level failure (e.g. a `require`d
+  missing NetBox site, an API error during `ensure_site()`/
+  `ensure_prerequisites()`) is caught and recorded as an error for that
+  site without stopping the others. Per-client errors within a site are
+  caught the same way (see "Known limitations") — narrowly, so a real bug
+  isn't masked as a routine sync failure. Stale-device marking is
+  deliberately *not* done inside `_run_site()`: `run()` first groups every
+  pair's `seen_macs` by NetBox site slug (so two pairs sharing a slug get
+  the union, not each other's false positives), then marks stale devices
+  once per distinct slug — skipping any slug whose pair(s) included a
+  failure, since acting on an incomplete client list risks false offlines.
 - `naming.py` — device-name sanitization and the deterministic
   MAC-suffix collision fallback.
 - `metrics.py` — the JSON run-summary log line and optional Prometheus
