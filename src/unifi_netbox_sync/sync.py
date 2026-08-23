@@ -651,12 +651,21 @@ class SyncEngine:
                 client.switch_mac, self._hints_for(client.switch_mac)
             )
             if switch_device is None:
-                result.cable_skipped_reason = "switch not found in NetBox"
+                result.cable_skipped_reason = (
+                    f"switch {client.switch_mac} not found in NetBox (port {client.switch_port})"
+                )
+                # Same diagnostics as a real run: a preview reporting "N cables
+                # skipped" without saying why is the one thing an operator
+                # cannot act on.
+                self._log_switch_not_found(client.switch_mac)
                 return
             candidates = [t.format(port=client.switch_port) for t in self.settings.port_name_templates]
             switch_iface = self.netbox.find_interface_by_name_candidates(switch_device, candidates)
             if switch_iface is None:
-                result.cable_skipped_reason = f"no switch interface matched {candidates}"
+                result.cable_skipped_reason = (
+                    f"no interface on {switch_device.name} matched {candidates}"
+                )
+                self._log_port_mismatch(switch_device, client.switch_port, candidates)
                 return
             result.cable_created = True
 
