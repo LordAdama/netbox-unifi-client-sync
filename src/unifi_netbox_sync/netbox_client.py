@@ -46,7 +46,7 @@ class NetboxGateway(Protocol):
 
     def ensure_cable(self, interface_a: Any, interface_b: Any, conflict_policy: str) -> tuple[bool, str | None]: ...
 
-    def list_synced_client_devices(self, tag_slug: str) -> list[Any]: ...
+    def list_synced_client_devices(self, tag_slug: str, site_slug: str) -> list[Any]: ...
 
     def mark_offline(self, device: Any) -> None: ...
 
@@ -144,8 +144,11 @@ class PynetboxGateway:
             return False
         return (existing.custom_fields or {}).get("unifi_mac") != mac
 
-    def list_synced_client_devices(self, tag_slug: str) -> list[Any]:
-        return list(self.api.dcim.devices.filter(tag=tag_slug))
+    def list_synced_client_devices(self, tag_slug: str, site_slug: str) -> list[Any]:
+        # Scoped to one NetBox site: with multiple sites synced in a single
+        # run, an unscoped query here would see every site's tagged devices
+        # and could mark a device stale based on another site's client list.
+        return list(self.api.dcim.devices.filter(tag=tag_slug, site=site_slug))
 
     def find_site(self, site_slug: str) -> Any | None:
         return self.api.dcim.sites.get(slug=site_slug)

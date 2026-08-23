@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from unifi_netbox_sync.sync import SyncEngine
 
 from .fakes import FakeNetboxGateway, FakeUnifiClient, make_unifi_client
@@ -15,8 +13,12 @@ def test_require_policy_fails_when_site_missing():
     unifi = FakeUnifiClient(clients=[client])
     engine = SyncEngine(unifi=unifi, netbox=netbox, settings=make_settings(site_policy="require"))
 
-    with pytest.raises(LookupError):
-        engine.run()
+    summary = engine.run()  # does not raise: recorded as a site-level error instead
+
+    assert len(summary.errors) == 1
+    assert "main" in summary.errors[0]
+    assert summary.devices_created == 0
+    assert netbox.clients_by_mac == {}
 
 
 def test_create_policy_creates_missing_site_and_proceeds():

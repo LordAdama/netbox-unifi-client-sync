@@ -30,7 +30,7 @@ class FakeInterface:
 
 
 class FakeDevice:
-    def __init__(self, name: str, mac: str | None = None) -> None:
+    def __init__(self, name: str, mac: str | None = None, site_slug: str | None = None) -> None:
         self.id = next(_id_counter)
         self.name = name
         self.status = Choice("active")
@@ -38,6 +38,7 @@ class FakeDevice:
         self.primary_ip4 = None
         self.tags: list[str] = []
         self.interfaces: dict[str, FakeInterface] = {}
+        self.site_slug = site_slug
 
 
 class FakeSite:
@@ -85,7 +86,11 @@ class FakeNetboxGateway:
         return self.clients_by_mac.get(mac)
 
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool:
-        return any(device.name == name for other_mac, device in self.clients_by_mac.items() if other_mac != mac)
+        return any(
+            device.name == name and device.site_slug == site_slug
+            for other_mac, device in self.clients_by_mac.items()
+            if other_mac != mac
+        )
 
     def find_site(self, site_slug: str):
         if site_slug in self.missing_sites and site_slug not in self.created_sites:
@@ -109,7 +114,7 @@ class FakeNetboxGateway:
                 return existing, False, would_change
             existing.name = name
             return existing, False, False
-        device = FakeDevice(name=name, mac=mac)
+        device = FakeDevice(name=name, mac=mac, site_slug=site_slug)
         device.tags.append(tag_slug)
         self.clients_by_mac[mac] = device
         return device, True, False
@@ -141,8 +146,8 @@ class FakeNetboxGateway:
         self.cables.add(pair)
         return True, None
 
-    def list_synced_client_devices(self, tag_slug: str):
-        return [d for d in self.clients_by_mac.values() if tag_slug in d.tags]
+    def list_synced_client_devices(self, tag_slug: str, site_slug: str):
+        return [d for d in self.clients_by_mac.values() if tag_slug in d.tags and d.site_slug == site_slug]
 
     def mark_offline(self, device: FakeDevice) -> None:
         device.status = Choice("offline")
@@ -167,11 +172,19 @@ def make_unifi_client(
 
 
 class FakeUnifiClient:
-    def __init__(self, clients: list[UnifiClient], devices: list[UnifiSwitchDevice] | None = None) -> None:
-        self._clients = clients
+    def __init__(
+        self,
+        clients: list[UnifiClient] | None = None,
+        devices: list[UnifiSwitchDevice] | None = None,
+        by_site: dict[str, list[UnifiClient]] | None = None,
+    ) -> None:
+        self._clients = clients or []
         self._devices = devices or []
+        self._by_site = by_site
 
     def get_clients(self, site: str) -> list[UnifiClient]:
+        if self._by_site is not None:
+            return self._by_site.get(site, [])
         return self._clients
 
     def get_devices(self, site: str) -> list[UnifiSwitchDevice]:
