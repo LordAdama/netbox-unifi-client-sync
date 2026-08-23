@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from .caching import CachingNetboxGateway
 from .config import Settings
 from .logging_utils import configure_logging
 from .netbox_client import PynetboxGateway
@@ -41,10 +42,12 @@ def main(argv: list[str] | None = None) -> int:
         is_udm=settings.unifi_is_udm,
         verify_ssl=settings.unifi_verify_ssl,
     ) as unifi:
-        netbox = PynetboxGateway(
-            url=settings.netbox_url,
-            token=settings.netbox_token,
-            verify_ssl=settings.netbox_verify_ssl,
+        netbox = CachingNetboxGateway(
+            PynetboxGateway(
+                url=settings.netbox_url,
+                token=settings.netbox_token,
+                verify_ssl=settings.netbox_verify_ssl,
+            )
         )
         engine = SyncEngine(unifi=unifi, netbox=netbox, settings=settings)
         summary = engine.run()

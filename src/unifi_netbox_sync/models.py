@@ -53,7 +53,27 @@ class ClientSyncResult:
     cable_created: bool = False
     cable_skipped_reason: str | None = None
     device_update_skipped_reason: str | None = None
+    # Set when that specific aspect was inspected and already correct, so no
+    # write was issued for it.
+    ip_unchanged: bool = False
+    cable_unchanged: bool = False
+    # True when nothing at all was written for this client.
+    unchanged: bool = False
     error: str | None = None
+
+
+@dataclass
+class SiteSyncStats:
+    """Per-site timing and counts, for spotting which site is expensive."""
+
+    unifi_site: str
+    netbox_site_slug: str
+    clients_seen: int = 0
+    devices_created: int = 0
+    devices_updated: int = 0
+    cables_created: int = 0
+    errors: int = 0
+    duration_seconds: float = 0.0
 
 
 @dataclass
@@ -66,12 +86,22 @@ class SyncSummary:
     cables_skipped: int = 0
     stale_marked_offline: int = 0
     sites_created: int = 0
+    # Work that was inspected and correctly required no write. High numbers
+    # here are the healthy steady state, not a problem.
+    clients_unchanged: int = 0
+    ips_unchanged: int = 0
+    cables_unchanged: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
     duration_seconds: float = 0.0
     errors: list[str] | None = None
     client_results: list[ClientSyncResult] | None = None
+    site_stats: list[SiteSyncStats] | None = None
 
     def __post_init__(self) -> None:
         if self.errors is None:
             self.errors = []
         if self.client_results is None:
             self.client_results = []
+        if self.site_stats is None:
+            self.site_stats = []

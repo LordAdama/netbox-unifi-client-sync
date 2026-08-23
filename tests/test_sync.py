@@ -69,7 +69,9 @@ def test_same_client_keeps_its_own_name_across_runs():
     engine.run()
     summary = engine.run()  # second run: same client, same name — not a collision with itself
 
-    assert summary.devices_updated == 1
+    # Nothing differs, so nothing is written: reported as unchanged, not updated.
+    assert summary.devices_updated == 0
+    assert summary.clients_unchanged == 1
     assert netbox.clients_by_mac["11:22:33:44:55:66"].name == "laptop"
 
 
@@ -196,7 +198,7 @@ def test_metrics_file_written_when_configured(tmp_path):
 
 def test_stale_client_marked_offline():
     netbox = FakeNetboxGateway()
-    stale_device, _, _ = netbox.upsert_client_device(
+    stale_device, *_ = netbox.upsert_client_device(
         "99:88:77:66:55:44", "old-laptop", "main", "unifi-client", "generic-network-client", "unifi-sync"
     )
     unifi = FakeUnifiClient(clients=[])  # UniFi no longer reports this client

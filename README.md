@@ -220,6 +220,7 @@ full list and defaults. Key ones:
 | `DRY_RUN` | Plan only, make no changes (same as `--dry-run`) |
 | `LOG_FORMAT` | `text` (default) or `json` — one JSON object per log line, for log shippers |
 | `METRICS_FILE` | If set, write Prometheus textfile-collector metrics to this path after every run |
+| `MAX_WORKERS` | NetBox sites synced concurrently (default `1`) — see "Scaling" |
 | `SYNC_INTERVAL_SECONDS` | Docker only — `0`/unset runs once and exits, a positive number loops forever on that interval |
 | `LOCK_FILE` | Docker only, optional — `flock` path to avoid two instances racing on the same NetBox (see "Known limitations") |
 | `HEARTBEAT_FILE` | Docker only — path the healthcheck reads (default `/tmp/last-sync-ok`); override if `/tmp` is constrained in your setup |
@@ -305,6 +306,56 @@ output — point node_exporter's `--collector.textfile.directory` (or
 equivalent) at that directory rather than running this tool as its own
 metrics server, which doesn't fit a periodic batch job.
 
+## Scaling
+
+Two things dominate runtime: how many NetBox round-trips each client costs,
+and whether sites are synced one at a time.
+
+**Per-client round-trips.** A steady-state run — where the network hasn't
+changed and the right answer is "do nothing" — costs about **3 gateway calls
+per client**, down from 11–14 before this work. Three things get it there,
+all on by default:
+
+- *Run-scoped caching* of lookups that are constant for a run: the NetBox
+  site, the device type/role, and (the big one) switch devices and their
+  interfaces. Resolving a switch port used to cost up to one lookup per
+  candidate name per client; a switch's interfaces are now fetched once and
+  matched in memory, so 48 clients behind one switch cost 1 interface list
+  instead of up to 192 lookups.
+- *No-op short-circuiting*: if the device already holds its own name the
+  uniqueness query is skipped; if the primary IP already matches, no IP write;
+  if the cable already lands on the right port, no cable write.
+- *Honest change reporting*: `devices_updated` now counts devices actually
+  written, not merely seen. A quiet run reports `clients_unchanged`, and the
+  `sync_summary` line makes churn visible at a glance.
+
+Measured on a synthetic 20-site × 2-switch × 48-port estate (1,920 clients),
+steady-state re-run: **9,660 → 5,881 gateway calls** (39% fewer) from caching
+alone, on top of the no-op savings, with 1,920/1,920 clients correctly
+detected as unchanged.
+
+**Concurrency.** `MAX_WORKERS` (default `1`) syncs that many NetBox sites at
+once. Pairs are grouped by *NetBox* site and a group is never split across
+workers, so two UniFi sites consolidated into one NetBox site still run
+sequentially together — the stale-marking union and single-writer-per-site
+guarantee are structural, not something you have to configure correctly.
+Because the work is round-trip-bound, speedup is near-linear until NetBox
+becomes the bottleneck; against a simulated 2 ms/call NetBox, 12 sites went
+1.94 s → 0.17 s at `MAX_WORKERS=12`. Raise it gradually and watch the
+per-site metrics — the ceiling is your NetBox instance, not this tool.
+
+**Partitioning across processes.** For very large estates, split `SITE_MAP`
+across several containers so each owns a disjoint set of UniFi sites. Two
+instances must never share a NetBox site — there is no distributed lock, so
+they would race (see "Known limitations"). Partition on NetBox site
+boundaries and the instances never touch the same objects.
+
+**Where this still won't go.** Hundreds of sites with tens of thousands of
+clients will remain round-trip-bound: the floor is a device lookup and an
+interface lookup per client, which no amount of caching removes. Getting
+below that needs bulk/`ORM` access — i.e. the NetBox-plugin path — rather
+than more tuning of an API client.
+
 ## Known limitations
 
 Documented rather than solved, because they're fine at the scale this was
@@ -316,7 +367,12 @@ for something bigger:
   can guard against overlap between instances that share a `LOCK_FILE`
   path (e.g. two containers with the same bind-mounted volume), but that's
   opt-in and does nothing for instances that don't share the file — don't
-  run multiple unrelated instances against the same NetBox.
+  run multiple unrelated instances against the same NetBox. `MAX_WORKERS`
+  is *within* one process and is safe: workers never share a NetBox site.
+- **A roaming MAC across two NetBox sites is unhandled.** The client-device
+  lookup is by MAC and global, so if the same client appears in two UniFi
+  sites that map to *different* NetBox sites, both groups will claim the
+  same device and fight over its site assignment. Don't map sites that way.
 - **No pagination handling.** UniFi's classic `/stat/sta` endpoint returns
   the full active-client list in one response, so there's nothing to
   paginate against today — but this hasn't been exercised at very large
@@ -372,6 +428,11 @@ every push/PR.
   the union, not each other's false positives), then marks stale devices
   once per distinct slug — skipping any slug whose pair(s) included a
   failure, since acting on an incomplete client list risks false offlines.
+- `caching.py` — `CachingNetboxGateway`, a run-scoped read cache wrapping
+  any gateway. Caches only what's stable for a run (sites, switches, switch
+  interfaces); deliberately does *not* cache client-device or name-collision
+  lookups, which change as the run creates devices. Thread-safe, since
+  parallel site workers share one instance.
 - `naming.py` — device-name sanitization and the deterministic
   MAC-suffix collision fallback.
 - `metrics.py` — the JSON run-summary log line and optional Prometheus
