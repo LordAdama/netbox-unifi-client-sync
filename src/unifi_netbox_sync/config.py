@@ -159,6 +159,17 @@ class Settings:
     # Optional IEEE oui.txt or Wireshark manuf file, consulted only for MACs
     # the controller did not attribute.
     oui_file: str | None = None
+    # Create adopted UniFi infrastructure (switches, APs, gateways) in NetBox
+    # rather than requiring it to be there already. Off by default: creating
+    # infrastructure is more invasive than creating clients.
+    sync_unifi_devices: bool = False
+    # Local clone of netbox-community/devicetype-library, used for canonical
+    # model names, part numbers and rack heights. Ports always come from the
+    # controller's own port_table, not from here.
+    devicetype_library_path: str | None = None
+    # Fallback role for created UniFi devices; per-type roles below take
+    # precedence when the device's type is recognised.
+    unifi_device_role_slug: str = "network-device"
 
     def site_pairs(self) -> list[SitePair]:
         if self.site_map:
@@ -227,4 +238,7 @@ class Settings:
             max_workers=_positive_int(os.environ.get("MAX_WORKERS", "1"), "MAX_WORKERS"),
             use_oui_manufacturer=_bool(os.environ.get("USE_OUI_MANUFACTURER", "true")),
             oui_file=os.environ.get("OUI_FILE") or None,
+            sync_unifi_devices=_bool(os.environ.get("SYNC_UNIFI_DEVICES", "false")),
+            devicetype_library_path=os.environ.get("DEVICETYPE_LIBRARY_PATH") or None,
+            unifi_device_role_slug=os.environ.get("UNIFI_DEVICE_ROLE_SLUG", "network-device"),
         )

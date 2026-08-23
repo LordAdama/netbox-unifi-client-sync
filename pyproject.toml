@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unifi-netbox-sync"
-version = "0.7.0"
+version = "0.8.0"
 description = "Sync UniFi Controller client devices and switch-port cable connections into NetBox"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,10 @@ dependencies = [
     "requests>=2.31",
     "pynetbox>=7.3",
     "urllib3>=2.0",
+    # Only needed to read a devicetype-library clone (DEVICETYPE_LIBRARY_PATH);
+    # the loader degrades gracefully without it, but it is small enough to just
+    # ship rather than make operators discover an extra.
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

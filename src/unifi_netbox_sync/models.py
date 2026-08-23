@@ -1,6 +1,27 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass
+class UnifiPort:
+    """One physical port on a UniFi device, from its port_table."""
+
+    index: int
+    name: str = ""
+    media: str = ""  # "GE", "SFP", "SFP+"
+    max_speed: int = 0  # Mbps
+    is_uplink: bool = False
+
+    @property
+    def netbox_name(self) -> str:
+        """Stable "Port N" naming.
+
+        Deliberately not the operator-assigned UniFi port name: that can be
+        renamed at will, whereas cable matching keys off port index via
+        PORT_NAME_TEMPLATES. The UniFi name goes in the description instead.
+        """
+        return f"Port {self.index}"
 
 
 @dataclass
@@ -12,6 +33,10 @@ class UnifiSwitchDevice:
     model: str
     device_type: str  # "usw", "uap", "ugw", ...
     serial: str | None = None
+    ip: str | None = None
+    version: str | None = None
+    adopted: bool = True
+    ports: list[UnifiPort] = field(default_factory=list)
 
     @property
     def is_switch(self) -> bool:
@@ -108,6 +133,9 @@ class SyncSummary:
     cables_skipped: int = 0
     stale_marked_offline: int = 0
     sites_created: int = 0
+    # Adopted UniFi infrastructure seen / created (SYNC_UNIFI_DEVICES)
+    devices_synced: int = 0
+    infra_created: int = 0
     # Work that was inspected and correctly required no write. High numbers
     # here are the healthy steady state, not a problem.
     clients_unchanged: int = 0

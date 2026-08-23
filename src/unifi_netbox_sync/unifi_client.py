@@ -5,13 +5,36 @@ import logging
 import requests
 import urllib3
 
-from .models import UnifiClient, UnifiSite, UnifiSwitchDevice
+from .models import UnifiClient, UnifiPort, UnifiSite, UnifiSwitchDevice
 
 logger = logging.getLogger(__name__)
 
 
 class UnifiAuthError(RuntimeError):
     pass
+
+
+def _parse_port_table(raw: list[dict]) -> list[UnifiPort]:
+    """Physical ports as the controller reports them.
+
+    This is the authoritative port list for the actual hardware, which is why
+    it is preferred over a static device-type library for building interfaces.
+    """
+    ports = []
+    for entry in raw:
+        index = entry.get("port_idx")
+        if index is None:
+            continue
+        ports.append(
+            UnifiPort(
+                index=int(index),
+                name=(entry.get("name") or "").strip(),
+                media=(entry.get("media") or "").strip(),
+                max_speed=int(entry.get("max_speed") or entry.get("speed") or 0),
+                is_uplink=bool(entry.get("is_uplink", False)),
+            )
+        )
+    return sorted(ports, key=lambda p: p.index)
 
 
 class UnifiClientAPI:
@@ -133,6 +156,12 @@ class UnifiClientAPI:
                     model=entry.get("model", ""),
                     device_type=entry.get("type", ""),
                     serial=entry.get("serial") or None,
+                    ip=entry.get("ip") or None,
+                    version=entry.get("version") or None,
+                    # Absent on older firmware; treat as adopted, since
+                    # /stat/device only lists devices the controller manages.
+                    adopted=bool(entry.get("adopted", True)),
+                    ports=_parse_port_table(entry.get("port_table") or []),
                 )
             )
         return devices

@@ -42,6 +42,8 @@ class FakeDevice:
         self.site_slug = site_slug
         self.serial: str | None = None
         self.device_type = None
+        self.role_slug: str | None = None
+        self.device_type_slug: str | None = None
 
 
 class FakeSite:
@@ -59,6 +61,10 @@ class FakeIP:
         self.address = address if "/" in address else f"{address}/32"
 
 
+class _NoSpec:
+    interfaces: list = []
+
+
 class FakeNetboxGateway:
     """In-memory double for NetboxGateway used in unit tests."""
 
@@ -72,6 +78,9 @@ class FakeNetboxGateway:
         self.switches: dict[str, FakeDevice] = {}
         self.switches_without_mac: list[FakeDevice] = []
         self.created_device_types: set[str] = set()
+        self.device_type_specs: dict = {}
+        self.created_roles: set[str] = set()
+        self.infra_by_mac: dict[str, FakeDevice] = {}
         self.clients_by_mac: dict[str, FakeDevice] = {}
         self.cables: set[tuple[int, int]] = set()
         self.ensure_prerequisites_called = False
@@ -126,6 +135,42 @@ class FakeNetboxGateway:
         with self._lock:
             self.created_device_types.add(type_slug)
         return type_slug
+
+    def ensure_device_type_from_spec(self, spec):
+        with self._lock:
+            self.created_device_types.add(spec.slug)
+            self.device_type_specs[spec.slug] = spec
+        return spec.slug
+
+    def ensure_device_role(self, role_slug: str) -> None:
+        with self._lock:
+            self.created_roles.add(role_slug)
+
+    def upsert_infrastructure_device(self, mac, name, site_slug, role_slug, device_type_slug,
+                                     tag_slug, serial="", update_policy="sync"):
+        with self._lock:
+            existing = self.infra_by_mac.get(mac)
+            if existing is not None:
+                if update_policy == "create-only":
+                    return existing, False, False
+                updated = existing.name != name
+                existing.name = name
+                return existing, False, updated
+            device = FakeDevice(name=name, mac=mac, site_slug=site_slug)
+            device.serial = serial
+            device.role_slug = role_slug
+            device.device_type_slug = device_type_slug
+            device.tags.append(tag_slug)
+            # NetBox instantiates interfaces from the device type's templates.
+            for iface_name, _t in self.device_type_specs.get(device_type_slug, _NoSpec()).interfaces:
+                device.interfaces[iface_name] = FakeInterface(device, iface_name)
+            self.infra_by_mac[mac] = device
+            # Findable by the cable code exactly like a hand-created switch.
+            self.switches[mac] = device
+            return device, True, False
+
+    def forget_switch(self, mac: str) -> None:
+        pass
 
     def find_interface_by_name_candidates(self, device: FakeDevice, candidates: list[str]):
         for name in candidates:
