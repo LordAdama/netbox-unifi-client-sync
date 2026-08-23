@@ -110,7 +110,8 @@ def test_cable_skipped_when_switch_missing():
 
 def test_cable_skipped_when_port_name_does_not_match_templates():
     netbox = FakeNetboxGateway()
-    netbox.seed_switch("aa:bb:cc:dd:ee:01", "switch-1", ["eth1"])  # unusual naming
+    # A naming scheme none of the default templates produce.
+    netbox.seed_switch("aa:bb:cc:dd:ee:01", "switch-1", ["xe-0/0/1"])
     client = make_unifi_client(
         mac="11:22:33:44:55:66",
         is_wired=True,

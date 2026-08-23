@@ -75,12 +75,14 @@ class CachingNetboxGateway:
             self.misses += 1
         return site
 
-    def find_switch_device_by_mac(self, mac: str) -> Any | None:
+    def find_switch_device_by_mac(self, mac: str, hints: Any | None = None) -> Any | None:
+        # Keyed on the MAC alone: hints are derived from it, so they can't vary
+        # for a given MAC within a run.
         with self._lock:
             if mac in self._switches:
                 self.hits += 1
                 return self._switches[mac]
-        device = self._inner.find_switch_device_by_mac(mac)
+        device = self._inner.find_switch_device_by_mac(mac, hints)
         with self._lock:
             # Negative results are cached too: a switch absent from NetBox at
             # the start of a run won't appear mid-run, and re-querying for
@@ -176,6 +178,11 @@ class CachingNetboxGateway:
 
     def list_device_interfaces(self, device: Any) -> list[Any]:
         return self._inner.list_device_interfaces(device)
+
+    def ensure_client_device_type(self, manufacturer_name: str) -> str:
+        # Already memoized inside PynetboxGateway, which is where the
+        # create-if-missing has to be atomic anyway.
+        return self._inner.ensure_client_device_type(manufacturer_name)
 
     def assign_ip(self, device: Any, interface: Any, ip: str, status: str = "active") -> bool:
         return self._inner.assign_ip(device, interface, ip, status)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -11,7 +12,8 @@ from .config import Settings
 from .metrics import log_json_summary, write_prometheus_textfile
 from .models import ClientSyncResult, SitePair, SiteSyncStats, SyncSummary, UnifiClient
 from .naming import mac_suffixed_name, sanitize_device_name
-from .netbox_client import NetboxGateway
+from .netbox_client import NetboxGateway, SwitchHints
+from .oui import OuiLookup, is_locally_administered
 from .unifi_client import UnifiClientAPI
 
 logger = logging.getLogger(__name__)
@@ -105,6 +107,14 @@ class SyncEngine:
         self.unifi = unifi
         self.netbox = netbox
         self.settings = settings
+        self._oui = OuiLookup(settings.oui_file)
+        # UniFi switch MAC -> what UniFi knows about that switch. Populated
+        # per site from /stat/device, and used to find the switch in NetBox by
+        # name or serial when its interfaces carry no MAC address.
+        self._switch_hints: dict[str, SwitchHints] = {}
+        self._hints_lock = threading.Lock()
+        # One warning per switch, not one per client behind it.
+        self._warned_switches: set[str] = set()
 
     # -- orchestration ---------------------------------------------------
 
@@ -258,6 +268,8 @@ class SyncEngine:
                     )
             logger.info("[dry-run] would ensure NetBox tag/custom-field/role/device-type exist")
 
+        self._load_switch_hints(pair.unifi_site)
+
         clients = self.unifi.get_clients(pair.unifi_site)
         summary.clients_seen = len(clients)
         seen_macs: set[str] = set()
@@ -299,6 +311,102 @@ class SyncEngine:
             summary.cables_skipped,
         )
         return summary, seen_macs
+
+    def _load_switch_hints(self, unifi_site: str) -> None:
+        """Record each UniFi device's name/serial, keyed by MAC.
+
+        Without this the only way to find a switch in NetBox is by an
+        interface `mac_address`, which most deployments never populate — so
+        every cable gets skipped even though the switch is plainly there.
+        """
+        try:
+            devices = self.unifi.get_devices(unifi_site)
+        except EXPECTED_CLIENT_ERRORS as exc:
+            # Non-fatal: we simply lose the name/serial fallbacks.
+            logger.warning(
+                "Could not list UniFi devices for site '%s' (%s); switch matching will rely on "
+                "interface MAC addresses alone",
+                unifi_site,
+                exc,
+            )
+            return
+        with self._hints_lock:
+            for device in devices:
+                if device.mac:
+                    self._switch_hints[device.mac] = SwitchHints(
+                        name=device.name, serial=device.serial, model=device.model
+                    )
+        logger.info("Loaded %d UniFi device(s) for site '%s' to match switches by name/serial",
+                    len(devices), unifi_site)
+
+    def _hints_for(self, mac: str) -> SwitchHints | None:
+        with self._hints_lock:
+            return self._switch_hints.get(mac)
+
+    def _log_switch_not_found(self, mac: str) -> None:
+        """Explain an unmatched switch once, with the fixes that actually work.
+
+        Warned rather than debugged because the symptom otherwise is silent:
+        the run simply reports skipped cables with no clue why.
+        """
+        with self._hints_lock:
+            if mac in self._warned_switches:
+                return
+            self._warned_switches.add(mac)
+            hints = self._switch_hints.get(mac)
+        logger.warning(
+            "No NetBox device found for UniFi switch %s%s, so its cables are skipped. Tried: "
+            "interface mac_address, device custom field unifi_mac, device serial, device name. "
+            "Fix by giving the NetBox device the same name UniFi uses, setting its serial, or "
+            "adding a unifi_mac custom field.",
+            mac,
+            f" (named {hints.name!r} in UniFi)" if hints and hints.name else "",
+        )
+
+    def _log_port_mismatch(self, switch_device: object, port: object, candidates: list[str]) -> None:
+        """Say what the switch's ports are actually called.
+
+        A port-name mismatch is otherwise near-impossible to diagnose from the
+        outside: the run just reports skipped cables. Printing the real names
+        next to what we looked for turns it into an obvious PORT_NAME_TEMPLATES fix.
+        """
+        lister = getattr(self.netbox, "list_device_interfaces", None)
+        if lister is None:
+            return
+        try:
+            names = sorted(iface.name for iface in lister(switch_device))
+        except EXPECTED_CLIENT_ERRORS:
+            return
+        logger.warning(
+            "UniFi port %s on %r matched no NetBox interface. Looked for %s; that device's "
+            "interfaces are named %s%s. Set PORT_NAME_TEMPLATES to match.",
+            port,
+            getattr(switch_device, "name", "?"),
+            candidates,
+            names[:12],
+            f" (+{len(names) - 12} more)" if len(names) > 12 else "",
+        )
+
+    def _client_device_type(self, client: UnifiClient) -> str:
+        """Device type slug for a client, carrying its real manufacturer when known."""
+        s = self.settings
+        if not s.use_oui_manufacturer:
+            return s.client_device_type_slug
+
+        vendor = client.oui
+        if not vendor and not is_locally_administered(client.mac):
+            # Randomized/locally-administered MACs have no owning vendor, so
+            # only fall back to the offline table for real burned-in addresses.
+            vendor = self._oui.lookup(client.mac)
+        if not vendor:
+            return s.client_device_type_slug
+
+        try:
+            return self.netbox.ensure_client_device_type(vendor)
+        except ValueError:
+            logger.warning("Unusable manufacturer name %r for %s; using the generic type",
+                           vendor, client.mac)
+            return s.client_device_type_slug
 
     # -- per-client ------------------------------------------------------
 
@@ -344,7 +452,7 @@ class SyncEngine:
                 device_name,
                 netbox_site_slug,
                 s.client_device_role_slug,
-                s.client_device_type_slug,
+                self._client_device_type(client),
                 s.sync_tag,
                 s.device_update_policy,
                 existing,
@@ -394,7 +502,9 @@ class SyncEngine:
         else:
             result.device_updated = existing is not None
         if client.is_wired and client.switch_mac and client.switch_port:
-            switch_device = self.netbox.find_switch_device_by_mac(client.switch_mac)
+            switch_device = self.netbox.find_switch_device_by_mac(
+                client.switch_mac, self._hints_for(client.switch_mac)
+            )
             if switch_device is None:
                 result.cable_skipped_reason = "switch not found in NetBox"
                 return
@@ -407,16 +517,22 @@ class SyncEngine:
 
     def _wire_cable(self, client: UnifiClient, iface: object, result: ClientSyncResult) -> bool:
         """Returns True if a cable was actually written."""
-        switch_device = self.netbox.find_switch_device_by_mac(client.switch_mac)
+        switch_device = self.netbox.find_switch_device_by_mac(
+            client.switch_mac, self._hints_for(client.switch_mac)
+        )
         if switch_device is None:
             result.cable_skipped_reason = (
                 f"switch {client.switch_mac} not found in NetBox (port {client.switch_port})"
             )
+            self._log_switch_not_found(client.switch_mac)
             return False
         candidates = [t.format(port=client.switch_port) for t in self.settings.port_name_templates]
         switch_iface = self.netbox.find_interface_by_name_candidates(switch_device, candidates)
         if switch_iface is None:
-            result.cable_skipped_reason = f"no interface on {switch_device.name} matched {candidates}"
+            result.cable_skipped_reason = (
+                f"no interface on {switch_device.name} matched {candidates}"
+            )
+            self._log_port_mismatch(switch_device, client.switch_port, candidates)
             return False
         # The interface came straight from ensure_interface, so its cable state
         # is current for this run — if it already points at the right port

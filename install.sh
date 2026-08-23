@@ -84,7 +84,9 @@ write_env() {
     printf '%s\n' "CLIENT_DEVICE_ROLE_SLUG=unifi-client" >> .env
     printf '%s\n' "CLIENT_MANUFACTURER_SLUG=generic" >> .env
     printf '%s\n' "CLIENT_DEVICE_TYPE_SLUG=generic-network-client" >> .env
-    printf '%s\n' "PORT_NAME_TEMPLATES={port},Port {port},GE{port},Gi{port}" >> .env
+    printf '%s\n' "PORT_NAME_TEMPLATES=" >> .env
+    printf '%s\n' "USE_OUI_MANUFACTURER=true" >> .env
+    printf '%s\n' "OUI_FILE=" >> .env
     printf '%s\n' "CABLE_CONFLICT_POLICY=skip" >> .env
     printf '%s\n' "MARK_STALE_OFFLINE=true" >> .env
     printf '%s\n' "DEVICE_UPDATE_POLICY=sync" >> .env

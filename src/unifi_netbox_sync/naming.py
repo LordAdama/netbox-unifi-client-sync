@@ -21,6 +21,16 @@ def sanitize_device_name(raw: str, mac: str) -> str:
     return name[:MAX_DEVICE_NAME_LENGTH]
 
 
+def slugify(value: str, max_length: int = 50) -> str:
+    """NetBox-safe slug: lowercase, alphanumerics and dashes only.
+
+    NetBox slugs are validated against ``[-a-zA-Z0-9_]+``, so vendor strings
+    like "Apple, Inc." have to be reduced before they can be used.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug[:max_length].rstrip("-")
+
+
 def mac_suffixed_name(name: str, mac: str) -> str:
     """Disambiguate a name that collides with a different device, deterministically."""
     suffix = "-" + mac.replace(":", "")[-4:]
