@@ -65,20 +65,36 @@ def _load_dotenv(path: str = ".env") -> None:
         os.environ.setdefault(key, value)
 
 
-def _parse_site_map(raw: str) -> dict[str, str]:
-    """Parse SITE_MAP="unifi_site1:netbox_slug1,unifi_site2:netbox_slug2"."""
+def _parse_site_map(raw: str) -> tuple[dict[str, str], bool]:
+    """Parse SITE_MAP into (explicit pairs, discover-all flag).
+
+    Accepts "unifi_site:netbox_slug" pairs, the bare token "*" meaning "every
+    site the controller reports", or both — so you can sync everything while
+    still pinning individual sites to a particular NetBox slug:
+
+        SITE_MAP=*
+        SITE_MAP=*,default:head-office
+    """
     site_map: dict[str, str] = {}
+    discover_all = False
     for entry in raw.split(","):
         entry = entry.strip()
         if not entry:
             continue
+        if entry == "*":
+            discover_all = True
+            continue
         if ":" not in entry:
-            raise SystemExit(f"Invalid SITE_MAP entry {entry!r}; expected 'unifi_site:netbox_site_slug'")
+            raise SystemExit(
+                f"Invalid SITE_MAP entry {entry!r}; expected 'unifi_site:netbox_site_slug' or '*'"
+            )
         unifi_site, netbox_slug = (part.strip() for part in entry.split(":", 1))
         if not unifi_site or not netbox_slug:
-            raise SystemExit(f"Invalid SITE_MAP entry {entry!r}; expected 'unifi_site:netbox_site_slug'")
+            raise SystemExit(
+                f"Invalid SITE_MAP entry {entry!r}; expected 'unifi_site:netbox_site_slug' or '*'"
+            )
         site_map[unifi_site] = netbox_slug
-    return site_map
+    return site_map, discover_all
 
 
 @dataclass
@@ -94,6 +110,10 @@ class Settings:
     # site in a single run. Takes precedence over unifi_site/netbox_site_slug
     # when non-empty. See Settings.site_pairs().
     site_map: dict[str, str] = field(default_factory=dict)
+    # Discover every site from the controller instead of listing them. Entries
+    # in site_map still win for the sites they name, so you can sync
+    # everything while pinning a few slugs explicitly.
+    sync_all_sites: bool = False
     unifi_is_udm: bool = True
     unifi_verify_ssl: bool = False
 
@@ -163,10 +183,13 @@ class Settings:
                 "Provide either UNIFI_API_KEY, or both UNIFI_USERNAME and UNIFI_PASSWORD"
             )
 
-        site_map = _parse_site_map(os.environ.get("SITE_MAP", ""))
+        site_map, sync_all_sites = _parse_site_map(os.environ.get("SITE_MAP", ""))
         netbox_site_slug = os.environ.get("NETBOX_SITE_SLUG", "")
-        if not site_map and not netbox_site_slug:
-            raise SystemExit("Provide either NETBOX_SITE_SLUG (single site) or SITE_MAP (multiple sites)")
+        if not site_map and not sync_all_sites and not netbox_site_slug:
+            raise SystemExit(
+                "Provide NETBOX_SITE_SLUG (single site), SITE_MAP (explicit pairs), "
+                "or SITE_MAP=* (every site on the controller)"
+            )
 
         templates_raw = os.environ.get("PORT_NAME_TEMPLATES", "")
         port_name_templates = [t.strip() for t in templates_raw.split(",") if t.strip()] or (
@@ -181,6 +204,7 @@ class Settings:
             unifi_site=os.environ.get("UNIFI_SITE", "default"),
             netbox_site_slug=netbox_site_slug,
             site_map=site_map,
+            sync_all_sites=sync_all_sites,
             unifi_is_udm=_bool(os.environ.get("UNIFI_IS_UDM", "true")),
             unifi_verify_ssl=_bool(os.environ.get("UNIFI_VERIFY_SSL", "false")),
             netbox_url=netbox_url.rstrip("/"),

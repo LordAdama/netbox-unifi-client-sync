@@ -11,7 +11,7 @@ import requests
 from .config import Settings
 from .metrics import log_json_summary, write_prometheus_textfile
 from .models import ClientSyncResult, SitePair, SiteSyncStats, SyncSummary, UnifiClient
-from .naming import mac_suffixed_name, sanitize_device_name
+from .naming import mac_suffixed_name, sanitize_device_name, slugify
 from .netbox_client import NetboxGateway, SwitchHints
 from .oui import OuiLookup, is_locally_administered
 from .unifi_client import UnifiClientAPI
@@ -118,9 +118,62 @@ class SyncEngine:
 
     # -- orchestration ---------------------------------------------------
 
+    def _discover_site_pairs(self) -> list[SitePair]:
+        """Ask the controller which sites exist and derive a NetBox slug each.
+
+        The slug comes from the site's description ("Head Office" ->
+        "head-office") rather than its API id, which is an opaque string like
+        "7xk2p9qr" and meaningless in NetBox. An explicit SITE_MAP entry always
+        wins for the site it names.
+        """
+        sites = self.unifi.get_sites()
+        if not sites:
+            raise LookupError(
+                "SITE_MAP=* is set but the controller reported no sites; check that this "
+                "account can see them"
+            )
+
+        pairs: list[SitePair] = []
+        slug_owners: dict[str, str] = {}
+        for site in sites:
+            override = self.settings.site_map.get(site.name)
+            slug = override or slugify(site.label) or slugify(site.name)
+            if not slug:
+                logger.warning("Skipping UniFi site %r: no usable NetBox slug from %r",
+                               site.name, site.label)
+                continue
+            if slug in slug_owners:
+                # Two sites collapsing to one NetBox site is handled safely
+                # (they become one group, stale-marking unions their clients),
+                # but it's almost certainly not what was intended.
+                logger.warning(
+                    "UniFi sites %r and %r both map to NetBox site '%s'; their clients will share "
+                    "it. Pin one with an explicit SITE_MAP entry to separate them.",
+                    slug_owners[slug],
+                    site.name,
+                    slug,
+                )
+            slug_owners[slug] = site.name
+            pairs.append(SitePair(unifi_site=site.name, netbox_site_slug=slug))
+
+        logger.info(
+            "Discovered %d site(s) from the controller: %s",
+            len(pairs),
+            ", ".join(f"{p.unifi_site}->{p.netbox_site_slug}" for p in pairs),
+        )
+        if self.settings.site_policy != "create":
+            # Discovering sites you haven't hand-created in NetBox is the norm,
+            # so say this up front rather than letting every site fail in turn.
+            logger.info(
+                "SITE_POLICY=%s: any discovered site missing from NetBox will be reported as an "
+                "error rather than created. Set SITE_POLICY=create to have them created.",
+                self.settings.site_policy,
+            )
+        return pairs
+
     def run(self) -> SyncSummary:
         start = time.monotonic()
-        pairs = self.settings.site_pairs()
+        pairs = self._discover_site_pairs() if self.settings.sync_all_sites else self.settings.site_pairs()
 
         groups: dict[str, list[SitePair]] = {}
         for pair in pairs:

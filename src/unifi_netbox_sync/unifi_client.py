@@ -5,7 +5,7 @@ import logging
 import requests
 import urllib3
 
-from .models import UnifiClient, UnifiSwitchDevice
+from .models import UnifiClient, UnifiSite, UnifiSwitchDevice
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +107,20 @@ class UnifiClientAPI:
         payload = resp.json()
         return payload.get("data", [])
 
-    def get_sites(self) -> list[dict]:
-        return self._get("/self/sites")
+    def get_sites(self) -> list[UnifiSite]:
+        """Every site this account can see on the controller.
+
+        Requires an account with visibility of all sites — a per-site admin
+        will only get the ones it administers, which is usually what you want
+        anyway.
+        """
+        sites = []
+        for entry in self._get("/self/sites"):
+            name = entry.get("name")
+            if not name:
+                continue
+            sites.append(UnifiSite(name=name, description=(entry.get("desc") or "").strip()))
+        return sites
 
     def get_devices(self, site: str) -> list[UnifiSwitchDevice]:
         raw = self._get(f"/s/{site}/stat/device")

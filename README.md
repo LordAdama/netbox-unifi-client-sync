@@ -256,7 +256,7 @@ full list and defaults. Key ones:
 | `UNIFI_SITE` | UniFi site name to sync (default `default`); ignored if `SITE_MAP` is set |
 | `NETBOX_URL` / `NETBOX_TOKEN` | NetBox API endpoint and token |
 | `NETBOX_SITE_SLUG` | NetBox site clients should be placed in; ignored if `SITE_MAP` is set |
-| `SITE_MAP` | Multi-site: comma-separated `unifi_site:netbox_site_slug` pairs — see "Multi-site sync" |
+| `SITE_MAP` | Multi-site: `*` for every site on the controller, and/or `unifi_site:netbox_site_slug` pairs — see "Multi-site sync" |
 | `SITE_POLICY` | `require` (default) or `create` — see "Site & update policies" |
 | `DEVICE_UPDATE_POLICY` | `sync` (default) or `create-only` — see "Site & update policies" |
 | `NETBOX_IP_STATUS` | Status set on IP addresses this tool creates (default `active`) |
@@ -276,13 +276,45 @@ full list and defaults. Key ones:
 ### Multi-site sync
 
 By default this syncs one UniFi site into one NetBox site
-(`UNIFI_SITE`/`NETBOX_SITE_SLUG`). To sync more than one UniFi site in a
-single run, set `SITE_MAP` instead — comma-separated `unifi_site:netbox_site_slug`
-pairs, which then completely replaces `UNIFI_SITE`/`NETBOX_SITE_SLUG`:
+(`UNIFI_SITE`/`NETBOX_SITE_SLUG`). To sync more than one, set `SITE_MAP`
+instead, which then completely replaces `UNIFI_SITE`/`NETBOX_SITE_SLUG`.
+
+**Every site on the controller**, without listing them:
+
+```bash
+SITE_MAP=*
+SITE_POLICY=create
+```
+
+The controller is asked which sites exist and each is synced into its own
+NetBox site, named from the site's description as shown in the UniFi UI
+("Head Office" → `head-office`) — not its API id, which is an opaque string
+like `7xk2p9qr`. Sites added in UniFi later are picked up automatically on
+the next run.
+
+`SITE_POLICY=create` is effectively required here: discovering sites you
+haven't already hand-created in NetBox is the normal case, and the default
+`require` would report each missing one as an error. The run logs a reminder
+if you leave it on `require`.
+
+**Explicit pairs**, when you want to control exactly which sites sync and
+where they land:
 
 ```bash
 SITE_MAP=default:main,branch-office:branch
 ```
+
+**Both** — discover everything, but pin individual sites to a chosen slug:
+
+```bash
+SITE_MAP=*,default:head-office
+```
+
+An explicit entry always wins over the derived name for the site it names.
+If two UniFi sites have the same description they'd derive the same slug and
+share one NetBox site; that's handled safely (they become one group, and
+stale-marking unions their clients) but is warned about, since it's rarely
+intended — pin one of them to separate them.
 
 Each pair is synced independently with its own client list and its own
 `SITE_POLICY`/site-creation check. Device-name-collision checks and

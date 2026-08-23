@@ -201,3 +201,33 @@ def test_client_oui_and_device_serial_are_captured():
     # Serial is one of the fallbacks used to find the switch in NetBox.
     assert devices[0].serial == "F09FC2ABCDEF"
     assert devices[0].name == "core-switch"
+
+
+@responses.activate
+def test_get_sites_parses_name_and_description():
+    """UniFi returns an opaque `name` plus the human `desc` shown in the UI."""
+    host = "https://udm.example.com"
+    responses.add(
+        responses.GET,
+        f"{host}/proxy/network/api/self/sites",
+        json={
+            "data": [
+                {"_id": "abc", "name": "default", "desc": "Head Office"},
+                {"_id": "def", "name": "7xk2p9qr", "desc": "Branch Office"},
+                {"_id": "ghi", "name": "nodesc"},
+                {"_id": "jkl", "desc": "no name at all"},  # unusable, skipped
+            ]
+        },
+        status=200,
+    )
+
+    client = UnifiClientAPI(host=host, api_key="k", is_udm=True)
+    with client:
+        sites = client.get_sites()
+
+    assert [(s.name, s.description) for s in sites] == [
+        ("default", "Head Office"),
+        ("7xk2p9qr", "Branch Office"),
+        ("nodesc", ""),
+    ]
+    assert sites[2].label == "nodesc"  # falls back to the id
