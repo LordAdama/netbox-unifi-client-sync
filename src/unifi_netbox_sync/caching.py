@@ -179,6 +179,18 @@ class CachingNetboxGateway:
     def list_device_interfaces(self, device: Any) -> list[Any]:
         return self._inner.list_device_interfaces(device)
 
+    def list_sites(self) -> list[Any]:
+        return self._inner.list_sites()
+
+    def resolve_existing_site(self, desired_slug: str, label: str, mode: str = "normalized") -> Any | None:
+        site = self._inner.resolve_existing_site(desired_slug, label, mode)
+        if site is not None:
+            with self._lock:
+                # Cache under the resolved slug, which is what every later
+                # call will use.
+                self._sites[site.slug] = site
+        return site
+
     def forget_switch(self, mac: str) -> None:
         """Drop a cached switch lookup, after creating the switch mid-run.
 

@@ -140,6 +140,14 @@ class Settings:
     # attributes are never modified either way. Any other value behaves as
     # "require", matching cable_conflict_policy's fail-safe-default style.
     # Applies to every site in site_map the same way.
+    # How to find an existing NetBox site for a UniFi site:
+    #   "normalized" (default) - exact slug, then exact name, then both folded
+    #                            to alphanumerics so punctuation differences
+    #                            (apostrophes, dashes) don't create duplicates
+    #   "name"                 - exact slug, then exact name
+    #   "slug"                 - exact slug only (the original behavior)
+    # A matched site is linked to and never modified.
+    site_match: str = "normalized"
     site_policy: str = "require"
     # "sync" (default): keep an existing client device's name/status in
     # sync with UniFi. "create-only": set them once at creation and never
@@ -233,6 +241,7 @@ class Settings:
             cable_conflict_policy=os.environ.get("CABLE_CONFLICT_POLICY", "skip"),
             mark_stale_offline=_bool(os.environ.get("MARK_STALE_OFFLINE", "true")),
             metrics_file=os.environ.get("METRICS_FILE") or None,
+            site_match=os.environ.get("SITE_MATCH", "normalized"),
             site_policy=os.environ.get("SITE_POLICY", "require"),
             device_update_policy=os.environ.get("DEVICE_UPDATE_POLICY", "sync"),
             max_workers=_positive_int(os.environ.get("MAX_WORKERS", "1"), "MAX_WORKERS"),

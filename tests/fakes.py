@@ -47,10 +47,10 @@ class FakeDevice:
 
 
 class FakeSite:
-    def __init__(self, slug: str) -> None:
+    def __init__(self, slug: str, name: str | None = None) -> None:
         self.id = next(_id_counter)
         self.slug = slug
-        self.name = slug
+        self.name = name or slug
 
 
 class FakeIP:
@@ -88,6 +88,9 @@ class FakeNetboxGateway:
         # here to simulate it being absent until ensure_site() creates it.
         self.missing_sites: set[str] = set()
         self.created_sites: set[str] = set()
+        # Sites that genuinely exist, with real names. Tests that don't
+        # seed any keep the permissive default below.
+        self.existing_sites: dict[str, FakeSite] = {}
 
     def seed_switch(self, mac: str, name: str, ports: list[str]) -> FakeDevice:
         device = FakeDevice(name=name)
@@ -199,10 +202,42 @@ class FakeNetboxGateway:
             if other_mac != mac
         )
 
+    def seed_site(self, slug: str, name: str | None = None) -> FakeSite:
+        site = FakeSite(slug, name)
+        self.existing_sites[slug] = site
+        return site
+
     def find_site(self, site_slug: str):
+        if site_slug in self.existing_sites:
+            return self.existing_sites[site_slug]
         if site_slug in self.missing_sites and site_slug not in self.created_sites:
             return None
+        if self.existing_sites and site_slug not in self.created_sites:
+            # Once a test seeds sites explicitly, only those exist.
+            return None
         return FakeSite(site_slug)
+
+    def list_sites(self):
+        return list(self.existing_sites.values())
+
+    def resolve_existing_site(self, desired_slug: str, label: str, mode: str = "normalized"):
+        from unifi_netbox_sync.naming import normalize_key
+
+        exact = self.find_site(desired_slug)
+        if exact is not None:
+            return exact
+        if mode == "slug":
+            return None
+        for site in self.list_sites():
+            if label and site.name == label:
+                return site
+        if mode != "normalized":
+            return None
+        wanted = {normalize_key(desired_slug), normalize_key(label)} - {""}
+        for site in self.list_sites():
+            if {normalize_key(site.slug), normalize_key(site.name)} & wanted:
+                return site
+        return None
 
     def ensure_site(self, site_slug: str, policy: str):
         with self._lock:

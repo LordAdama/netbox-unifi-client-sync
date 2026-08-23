@@ -9,7 +9,7 @@ from typing import Any, Protocol
 import pynetbox
 
 from .devicetype_library import normalize_model
-from .naming import slugify
+from .naming import normalize_key, slugify
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,12 @@ class NetboxGateway(Protocol):
 
     def ensure_site(self, site_slug: str, policy: str) -> tuple[Any, bool]: ...
 
+    def list_sites(self) -> list[Any]: ...
+
+    def resolve_existing_site(
+        self, desired_slug: str, label: str, mode: str = "normalized"
+    ) -> Any | None: ...
+
     def upsert_client_device(
         self,
         mac: str,
@@ -117,6 +123,7 @@ class PynetboxGateway:
         self._infra_type_memo: dict[str, str] = {}
         self._site_missing: set[str] = set()
         self._warned: set[str] = set()
+        self._all_sites: list[Any] | None = None
 
     def _memoized(self, memo: dict[str, Any], key: str, fetch: Callable[[], Any]) -> Any:
         with self._memo_lock:
@@ -340,6 +347,51 @@ class PynetboxGateway:
     def list_device_interfaces(self, device: Any) -> list[Any]:
         return list(self.api.dcim.interfaces.filter(device_id=device.id))
 
+    def list_sites(self) -> list[Any]:
+        """Every NetBox site, fetched once per run for name matching."""
+        with self._memo_lock:
+            if self._all_sites is not None:
+                return self._all_sites
+        sites = list(self.api.dcim.sites.all())
+        with self._memo_lock:
+            self._all_sites = sites
+        return sites
+
+    def resolve_existing_site(self, desired_slug: str, label: str, mode: str = "normalized") -> Any | None:
+        """Find a NetBox site that already represents this UniFi site.
+
+        Tried in order, each an exact comparison (never fuzzy, so two genuinely
+        different sites can't be bound together):
+
+        1. slug == desired_slug
+        2. name == the UniFi site's label
+        3. slug or name folded to alphanumerics matches either of the above
+
+        Step 3 is what stops a duplicate when punctuation differs: "Acme's
+        Depot - North Yard" slugifies to `acme-s-depot-north-yard`, which
+        would miss an existing `acmes-depot-north-yard` on an exact match.
+
+        Read-only. The matched site is never modified.
+        """
+        exact = self.find_site(desired_slug)
+        if exact is not None:
+            return exact
+        if mode == "slug":
+            return None
+
+        by_name = self._first(self.api.dcim.sites.filter(name=label)) if label else None
+        if by_name is not None:
+            return by_name
+        if mode != "normalized":
+            return None
+
+        wanted = {normalize_key(desired_slug), normalize_key(label)} - {""}
+        for site in self.list_sites():
+            candidates = {normalize_key(site.slug or ""), normalize_key(site.name or "")}
+            if candidates & wanted:
+                return site
+        return None
+
     def ensure_device_type_from_spec(self, spec: Any) -> str:
         """Find or create a NetBox device type, with its interface templates.
 
@@ -522,6 +574,7 @@ class PynetboxGateway:
         with self._memo_lock:
             self._site_memo[site_slug] = site
             self._site_missing.discard(site_slug)
+            self._all_sites = None
         logger.info("Created NetBox site %r (SITE_POLICY=create)", site_slug)
         return site, True
 
