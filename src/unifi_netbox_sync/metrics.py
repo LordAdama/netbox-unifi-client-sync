@@ -18,9 +18,19 @@ _HELP_TEXT = {
     "cables_skipped": "NetBox cables skipped (conflict or no match) in the last sync run",
     "stale_marked_offline": "NetBox client devices marked offline in the last sync run",
     "sites_created": "Number of NetBox sites created by the last sync run (SITE_POLICY=create)",
+    "clients_unchanged": "Clients that already matched NetBox and needed no write in the last sync run",
+    "ips_unchanged": "Client IP assignments that were already correct in the last sync run",
+    "cables_unchanged": "Client cables that were already correct in the last sync run",
+    "cache_hits": "Run-scoped NetBox lookups served from cache in the last sync run",
+    "cache_misses": "Run-scoped NetBox lookups that hit the API in the last sync run",
     "errors": "Errors encountered in the last sync run",
     "duration_seconds": "Wall-clock duration of the last sync run, in seconds",
 }
+
+
+def _escape(value: str) -> str:
+    """Escape a Prometheus label value (backslash, quote, newline)."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def summary_as_dict(summary: SyncSummary) -> dict:
@@ -33,6 +43,11 @@ def summary_as_dict(summary: SyncSummary) -> dict:
         "cables_skipped": summary.cables_skipped,
         "stale_marked_offline": summary.stale_marked_offline,
         "sites_created": summary.sites_created,
+        "clients_unchanged": summary.clients_unchanged,
+        "ips_unchanged": summary.ips_unchanged,
+        "cables_unchanged": summary.cables_unchanged,
+        "cache_hits": summary.cache_hits,
+        "cache_misses": summary.cache_misses,
         "errors": len(summary.errors or []),
         "duration_seconds": round(summary.duration_seconds, 3),
     }
@@ -64,6 +79,25 @@ def write_prometheus_textfile(summary: SyncSummary, path: str) -> None:
         lines.append(f"# HELP {metric} {_HELP_TEXT.get(key, key)}")
         lines.append(f"# TYPE {metric} gauge")
         lines.append(f"{metric} {value}")
+
+    # Per-site series, so a slow or erroring site is identifiable rather than
+    # averaged into the totals above.
+    if summary.site_stats:
+        for metric, help_text in (
+            ("site_duration_seconds", "Duration of the last sync run for one UniFi->NetBox site pair"),
+            ("site_clients_seen", "Clients seen for one UniFi->NetBox site pair in the last run"),
+            ("site_errors", "Errors for one UniFi->NetBox site pair in the last run"),
+        ):
+            lines.append(f"# HELP {prefix}_{metric} {help_text}")
+            lines.append(f"# TYPE {prefix}_{metric} gauge")
+            for st in summary.site_stats:
+                labels = f'unifi_site="{_escape(st.unifi_site)}",netbox_site="{_escape(st.netbox_site_slug)}"'
+                value = {
+                    "site_duration_seconds": round(st.duration_seconds, 3),
+                    "site_clients_seen": st.clients_seen,
+                    "site_errors": st.errors,
+                }[metric]
+                lines.append(f"{prefix}_{metric}{{{labels}}} {value}")
 
     lines += [
         f"# HELP {prefix}_last_run_timestamp_seconds Unix time the last sync run finished",

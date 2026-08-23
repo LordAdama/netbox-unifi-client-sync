@@ -10,6 +10,16 @@ def _bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _positive_int(raw: str, name: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}") from None
+    if value < 1:
+        raise SystemExit(f"{name} must be >= 1, got {value}")
+    return value
+
+
 def _load_dotenv(path: str = ".env") -> None:
     """Load KEY=VALUE lines from `path` into os.environ (without overriding
     variables already set in the real environment).
@@ -99,6 +109,10 @@ class Settings:
     # IPs, and cables are unaffected by this — it only governs the device's
     # name/status fields. Any other value behaves as "sync".
     device_update_policy: str = "sync"
+    # Site groups synced concurrently. 1 (default) keeps the original strictly
+    # sequential behavior. Raise it for many sites; the ceiling is whatever
+    # your NetBox and UniFi controller tolerate, not this tool.
+    max_workers: int = 1
 
     def site_pairs(self) -> list[SitePair]:
         if self.site_map:
@@ -158,4 +172,5 @@ class Settings:
             metrics_file=os.environ.get("METRICS_FILE") or None,
             site_policy=os.environ.get("SITE_POLICY", "require"),
             device_update_policy=os.environ.get("DEVICE_UPDATE_POLICY", "sync"),
+            max_workers=_positive_int(os.environ.get("MAX_WORKERS", "1"), "MAX_WORKERS"),
         )

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pynetbox
 import requests
 
 from .config import Settings
 from .metrics import log_json_summary, write_prometheus_textfile
-from .models import ClientSyncResult, SitePair, SyncSummary, UnifiClient
+from .models import ClientSyncResult, SitePair, SiteSyncStats, SyncSummary, UnifiClient
 from .naming import mac_suffixed_name, sanitize_device_name
 from .netbox_client import NetboxGateway
 from .unifi_client import UnifiClientAPI
@@ -26,6 +27,31 @@ def _interface_name(client: UnifiClient) -> str:
     return "eth0" if client.is_wired else "wlan0"
 
 
+def _primary_ip_matches(device: object, ip: str) -> bool:
+    """True if the device's primary IPv4 is already this address.
+
+    Assumes the single interface this tool manages per client device is the
+    one holding the primary IP — true for devices it created. If someone
+    hand-moves the IP to another interface, this treats it as already-correct
+    and leaves it alone, the same conservative posture as DEVICE_UPDATE_POLICY.
+    """
+    primary = getattr(device, "primary_ip4", None)
+    if not primary:
+        return False
+    address = getattr(primary, "address", primary)
+    return str(address).split("/")[0] == ip.split("/")[0]
+
+
+def _already_cabled_to(interface: object, peer_interface: object) -> bool:
+    """True if `interface` already has a cable whose far end is `peer_interface`."""
+    if not getattr(interface, "cable", None):
+        return False
+    peer_id = getattr(peer_interface, "id", None)
+    if peer_id is None:
+        return False
+    return any(getattr(p, "id", None) == peer_id for p in getattr(interface, "link_peers", None) or [])
+
+
 def _merge_summaries(summaries: list[SyncSummary]) -> SyncSummary:
     merged = SyncSummary()
     for s in summaries:
@@ -36,111 +62,93 @@ def _merge_summaries(summaries: list[SyncSummary]) -> SyncSummary:
         merged.cables_created += s.cables_created
         merged.cables_skipped += s.cables_skipped
         merged.sites_created += s.sites_created
+        merged.stale_marked_offline += s.stale_marked_offline
+        merged.clients_unchanged += s.clients_unchanged
+        merged.ips_unchanged += s.ips_unchanged
+        merged.cables_unchanged += s.cables_unchanged
         merged.errors.extend(s.errors or [])
         merged.client_results.extend(s.client_results or [])
-    # stale_marked_offline is filled in separately by run(), after all sites'
-    # clients are known — see the comment on _mark_stale below.
+        merged.site_stats.extend(s.site_stats or [])
     return merged
 
 
 class SyncEngine:
-    """Syncs UniFi clients into NetBox, one or more UniFi-site -> NetBox-site
-    pairs at a time (see Settings.site_map / Settings.site_pairs()).
+    """Syncs UniFi clients into NetBox for one or more UniFi-site -> NetBox-site
+    pairs (see Settings.site_map / Settings.site_pairs()).
 
-    Two site pairs mapping to the same NetBox site are handled correctly
-    within one run — stale-device marking uses the union of both pairs'
-    clients for that NetBox site (see _mark_stale), and per-site device-name
-    collision checks already scope by NetBox site slug. What's still not
-    handled is multiple *instances* of this tool (or unrelated automation)
-    writing to the same NetBox concurrently: there is no distributed/
-    advisory locking, so that can race on cable creation/deletion. The
-    Docker entrypoint guards against a single instance overlapping itself
-    (a run that outlives its own interval) with a local flock, but that
-    does not protect against separate hosts/containers syncing the same
-    NetBox concurrently — don't do that.
+    Pairs are grouped by their *NetBox* site slug. Each group is one unit of
+    work: its pairs run sequentially, and stale-device marking runs once at the
+    end of the group over the union of every pair's clients. Groups touch
+    disjoint NetBox sites by construction, so they can run concurrently —
+    MAX_WORKERS controls how many at once, defaulting to 1 (the original
+    strictly-sequential behavior). Grouping is what makes both the
+    stale-marking union and the no-concurrent-writers-per-site guarantee
+    structural rather than something callers must remember.
+
+    What this does NOT protect against is multiple *instances* of this tool (or
+    unrelated automation) writing the same NetBox concurrently: there is no
+    distributed lock, so that can still race on cable creation/deletion. The
+    Docker entrypoint's LOCK_FILE guards a single instance against overlapping
+    itself; separate hosts/containers syncing the same NetBox are on you.
+
+    One client MAC appearing in two UniFi sites mapped to *different* NetBox
+    sites is also unhandled: the by-MAC device lookup is global, so those two
+    groups would fight over the device's site assignment. Don't map a roaming
+    client's sites that way.
 
     Also assumes the UniFi controller returns its full active-client list in
     one `/stat/sta` call per site (true for the classic controller API this
-    client uses); there is no pagination handling. This is fine at typical
-    homelab/SMB client counts, but hasn't been exercised against very large
-    (thousands of clients) deployments.
+    client uses); there is no pagination handling.
     """
 
     def __init__(self, unifi: UnifiClientAPI, netbox: NetboxGateway, settings: Settings) -> None:
         self.unifi = unifi
         self.netbox = netbox
         self.settings = settings
-        self._current_netbox_site_slug = ""
+
+    # -- orchestration ---------------------------------------------------
 
     def run(self) -> SyncSummary:
         start = time.monotonic()
         pairs = self.settings.site_pairs()
-        multi = len(pairs) > 1
 
+        groups: dict[str, list[SitePair]] = {}
+        for pair in pairs:
+            groups.setdefault(pair.netbox_site_slug, []).append(pair)
+
+        workers = max(1, min(self.settings.max_workers, len(groups)))
         logger.info(
-            "Policies: site=%s, device_update=%s, cable_conflict=%s",
+            "Policies: site=%s, device_update=%s, cable_conflict=%s | %d pair(s) in %d NetBox site "
+            "group(s), %d worker(s)",
             self.settings.site_policy,
             self.settings.device_update_policy,
             self.settings.cable_conflict_policy,
+            len(pairs),
+            len(groups),
+            workers,
         )
-        if multi:
-            logger.info(
-                "Syncing %d site pairs: %s",
-                len(pairs),
-                ", ".join(f"{p.unifi_site}->{p.netbox_site_slug}" for p in pairs),
-            )
 
-        site_summaries: list[SyncSummary] = []
-        # Two pairs can map to the same NetBox site (e.g. two UniFi sites
-        # consolidated into one NetBox site). Stale-device marking has to see
-        # the union of both pairs' clients for that site — grouping by
-        # netbox_site_slug here, and doing the actual marking once per
-        # distinct slug below, after every pair's clients are known.
-        seen_macs_by_netbox_site: dict[str, set[str]] = {}
-        failed_netbox_sites: set[str] = set()
-
-        for pair in pairs:
-            try:
-                site_summary, seen_macs = self._run_site(pair)
-                site_summaries.append(site_summary)
-                seen_macs_by_netbox_site.setdefault(pair.netbox_site_slug, set()).update(seen_macs)
-            except EXPECTED_CLIENT_ERRORS as exc:
-                # A site-level failure (e.g. a `require`d NetBox site that's
-                # missing) shouldn't take other, correctly-configured sites
-                # down with it in the same run.
-                logger.exception(
-                    "Failed syncing site '%s' -> NetBox '%s'", pair.unifi_site, pair.netbox_site_slug
+        if workers == 1:
+            group_summaries = [self._run_group(slug, gp) for slug, gp in groups.items()]
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="site") as pool:
+                group_summaries = list(
+                    pool.map(lambda item: self._run_group(item[0], item[1]), list(groups.items()))
                 )
-                site_summaries.append(
-                    SyncSummary(errors=[f"{pair.unifi_site}->{pair.netbox_site_slug}: {exc}"])
-                )
-                failed_netbox_sites.add(pair.netbox_site_slug)
-        summary = _merge_summaries(site_summaries)
 
-        if self.settings.mark_stale_offline:
-            if not self.settings.dry_run:
-                for netbox_site_slug, seen_macs in seen_macs_by_netbox_site.items():
-                    if netbox_site_slug in failed_netbox_sites:
-                        # A pair targeting this NetBox site failed before we
-                        # learned its clients, so seen_macs is incomplete for
-                        # this site — marking stale now could wrongly offline
-                        # devices that pair would have reported as active.
-                        logger.warning(
-                            "Skipping stale-device marking for NetBox site '%s': a mapped "
-                            "UniFi site failed to sync this run",
-                            netbox_site_slug,
-                        )
-                        continue
-                    summary.stale_marked_offline += self._mark_stale(netbox_site_slug, seen_macs)
-            else:
-                logger.info("[dry-run] would mark devices missing from UniFi as offline")
-
+        summary = _merge_summaries(group_summaries)
         summary.duration_seconds = time.monotonic() - start
+        summary.cache_hits = getattr(self.netbox, "hits", 0)
+        summary.cache_misses = getattr(self.netbox, "misses", 0)
+        if hasattr(self.netbox, "log_stats"):
+            self.netbox.log_stats()
 
         logger.info(
-            "Sync complete: %d clients, %d created, %d updated, %d update-skipped (policy), "
-            "%d cables created, %d cables skipped, %d marked offline, %d errors, %.1fs%s",
+            "Sync complete: %d clients (%d unchanged), %d created, %d updated, %d update-skipped "
+            "(policy), %d cables created, %d cables skipped, %d marked offline, %d errors, %.1fs "
+            "across %d site pair(s)",
             summary.clients_seen,
+            summary.clients_unchanged,
             summary.devices_created,
             summary.devices_updated,
             summary.devices_update_skipped,
@@ -149,27 +157,87 @@ class SyncEngine:
             summary.stale_marked_offline,
             len(summary.errors),
             summary.duration_seconds,
-            f" across {len(pairs)} sites" if multi else "",
+            len(pairs),
         )
         log_json_summary(summary)
         if self.settings.metrics_file:
             write_prometheus_textfile(summary, self.settings.metrics_file)
         return summary
 
+    def _run_group(self, netbox_site_slug: str, pairs: list[SitePair]) -> SyncSummary:
+        """Sync every UniFi site mapped to one NetBox site, then stale-mark once."""
+        summaries: list[SyncSummary] = []
+        seen_macs: set[str] = set()
+        any_pair_failed = False
+
+        for pair in pairs:
+            pair_start = time.monotonic()
+            try:
+                pair_summary, pair_macs = self._run_site(pair)
+                pair_summary.site_stats = [
+                    SiteSyncStats(
+                        unifi_site=pair.unifi_site,
+                        netbox_site_slug=pair.netbox_site_slug,
+                        clients_seen=pair_summary.clients_seen,
+                        devices_created=pair_summary.devices_created,
+                        devices_updated=pair_summary.devices_updated,
+                        cables_created=pair_summary.cables_created,
+                        errors=len(pair_summary.errors or []),
+                        duration_seconds=time.monotonic() - pair_start,
+                    )
+                ]
+                summaries.append(pair_summary)
+                seen_macs.update(pair_macs)
+            except EXPECTED_CLIENT_ERRORS as exc:
+                # A site-level failure (e.g. a `require`d NetBox site that's
+                # missing) shouldn't take other pairs or other groups with it.
+                logger.exception(
+                    "Failed syncing site '%s' -> NetBox '%s'", pair.unifi_site, pair.netbox_site_slug
+                )
+                summaries.append(
+                    SyncSummary(
+                        errors=[f"{pair.unifi_site}->{pair.netbox_site_slug}: {exc}"],
+                        site_stats=[
+                            SiteSyncStats(
+                                unifi_site=pair.unifi_site,
+                                netbox_site_slug=pair.netbox_site_slug,
+                                errors=1,
+                                duration_seconds=time.monotonic() - pair_start,
+                            )
+                        ],
+                    )
+                )
+                any_pair_failed = True
+
+        group = _merge_summaries(summaries)
+
+        if self.settings.mark_stale_offline:
+            if self.settings.dry_run:
+                logger.info("[dry-run] would mark devices missing from UniFi as offline")
+            elif any_pair_failed:
+                # seen_macs is incomplete for this NetBox site, so marking now
+                # could offline devices a failed pair would have reported as
+                # active. Not knowing a client is not the same as it being gone.
+                logger.warning(
+                    "Skipping stale-device marking for NetBox site '%s': a mapped UniFi site "
+                    "failed to sync this run",
+                    netbox_site_slug,
+                )
+            else:
+                group.stale_marked_offline = self._mark_stale(netbox_site_slug, seen_macs)
+
+        return group
+
     def _run_site(self, pair: SitePair) -> tuple[SyncSummary, set[str]]:
-        """Syncs one site pair's clients. Does not do stale-device marking —
-        that happens once per distinct NetBox site slug in run(), after every
-        pair's clients are known (see the comment there)."""
+        """Syncs one pair's clients. Stale marking is the group's job, not this."""
         summary = SyncSummary()
         s = self.settings
-        self._current_netbox_site_slug = pair.netbox_site_slug
+        slug = pair.netbox_site_slug
 
         if not s.dry_run:
-            _site, site_created = self.netbox.ensure_site(pair.netbox_site_slug, s.site_policy)
-            summary.sites_created = 1 if site_created else 0
-            logger.info(
-                "NetBox site '%s': %s", pair.netbox_site_slug, "created" if site_created else "reused existing"
-            )
+            _site, created = self.netbox.ensure_site(slug, s.site_policy)
+            summary.sites_created = 1 if created else 0
+            logger.info("NetBox site '%s': %s", slug, "created" if created else "reused existing")
             self.netbox.ensure_prerequisites(
                 s.client_device_role_slug,
                 s.client_manufacturer_slug,
@@ -177,18 +245,15 @@ class SyncEngine:
                 s.sync_tag,
             )
         else:
-            existing_site = self.netbox.find_site(pair.netbox_site_slug)
-            if existing_site is None:
+            if self.netbox.find_site(slug) is None:
                 if s.site_policy == "create":
                     summary.sites_created = 1
-                    logger.info(
-                        "[dry-run] would create NetBox site '%s' (SITE_POLICY=create)", pair.netbox_site_slug
-                    )
+                    logger.info("[dry-run] would create NetBox site '%s' (SITE_POLICY=create)", slug)
                 else:
                     logger.warning(
                         "[dry-run] NetBox site '%s' does not exist and SITE_POLICY=%s; "
                         "a real run would fail here",
-                        pair.netbox_site_slug,
+                        slug,
                         s.site_policy,
                     )
             logger.info("[dry-run] would ensure NetBox tag/custom-field/role/device-type exist")
@@ -199,7 +264,7 @@ class SyncEngine:
 
         for client in clients:
             seen_macs.add(client.mac)
-            result = self._sync_client(client)
+            result = self._sync_client(client, slug)
             summary.client_results.append(result)
             if result.error:
                 summary.errors.append(f"{pair.unifi_site}/{client.mac}: {result.error}")
@@ -210,29 +275,47 @@ class SyncEngine:
                 summary.devices_updated += 1
             elif result.device_update_skipped_reason:
                 summary.devices_update_skipped += 1
+            if result.unchanged:
+                summary.clients_unchanged += 1
+            if result.ip_unchanged:
+                summary.ips_unchanged += 1
+            if result.cable_unchanged:
+                summary.cables_unchanged += 1
             if result.cable_created:
                 summary.cables_created += 1
             elif result.cable_skipped_reason:
                 summary.cables_skipped += 1
 
         logger.info(
-            "Site '%s' -> NetBox '%s': %d clients, %d created, %d updated, %d cables created, %d cables skipped",
+            "Site '%s' -> NetBox '%s': %d clients, %d created, %d updated, %d unchanged, "
+            "%d cables created, %d cables skipped",
             pair.unifi_site,
-            pair.netbox_site_slug,
+            slug,
             summary.clients_seen,
             summary.devices_created,
             summary.devices_updated,
+            summary.clients_unchanged,
             summary.cables_created,
             summary.cables_skipped,
         )
         return summary, seen_macs
 
-    def _resolve_device_name(self, client: UnifiClient) -> str:
-        """Sanitize the UniFi-reported name and disambiguate it if some other
-        device (a different MAC) already holds it in this NetBox site — NetBox
-        requires device names to be unique within a site."""
+    # -- per-client ------------------------------------------------------
+
+    def _resolve_device_name(
+        self, client: UnifiClient, netbox_site_slug: str, existing: object | None
+    ) -> str:
+        """Sanitize the UniFi-reported name, disambiguating only when needed.
+
+        If the device we already found is itself using this name, the name is
+        by definition not taken by anyone else, so the collision query is
+        skipped — one saved NetBox call per client on steady-state runs, which
+        are the overwhelmingly common case.
+        """
         base_name = sanitize_device_name(client.display_name, client.mac)
-        if self.netbox.device_name_taken_by_other(base_name, self._current_netbox_site_slug, client.mac):
+        if existing is not None and getattr(existing, "name", None) == base_name:
+            return base_name
+        if self.netbox.device_name_taken_by_other(base_name, netbox_site_slug, client.mac):
             disambiguated = mac_suffixed_name(base_name, client.mac)
             logger.info(
                 "Name %r for %s is already used by another device in NetBox; using %r instead",
@@ -243,29 +326,35 @@ class SyncEngine:
             return disambiguated
         return base_name
 
-    def _sync_client(self, client: UnifiClient) -> ClientSyncResult:
+    def _sync_client(self, client: UnifiClient, netbox_site_slug: str) -> ClientSyncResult:
         result = ClientSyncResult(mac=client.mac, name=client.display_name)
         s = self.settings
         iface_name = _interface_name(client)
         try:
-            device_name = self._resolve_device_name(client)
+            existing = self.netbox.find_client_device_by_mac(client.mac)
+            device_name = self._resolve_device_name(client, netbox_site_slug, existing)
             result.name = device_name
 
             if s.dry_run:
-                self._plan_client(client, iface_name, result)
+                self._plan_client(client, existing, result)
                 return result
 
-            device, created, update_skipped = self.netbox.upsert_client_device(
+            device, created, update_skipped, updated = self.netbox.upsert_client_device(
                 client.mac,
                 device_name,
-                self._current_netbox_site_slug,
+                netbox_site_slug,
                 s.client_device_role_slug,
                 s.client_device_type_slug,
                 s.sync_tag,
                 s.device_update_policy,
+                existing,
+                True,
             )
             result.device_created = created
-            result.device_updated = not created and not update_skipped
+            # "updated" means fields were actually written, not merely that an
+            # existing device was seen — otherwise every steady-state run would
+            # report the whole estate as updated.
+            result.device_updated = updated
             if update_skipped:
                 result.device_update_skipped_reason = (
                     f"DEVICE_UPDATE_POLICY={s.device_update_policy!r}: existing device left as-is"
@@ -278,18 +367,25 @@ class SyncEngine:
 
             iface = self.netbox.ensure_interface(device, iface_name, client.is_wired)
 
+            ip_wrote = False
             if client.ip:
-                result.ip_assigned = self.netbox.assign_ip(device, iface, client.ip, s.netbox_ip_status)
+                if _primary_ip_matches(device, client.ip):
+                    result.ip_unchanged = True
+                else:
+                    ip_wrote = self.netbox.assign_ip(device, iface, client.ip, s.netbox_ip_status)
+                    result.ip_assigned = ip_wrote
 
+            cable_wrote = False
             if client.is_wired and client.switch_mac and client.switch_port:
-                self._wire_cable(client, iface, result)
+                cable_wrote = self._wire_cable(client, iface, result)
+
+            result.unchanged = not (created or updated or ip_wrote or cable_wrote)
         except EXPECTED_CLIENT_ERRORS as exc:
             logger.exception("Failed syncing client %s (%s)", client.mac, client.display_name)
             result.error = str(exc)
         return result
 
-    def _plan_client(self, client: UnifiClient, iface_name: str, result: ClientSyncResult) -> None:
-        existing = self.netbox.find_client_device_by_mac(client.mac)
+    def _plan_client(self, client: UnifiClient, existing: object | None, result: ClientSyncResult) -> None:
         result.device_created = existing is None
         if existing is not None and self.settings.device_update_policy == "create-only":
             result.device_update_skipped_reason = (
@@ -309,21 +405,29 @@ class SyncEngine:
                 return
             result.cable_created = True
 
-    def _wire_cable(self, client: UnifiClient, iface: object, result: ClientSyncResult) -> None:
+    def _wire_cable(self, client: UnifiClient, iface: object, result: ClientSyncResult) -> bool:
+        """Returns True if a cable was actually written."""
         switch_device = self.netbox.find_switch_device_by_mac(client.switch_mac)
         if switch_device is None:
             result.cable_skipped_reason = (
                 f"switch {client.switch_mac} not found in NetBox (port {client.switch_port})"
             )
-            return
+            return False
         candidates = [t.format(port=client.switch_port) for t in self.settings.port_name_templates]
         switch_iface = self.netbox.find_interface_by_name_candidates(switch_device, candidates)
         if switch_iface is None:
             result.cable_skipped_reason = f"no interface on {switch_device.name} matched {candidates}"
-            return
+            return False
+        # The interface came straight from ensure_interface, so its cable state
+        # is current for this run — if it already points at the right port
+        # there is nothing to write and nothing to re-read.
+        if _already_cabled_to(iface, switch_iface):
+            result.cable_unchanged = True
+            return False
         created, reason = self.netbox.ensure_cable(iface, switch_iface, self.settings.cable_conflict_policy)
         result.cable_created = created
         result.cable_skipped_reason = reason
+        return created
 
     def _mark_stale(self, netbox_site_slug: str, seen_macs: set[str]) -> int:
         marked = 0

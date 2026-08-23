@@ -89,6 +89,7 @@ write_env() {
     printf '%s\n' "MARK_STALE_OFFLINE=true" >> .env
     printf '%s\n' "DEVICE_UPDATE_POLICY=sync" >> .env
     printf '%s\n' "METRICS_FILE=" >> .env
+    printf '%s\n' "MAX_WORKERS=1" >> .env
     printf '%s\n' "SYNC_INTERVAL_SECONDS=${10}" >> .env
     printf '%s\n' "LOCK_FILE=" >> .env
     chmod 600 .env

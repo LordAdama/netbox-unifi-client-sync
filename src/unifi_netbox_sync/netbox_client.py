@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import pynetbox
@@ -38,9 +40,13 @@ class NetboxGateway(Protocol):
         device_type_slug: str,
         tag_slug: str,
         update_policy: str = "sync",
-    ) -> tuple[Any, bool, bool]: ...
+        existing: Any | None = None,
+        existing_looked_up: bool = False,
+    ) -> tuple[Any, bool, bool, bool]: ...
 
     def ensure_interface(self, device: Any, name: str, wired: bool) -> Any: ...
+
+    def list_device_interfaces(self, device: Any) -> list[Any]: ...
 
     def assign_ip(self, device: Any, interface: Any, ip: str, status: str) -> bool: ...
 
@@ -57,6 +63,32 @@ class PynetboxGateway:
     def __init__(self, url: str, token: str, verify_ssl: bool = True) -> None:
         self.api = pynetbox.api(url, token=token)
         self.api.http_session.verify = verify_ssl
+        # Per-run memo for objects that are constant for the whole run but are
+        # looked up inside upsert_client_device (i.e. once per client, which
+        # is pure waste). Not exposed on NetboxGateway, so CachingNetboxGateway
+        # can't reach them — hence the local memo. Guarded by a lock because
+        # parallel site workers share one gateway instance.
+        self._memo_lock = threading.Lock()
+        self._device_type_memo: dict[str, Any] = {}
+        self._role_memo: dict[str, Any] = {}
+        self._site_memo: dict[str, Any] = {}
+
+    def _memoized(self, memo: dict[str, Any], key: str, fetch: Callable[[], Any]) -> Any:
+        with self._memo_lock:
+            if key in memo:
+                return memo[key]
+        value = fetch()
+        with self._memo_lock:
+            memo[key] = value
+        return value
+
+    def _get_device_type(self, slug: str) -> Any:
+        return self._memoized(
+            self._device_type_memo, slug, lambda: self.api.dcim.device_types.get(slug=slug)
+        )
+
+    def _get_role(self, slug: str) -> Any:
+        return self._memoized(self._role_memo, slug, lambda: self.api.dcim.device_roles.get(slug=slug))
 
     # -- setup -----------------------------------------------------------
 
@@ -151,7 +183,21 @@ class PynetboxGateway:
         return list(self.api.dcim.devices.filter(tag=tag_slug, site=site_slug))
 
     def find_site(self, site_slug: str) -> Any | None:
-        return self.api.dcim.sites.get(slug=site_slug)
+        # Memoized here, not only in CachingNetboxGateway: upsert_client_device
+        # calls this internally (once per client), which bypasses the decorator
+        # entirely. Only hits are cached — a site missing now may be created
+        # later in the run under SITE_POLICY=create.
+        with self._memo_lock:
+            if site_slug in self._site_memo:
+                return self._site_memo[site_slug]
+        site = self.api.dcim.sites.get(slug=site_slug)
+        if site is not None:
+            with self._memo_lock:
+                self._site_memo[site_slug] = site
+        return site
+
+    def list_device_interfaces(self, device: Any) -> list[Any]:
+        return list(self.api.dcim.interfaces.filter(device_id=device.id))
 
     # -- mutations -----------------------------------------------------------
 
@@ -174,6 +220,8 @@ class PynetboxGateway:
         site = self.api.dcim.sites.create(
             name=site_slug.replace("-", " ").title(), slug=site_slug, status="active"
         )
+        with self._memo_lock:
+            self._site_memo[site_slug] = site
         logger.info("Created NetBox site %r (SITE_POLICY=create)", site_slug)
         return site, True
 
@@ -186,11 +234,21 @@ class PynetboxGateway:
         device_type_slug: str,
         tag_slug: str,
         update_policy: str = "sync",
-    ) -> tuple[Any, bool, bool]:
-        """Returns (device, created, update_skipped_by_policy)."""
-        device = self.find_client_device_by_mac(mac)
-        device_type = self.api.dcim.device_types.get(slug=device_type_slug)
-        role = self.api.dcim.device_roles.get(slug=role_slug)
+        existing: Any | None = None,
+        existing_looked_up: bool = False,
+    ) -> tuple[Any, bool, bool, bool]:
+        """Returns (device, created, update_skipped_by_policy, updated).
+
+        `updated` is True only when fields were actually written — an existing
+        device that already matched reports False, so callers can distinguish
+        "seen" from "changed".
+
+        `existing` lets the caller pass a device it has already fetched, so we
+        don't repeat the by-MAC lookup. `existing_looked_up` distinguishes
+        "caller looked and found nothing" from "caller didn't look" — without
+        it, a None `existing` would force a redundant query on every new device.
+        """
+        device = existing if existing_looked_up else self.find_client_device_by_mac(mac)
         site = self.find_site(site_slug)
         if site is None:
             # Defensive: SyncEngine.run() already resolves the site via
@@ -199,6 +257,10 @@ class PynetboxGateway:
             raise LookupError(f"NetBox site '{site_slug}' does not exist")
 
         if device is None:
+            # Only needed on the create path — memoized so this costs at most
+            # one lookup each per run rather than one per client.
+            device_type = self._get_device_type(device_type_slug)
+            role = self._get_role(role_slug)
             device = self.api.dcim.devices.create(
                 name=name,
                 device_type=device_type.id,
@@ -208,11 +270,11 @@ class PynetboxGateway:
                 custom_fields={"unifi_mac": mac},
                 tags=[{"slug": tag_slug}],
             )
-            return device, True, False
+            return device, True, False, False
 
         would_change = device.name != name or device.status.value != "active"
         if update_policy == "create-only":
-            return device, False, would_change
+            return device, False, would_change, False
 
         updated = False
         if device.name != name:
@@ -223,7 +285,7 @@ class PynetboxGateway:
             updated = True
         if updated:
             device.save()
-        return device, False, False
+        return device, False, False, updated
 
     def ensure_interface(self, device: Any, name: str, wired: bool) -> Any:
         iface = self.api.dcim.interfaces.get(device_id=device.id, name=name)
