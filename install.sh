@@ -20,11 +20,14 @@
 #   NETBOX_URL=https://netbox.example.com NETBOX_TOKEN=... NETBOX_SITE_SLUG=main \
 #   bash install.sh --non-interactive
 #
-# Required: UNIFI_HOST, NETBOX_URL, NETBOX_TOKEN, NETBOX_SITE_SLUG, and
-# either UNIFI_API_KEY or both UNIFI_USERNAME and UNIFI_PASSWORD. Optional:
+# Required: UNIFI_HOST, NETBOX_URL, NETBOX_TOKEN, either UNIFI_API_KEY or
+# both UNIFI_USERNAME and UNIFI_PASSWORD, and either NETBOX_SITE_SLUG
+# (single site) or SITE_MAP (multiple sites — see .env.example). Optional:
 # UNIFI_IS_UDM (default true), UNIFI_SITE (default "default"),
 # SYNC_INTERVAL_SECONDS (default 3600). Ignored entirely if .env already
-# exists — non-interactive mode only applies to first-time setup.
+# exists — non-interactive mode only applies to first-time setup. This
+# installer's interactive prompts only set up a single site; edit SITE_MAP
+# in .env afterwards if you need more than one.
 set -euo pipefail
 
 REPO_URL="https://github.com/LordAdama/netbox-unifi-client-sync.git"
@@ -71,6 +74,7 @@ write_env() {
     printf '%s\n' "NETBOX_TOKEN=$8" >> .env
     printf '%s\n' "NETBOX_VERIFY_SSL=true" >> .env
     printf '%s\n' "NETBOX_SITE_SLUG=$9" >> .env
+    printf '%s\n' "SITE_MAP=${11:-}" >> .env
     printf '%s\n' "SITE_POLICY=require" >> .env
     printf '%s\n' "NETBOX_IP_STATUS=active" >> .env
     printf '%s\n' "DRY_RUN=false" >> .env
@@ -106,7 +110,10 @@ elif [ "$NONINTERACTIVE" = true ]; then
     : "${UNIFI_HOST:?UNIFI_HOST must be set}"
     : "${NETBOX_URL:?NETBOX_URL must be set}"
     : "${NETBOX_TOKEN:?NETBOX_TOKEN must be set}"
-    : "${NETBOX_SITE_SLUG:?NETBOX_SITE_SLUG must be set}"
+    if [ -z "${SITE_MAP:-}" ] && [ -z "${NETBOX_SITE_SLUG:-}" ]; then
+        echo "Error: set NETBOX_SITE_SLUG (single site), or SITE_MAP (multiple sites)" >&2
+        exit 1
+    fi
     if [ -z "${UNIFI_API_KEY:-}" ] && { [ -z "${UNIFI_USERNAME:-}" ] || [ -z "${UNIFI_PASSWORD:-}" ]; }; then
         echo "Error: set UNIFI_API_KEY, or both UNIFI_USERNAME and UNIFI_PASSWORD" >&2
         exit 1
@@ -115,8 +122,8 @@ elif [ "$NONINTERACTIVE" = true ]; then
     write_env \
         "$UNIFI_HOST" "${UNIFI_API_KEY:-}" "${UNIFI_USERNAME:-}" "${UNIFI_PASSWORD:-}" \
         "${UNIFI_IS_UDM:-true}" "${UNIFI_SITE:-default}" \
-        "$NETBOX_URL" "$NETBOX_TOKEN" "$NETBOX_SITE_SLUG" \
-        "${SYNC_INTERVAL_SECONDS:-3600}"
+        "$NETBOX_URL" "$NETBOX_TOKEN" "${NETBOX_SITE_SLUG:-}" \
+        "${SYNC_INTERVAL_SECONDS:-3600}" "${SITE_MAP:-}"
     echo "==> Wrote .env (chmod 600)"
 else
     echo "==> First-time setup — answer a few questions (nothing is sent anywhere but your own .env file)"
@@ -148,8 +155,9 @@ else
         "$unifi_host" "$unifi_api_key" "$unifi_user" "$unifi_pass" \
         "$is_udm_bool" "$unifi_site" \
         "$netbox_url" "$netbox_token" "$netbox_site_slug" \
-        "$interval"
+        "$interval" ""
     echo "==> Wrote .env (chmod 600)"
+    echo "==> (This sets up a single site. For more than one, edit SITE_MAP in .env — see .env.example.)"
 fi
 
 echo "==> Building Docker image"

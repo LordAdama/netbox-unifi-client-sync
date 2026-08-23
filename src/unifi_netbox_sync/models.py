@@ -36,6 +36,14 @@ class UnifiClient:
 
 
 @dataclass
+class SitePair:
+    """One UniFi site synced into one NetBox site."""
+
+    unifi_site: str
+    netbox_site_slug: str
+
+
+@dataclass
 class ClientSyncResult:
     mac: str
     name: str
