@@ -31,6 +31,9 @@ _HELP_TEXT = {
     "cables_unchanged": "Client cables that were already correct in the last sync run",
     "cache_hits": "Run-scoped NetBox lookups served from cache in the last sync run",
     "cache_misses": "Run-scoped NetBox lookups that hit the API in the last sync run",
+    "clients_fast_path": "Clients answered from the prefetched index without the write path in the last sync run",
+    "prefetch_seconds": "Seconds spent bulk-loading NetBox objects before per-client work in the last sync run",
+    "prefetch_hits": "Lookups served from the bulk NetBox index in the last sync run",
     "errors": "Errors encountered in the last sync run",
     "duration_seconds": "Wall-clock duration of the last sync run, in seconds",
 }
@@ -63,6 +66,9 @@ def summary_as_dict(summary: SyncSummary) -> dict:
         "cables_unchanged": summary.cables_unchanged,
         "cache_hits": summary.cache_hits,
         "cache_misses": summary.cache_misses,
+        "clients_fast_path": summary.clients_fast_path,
+        "prefetch_seconds": round(summary.prefetch_seconds, 3),
+        "prefetch_hits": summary.prefetch_hits,
         "errors": len(summary.errors or []),
         "duration_seconds": round(summary.duration_seconds, 3),
     }

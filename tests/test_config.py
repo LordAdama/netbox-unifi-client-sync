@@ -202,3 +202,58 @@ def test_inventory_device_status_rejects_unknown_values(monkeypatch):
 
     with pytest.raises(SystemExit):
         Settings.from_env()
+
+
+def test_prefetch_and_worker_defaults(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    for key in (
+        "NETBOX_PREFETCH",
+        "NETBOX_FAST_PATH",
+        "NETBOX_PAGE_SIZE",
+        "NETBOX_MAX_INFLIGHT",
+        "NETBOX_RATE_LIMIT_RETRIES",
+        "MAX_WORKERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.netbox_prefetch is True
+    assert settings.netbox_fast_path is True
+    assert settings.netbox_page_size == 1000
+    assert settings.netbox_max_inflight == 4
+    assert settings.netbox_rate_limit_retries == 5
+    assert settings.max_workers == 4
+
+
+def test_prefetch_settings_can_be_turned_down(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("NETBOX_PREFETCH", "false")
+    monkeypatch.setenv("NETBOX_FAST_PATH", "off")
+    monkeypatch.setenv("NETBOX_PAGE_SIZE", "50")
+    monkeypatch.setenv("NETBOX_MAX_INFLIGHT", "0")
+    monkeypatch.setenv("NETBOX_RATE_LIMIT_RETRIES", "2")
+    monkeypatch.setenv("MAX_WORKERS", "1")
+
+    settings = Settings.from_env()
+
+    assert settings.netbox_prefetch is False
+    assert settings.netbox_fast_path is False
+    assert settings.netbox_page_size == 50
+    assert settings.netbox_max_inflight == 0
+    assert settings.netbox_rate_limit_retries == 2
+    assert settings.max_workers == 1
+
+
+def test_page_size_rejects_zero(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("NETBOX_PAGE_SIZE", "0")
+
+    with pytest.raises(SystemExit):
+        Settings.from_env()

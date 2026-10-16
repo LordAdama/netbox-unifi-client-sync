@@ -101,6 +101,9 @@ def main(argv: list[str] | None = None) -> int:
                 token=settings.netbox_token,
                 verify_ssl=settings.netbox_verify_ssl,
                 timeout=settings.netbox_timeout,
+                page_size=settings.netbox_page_size,
+                max_inflight=settings.netbox_max_inflight,
+                rate_limit_retries=settings.netbox_rate_limit_retries,
             )
         )
         engine = SyncEngine(unifi=unifi, netbox=netbox, settings=settings)

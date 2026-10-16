@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import pynetbox
 import requests
@@ -118,6 +119,26 @@ DEFAULT_READ_ATTEMPTS = 3
 DEFAULT_READ_BACKOFF = (1.0, 2.0)
 
 
+class _Unlimited:
+    """Stand-in for a semaphore when NETBOX_MAX_INFLIGHT is 0."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+def _retry_delay(response: requests.Response, attempt: int) -> float:
+    """Seconds to wait after HTTP 429. Honors Retry-After when it is numeric."""
+    raw = (response.headers.get("Retry-After") or "").strip()
+    try:
+        parsed = float(raw)
+    except ValueError:
+        parsed = 0.5 * (2**attempt)
+    return min(60.0, max(0.0, parsed))
+
+
 class TimeoutSession(requests.Session):
     """requests.Session that applies a default timeout to every call.
 
@@ -126,12 +147,20 @@ class TimeoutSession(requests.Session):
     is the one choke point those verbs share.
 
     A read that times out or fails to connect is retried a bounded number of
-    times with backoff. POSTs, PUTs, PATCHes, and DELETEs are not retried.
+    times with backoff. POSTs, PUTs, PATCHes, and DELETEs are not retried
+    after a timeout or a dropped connection.
+
+    Also caps how many NetBox calls are in flight and retries HTTP 429 on
+    every verb. A 429 means NetBox refused the call before applying it, so
+    repeating it does not create a second object. The wait happens outside
+    the in-flight cap so a backoff does not pin every worker.
     """
 
     def __init__(
         self,
         timeout: float,
+        max_inflight: int = 4,
+        rate_limit_retries: int = 5,
         *,
         read_attempts: int = DEFAULT_READ_ATTEMPTS,
         read_backoff: tuple[float, ...] = DEFAULT_READ_BACKOFF,
@@ -139,19 +168,54 @@ class TimeoutSession(requests.Session):
     ) -> None:
         super().__init__()
         self.timeout = timeout
+        self.rate_limit_retries = rate_limit_retries
         self.read_attempts = max(1, read_attempts)
         self.read_backoff = read_backoff or (0.0,)
+        self.requests_made = 0
+        self._count_lock = threading.Lock()
         self._sleep = sleep or time.sleep
+        if max_inflight <= 0:
+            self._inflight: threading.BoundedSemaphore | _Unlimited = _Unlimited()
+        else:
+            self._inflight = threading.BoundedSemaphore(max_inflight)
 
     def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         kwargs.setdefault("timeout", self.timeout)
         verb = method.upper()
-        attempts = self.read_attempts if verb in _READ_METHODS else 1
-        for attempt in range(1, attempts + 1):
+        read_attempts = self.read_attempts if verb in _READ_METHODS else 1
+        rate_retries = max(0, self.rate_limit_retries)
+        response: requests.Response | None = None
+        for rate_attempt in range(rate_retries + 1):
+            response = self._request_once(verb, url, kwargs, read_attempts)
+            if response.status_code != 429 or rate_attempt >= rate_retries:
+                return response
+            delay = _retry_delay(response, rate_attempt)
+            logger.warning(
+                "NetBox returned 429 for %s %s; retrying in %.1fs (%d/%d)",
+                verb,
+                urlsplit(url).path or url,
+                delay,
+                rate_attempt + 1,
+                rate_retries,
+            )
+            if delay:
+                self._sleep(delay)
+        assert response is not None
+        return response
+
+    def _request_once(
+        self, verb: str, url: str, kwargs: dict[str, Any], read_attempts: int
+    ) -> requests.Response:
+        """One logical call, repeating a read that times out or fails to connect."""
+        for attempt in range(1, read_attempts + 1):
             try:
-                return super().request(method, url, **kwargs)
+                with self._inflight:
+                    response = super().request(verb, url, **kwargs)
+                with self._count_lock:
+                    self.requests_made += 1
+                return response
             except _RETRYABLE_READ_ERRORS as exc:
-                if attempt >= attempts:
+                if attempt >= read_attempts:
                     raise
                 delay = self.read_backoff[min(attempt - 1, len(self.read_backoff) - 1)]
                 logger.warning(
@@ -161,7 +225,7 @@ class TimeoutSession(requests.Session):
                     exc.__class__.__name__,
                     delay,
                     attempt + 1,
-                    attempts,
+                    read_attempts,
                 )
                 if delay > 0:
                     self._sleep(delay)
@@ -328,18 +392,28 @@ class NetboxGateway(Protocol):
 class PynetboxGateway:
     """NetBox gateway backed by the real pynetbox API client."""
 
-    def __init__(self, url: str, token: str, verify_ssl: bool = True, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        verify_ssl: bool = True,
+        timeout: float = 30.0,
+        page_size: int = 1000,
+        max_inflight: int = 4,
+        rate_limit_retries: int = 5,
+    ) -> None:
         self.api = pynetbox.api(url, token=token)
         # pynetbox never passes timeout= into requests, so a single stalled
         # NetBox call hangs the sync (and, in the long-running container, the
         # healthcheck) until something kills the process. Replace the session
         # before any call. Auth is attached per request from api.token, not
         # from the session, so swapping the session does not drop the token.
-        session = TimeoutSession(timeout)
+        session = TimeoutSession(timeout, max_inflight, rate_limit_retries)
         session.verify = verify_ssl
         session.headers.update(self.api.http_session.headers)
         self.api.http_session = session
         self.timeout = timeout
+        self.page_size = page_size
         # Per-run memo for objects that are constant for the whole run but are
         # looked up inside upsert_client_device (i.e. once per client, which
         # is pure waste). Not exposed on NetboxGateway, so CachingNetboxGateway
@@ -358,6 +432,14 @@ class PynetboxGateway:
         # the parameter and returns every site; trusting the first one bound
         # every UniFi site to whichever site sorts first.
         self._unifi_site_id_filter_unusable = False
+        # Filled by note_prefetched_* before per-client work. Hits skip the
+        # filtered GET; misses fall through unless the index is complete.
+        self._pref_by_mac: dict[str, Any] | None = None
+        self._pref_by_serial: dict[str, Any] | None = None
+        self._pref_by_name: dict[str, Any] | None = None
+        self._pref_by_id: dict[Any, Any] = {}
+        self._pref_mac_complete = False
+        self._pref_ifaces_by_mac: dict[str, list[Any]] | None = None
 
     def _memoized(self, memo: dict[str, Any], key: str, fetch: Callable[[], Any]) -> Any:
         with self._memo_lock:
@@ -491,10 +573,17 @@ class PynetboxGateway:
         populated at all, and where they do, a port's MAC is not the chassis
         MAC that UniFi reports as `sw_mac`. So we try several joins in
         descending order of precision, and say plainly which one worked.
+
+        The interface-MAC join stays a live filter: the first hit has to be
+        the one that filter returns, and a site-scoped prefetch can miss it.
+        A complete ``unifi_mac`` index answers the custom-field join with no
+        further GET. Serial and name stay live queries too, once per switch,
+        because a partial index can hold a different device than the first
+        row of the global filter.
         """
         for strategy, finder in (
             ("interface MAC", lambda: self._switch_by_interface_mac(mac)),
-            ("unifi_mac custom field", lambda: self._first(self.api.dcim.devices.filter(cf_unifi_mac=mac))),
+            ("unifi_mac custom field", lambda: self._switch_by_unifi_mac(mac)),
             ("serial", lambda: self._switch_by_serial(mac, hints)),
             ("device name", lambda: self._switch_by_name(hints)),
         ):
@@ -513,9 +602,15 @@ class PynetboxGateway:
         return next(iter(results), None)
 
     def _switch_by_interface_mac(self, mac: str) -> Any | None:
-        matches = list(self.api.dcim.interfaces.filter(mac_address=mac))
+        # Always the live filter. A site-scoped interface prefetch can miss a
+        # port MAC that lives on some other device, and the first hit has to
+        # stay the one this filter would return.
+        matches = list(self.api.dcim.interfaces.filter(mac_address=mac, limit=getattr(self, "page_size", 1000)))
         if not matches:
             return None
+        return self._device_for_mac_interfaces(mac, matches)
+
+    def _device_for_mac_interfaces(self, mac: str, matches: list[Any]) -> Any | None:
         iface = matches[0]
         if len(matches) > 1:
             logger.warning(
@@ -526,16 +621,28 @@ class PynetboxGateway:
                 iface.device.name,
                 iface.name,
             )
-        return self.api.dcim.devices.get(iface.device.id)
+        device_id = getattr(getattr(iface, "device", None), "id", None)
+        cached = self._pref_by_id.get(device_id) if device_id is not None else None
+        if cached is not None:
+            return cached
+        if device_id is None:
+            return None
+        return self.api.dcim.devices.get(device_id)
 
-    def _switch_by_serial(self, mac: str, hints: SwitchHints | None) -> Any | None:
+    def _serial_candidates(self, mac: str, hints: SwitchHints | None) -> list[str]:
         # UniFi imports commonly use the MAC as the serial, in either
         # colon-separated or bare form; the controller's own serial too.
         candidates = [mac, mac.replace(":", ""), mac.upper(), mac.replace(":", "").upper()]
         if hints and hints.serial:
             candidates.insert(0, hints.serial)
-        for serial in candidates:
-            device = self._first(self.api.dcim.devices.filter(serial=serial))
+        return candidates
+
+    def _switch_by_serial(self, mac: str, hints: SwitchHints | None) -> Any | None:
+        # Serial is a global join. A per-site index can hold a later device
+        # than the one ``filter(serial=)`` returns first, so this stays a
+        # live query. It runs once per switch, not once per client.
+        for serial in self._serial_candidates(mac, hints):
+            device = self._first(self.api.dcim.devices.filter(serial=serial, limit=getattr(self, "page_size", 1000)))
             if device is not None:
                 return device
         return None
@@ -543,7 +650,17 @@ class PynetboxGateway:
     def _switch_by_name(self, hints: SwitchHints | None) -> Any | None:
         if not hints or not hints.name:
             return None
-        return self._first(self.api.dcim.devices.filter(name=hints.name))
+        return self._first(self.api.dcim.devices.filter(name=hints.name, limit=getattr(self, "page_size", 1000)))
+
+    def _switch_by_unifi_mac(self, mac: str) -> Any | None:
+        index = self._pref_by_mac
+        if index is not None and mac in index:
+            return index[mac]
+        if self._pref_mac_complete:
+            return None
+        return self._first(
+            self.api.dcim.devices.filter(**{f"cf_{UNIFI_MAC_FIELD}": mac}, limit=getattr(self, "page_size", 1000))
+        )
 
     def find_interface_by_name_candidates(self, device: Any, candidates: list[str]) -> Any | None:
         for name in candidates:
@@ -559,7 +676,164 @@ class PynetboxGateway:
         return None
 
     def find_client_device_by_mac(self, mac: str) -> Any | None:
-        return next(iter(self.api.dcim.devices.filter(cf_unifi_mac=mac)), None)
+        return next(
+            iter(self.api.dcim.devices.filter(**{f"cf_{UNIFI_MAC_FIELD}": mac}, limit=getattr(self, "page_size", 1000))),
+            None,
+        )
+
+    def match_client_device(self, devices: list[Any], mac: str) -> Any | None:
+        """First device whose ``unifi_mac`` equals ``mac``, in list order.
+
+        Same answer as ``find_client_device_by_mac`` when ``devices`` is the
+        full set that filter would scan, in NetBox's default order.
+        """
+        for device in devices:
+            raw = (getattr(device, "custom_fields", None) or {}).get(UNIFI_MAC_FIELD)
+            if raw is not None and str(raw) == mac:
+                return device
+        return None
+
+    def device_name_taken_among(self, devices: list[Any], name: str, site_slug: str, mac: str) -> bool:
+        """In-memory form of ``device_name_taken_by_other``.
+
+        The first device at the site with this name wins, matching
+        ``next(iter(filter(name=, site=)))``.
+        """
+        if not self._site_exists(site_slug):
+            return False
+        for device in devices:
+            if getattr(device, "name", None) != name:
+                continue
+            if device_site_slug(device) != site_slug:
+                continue
+            stored = (getattr(device, "custom_fields", None) or {}).get(UNIFI_MAC_FIELD)
+            return stored != mac
+        return False
+
+    def select_synced_clients(
+        self, devices: list[Any], tag_slug: str, site_slug: str, role_slug: str | None
+    ) -> list[Any]:
+        """Devices from ``devices`` that ``list_synced_client_devices`` would return."""
+        if not self._site_exists(site_slug):
+            return []
+        selected = []
+        for device in devices:
+            if not device_has_tag(device, tag_slug):
+                continue
+            if device_site_slug(device) != site_slug:
+                continue
+            if role_slug and role_slug_of(device) != role_slug:
+                continue
+            selected.append(device)
+        return selected
+
+    def bulk_devices_with_unifi_mac(self) -> list[Any] | None:
+        """Every device that has ``unifi_mac`` set, or None if the query failed.
+
+        An ignored filter returns the whole device table (NetBox drops unknown
+        parameters and answers 200). That table is still a complete index: a
+        MAC that is not on any record is not in NetBox. Pagination is followed
+        to the end, so a short page is not treated as the full set.
+        """
+        try:
+            devices = list(
+                self.api.dcim.devices.filter(
+                    **{f"cf_{UNIFI_MAC_FIELD}__empty": "false"},
+                    limit=getattr(self, "page_size", 1000),
+                )
+            )
+        except pynetbox.RequestError as exc:
+            logger.warning(
+                "Could not bulk-load devices by %s (%s); per-client lookups will be used",
+                UNIFI_MAC_FIELD,
+                exc,
+            )
+            return None
+        empty = sum(1 for device in devices if not _custom_field(device, UNIFI_MAC_FIELD))
+        if empty:
+            logger.info(
+                "NetBox ignored the %s empty-filter and returned the full device list "
+                "(%d record(s), %d without the field); indexing that list",
+                UNIFI_MAC_FIELD,
+                len(devices),
+                empty,
+            )
+        else:
+            logger.info("Bulk-loaded %d NetBox device(s) with %s set", len(devices), UNIFI_MAC_FIELD)
+        return devices
+
+    def bulk_devices_at_site(self, site_slug: str) -> list[Any] | None:
+        """Every device at ``site_slug``, or None if the query failed.
+
+        An empty list means the site exists and holds nothing (or the site
+        does not exist). None means "do not trust an index".
+        """
+        if not self._site_exists(site_slug):
+            return []
+        try:
+            devices = list(self.api.dcim.devices.filter(site=site_slug, limit=getattr(self, "page_size", 1000)))
+        except pynetbox.RequestError as exc:
+            logger.warning(
+                "Could not bulk-load devices at site %s (%s); per-client lookups will be used",
+                site_slug,
+                exc,
+            )
+            return None
+        logger.info("Bulk-loaded %d NetBox device(s) at site %s", len(devices), site_slug)
+        return devices
+
+    def bulk_interfaces(self, device_ids: list[Any]) -> list[Any] | None:
+        """Interfaces for ``device_ids``, in chunks so the query string stays bounded."""
+        if not device_ids:
+            return []
+        found: list[Any] = []
+        try:
+            for start in range(0, len(device_ids), 50):
+                batch = device_ids[start : start + 50]
+                found.extend(
+                    self.api.dcim.interfaces.filter(device_id=batch, limit=getattr(self, "page_size", 1000))
+                )
+        except pynetbox.RequestError as exc:
+            logger.warning("Could not bulk-load interfaces (%s); per-device lookups will be used", exc)
+            return None
+        return found
+
+    def note_prefetched_devices(self, devices: list[Any], *, mac_complete: bool) -> None:
+        """Index devices for switch joins. ``mac_complete`` means every unifi_mac is here."""
+        by_mac: dict[str, Any] = {}
+        by_serial: dict[str, Any] = {}
+        by_name: dict[str, Any] = {}
+        by_id: dict[Any, Any] = {}
+        for device in devices:
+            device_id = getattr(device, "id", None)
+            if device_id is not None and device_id not in by_id:
+                by_id[device_id] = device
+            raw = (getattr(device, "custom_fields", None) or {}).get(UNIFI_MAC_FIELD)
+            if raw is not None and str(raw) not in by_mac:
+                by_mac[str(raw)] = device
+            serial = getattr(device, "serial", None) or ""
+            if serial and serial not in by_serial:
+                by_serial[str(serial)] = device
+            name = getattr(device, "name", None) or ""
+            if name and name not in by_name:
+                by_name[str(name)] = device
+        with self._memo_lock:
+            self._pref_by_mac = by_mac
+            self._pref_by_serial = by_serial
+            self._pref_by_name = by_name
+            self._pref_by_id.update(by_id)
+            self._pref_mac_complete = mac_complete
+
+    def note_prefetched_interfaces(self, interfaces: list[Any]) -> None:
+        """Interface-MAC hits from the bulk load. A miss still queries NetBox."""
+        by_mac: dict[str, list[Any]] = {}
+        for iface in interfaces:
+            raw = getattr(iface, "mac_address", None)
+            if not raw:
+                continue
+            by_mac.setdefault(str(raw).lower(), []).append(iface)
+        with self._memo_lock:
+            self._pref_ifaces_by_mac = by_mac
 
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool:
         # NetBox validates ?site=<slug> against existing sites and answers a
@@ -570,7 +844,10 @@ class PynetboxGateway:
         if not self._site_exists(site_slug):
             return False
         try:
-            existing = next(iter(self.api.dcim.devices.filter(name=name, site=site_slug)), None)
+            existing = next(
+                iter(self.api.dcim.devices.filter(name=name, site=site_slug, limit=getattr(self, "page_size", 1000))),
+                None,
+            )
         except pynetbox.RequestError as exc:
             if getattr(exc, "req", None) is not None and exc.req.status_code == 400:
                 # A validation error means this NetBox can't answer the query
@@ -630,6 +907,7 @@ class PynetboxGateway:
         filters: dict[str, Any] = {"tag": tag_slug, "site": site_slug}
         if role_slug:
             filters["role"] = role_slug
+        filters["limit"] = getattr(self, "page_size", 1000)
         return list(self.api.dcim.devices.filter(**filters))
 
     def find_site(self, site_slug: str) -> Any | None:
@@ -647,7 +925,7 @@ class PynetboxGateway:
         return site
 
     def list_device_interfaces(self, device: Any) -> list[Any]:
-        return list(self.api.dcim.interfaces.filter(device_id=device.id))
+        return list(self.api.dcim.interfaces.filter(device_id=device.id, limit=getattr(self, "page_size", 1000)))
 
     def list_sites(self) -> list[Any]:
         """Every NetBox site, fetched once per run for name matching."""

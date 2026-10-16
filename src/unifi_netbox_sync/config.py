@@ -96,6 +96,16 @@ def _positive_int(raw: str, name: str) -> int:
     return value
 
 
+def _non_negative_int(raw: str, name: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}") from None
+    if value < 0:
+        raise SystemExit(f"{name} must be >= 0, got {value}")
+    return value
+
+
 def _load_dotenv(path: str = ".env") -> None:
     """Load KEY=VALUE lines from `path` into os.environ (without overriding
     variables already set in the real environment).
@@ -183,6 +193,19 @@ class Settings:
     # its own; without this a stalled connection hangs the run indefinitely.
     netbox_timeout: float = 30.0
     unifi_timeout: float = 30.0
+    # Bulk-load devices, interfaces, and names once per site instead of one
+    # filtered GET per client. Results match the per-object lookups. Set
+    # false to force the old call pattern.
+    netbox_prefetch: bool = True
+    # Skip the write path when the prefetched record already matches UniFi.
+    # Same creates, updates, skips, and offline decisions as the full path.
+    netbox_fast_path: bool = True
+    # Page size for bulk GETs. NetBox caps this at MAX_PAGE_SIZE (often 1000).
+    netbox_page_size: int = 1000
+    # Cap on concurrent NetBox HTTP calls across site workers. 0 means no
+    # extra cap. 429 responses are retried up to netbox_rate_limit_retries.
+    netbox_max_inflight: int = 4
+    netbox_rate_limit_retries: int = 5
 
     # Default on, so a container started from an unedited environment cannot
     # write to NetBox. Set DRY_RUN=false or pass --apply to write.
@@ -231,10 +254,10 @@ class Settings:
     # only applies to devices carrying sync_tag; untagged objects are never
     # modified. Any value other than "create-only" behaves as "sync".
     device_update_policy: str = "create-only"
-    # Site groups synced concurrently. 1 (default) keeps the original strictly
-    # sequential behavior. Raise it for many sites; the ceiling is whatever
-    # your NetBox and UniFi controller tolerate, not this tool.
-    max_workers: int = 1
+    # Site groups synced concurrently. 4 overlaps independent sites without
+    # a stampede; NETBOX_MAX_INFLIGHT still caps in-flight HTTP. 1 is strictly
+    # sequential. The ceiling is whatever NetBox and the controller tolerate.
+    max_workers: int = 4
     # Give each client a device type carrying its real manufacturer, resolved
     # from the MAC OUI (the controller reports this per client). Falls back to
     # client_manufacturer_slug / client_device_type_slug when the vendor is
@@ -326,6 +349,17 @@ class Settings:
             netbox_ip_status=os.environ.get("NETBOX_IP_STATUS", "active"),
             netbox_timeout=_positive_float(os.environ.get("NETBOX_TIMEOUT", "30"), "NETBOX_TIMEOUT"),
             unifi_timeout=_positive_float(os.environ.get("UNIFI_TIMEOUT", "30"), "UNIFI_TIMEOUT"),
+            netbox_prefetch=_bool(os.environ.get("NETBOX_PREFETCH", "true")),
+            netbox_fast_path=_bool(os.environ.get("NETBOX_FAST_PATH", "true")),
+            netbox_page_size=_positive_int(
+                os.environ.get("NETBOX_PAGE_SIZE", "1000"), "NETBOX_PAGE_SIZE"
+            ),
+            netbox_max_inflight=_non_negative_int(
+                os.environ.get("NETBOX_MAX_INFLIGHT", "4"), "NETBOX_MAX_INFLIGHT"
+            ),
+            netbox_rate_limit_retries=_non_negative_int(
+                os.environ.get("NETBOX_RATE_LIMIT_RETRIES", "5"), "NETBOX_RATE_LIMIT_RETRIES"
+            ),
             dry_run=_bool(os.environ.get("DRY_RUN", "true")),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
             log_format=os.environ.get("LOG_FORMAT", "text"),
@@ -345,7 +379,7 @@ class Settings:
             site_match=os.environ.get("SITE_MATCH", "normalized"),
             site_policy=os.environ.get("SITE_POLICY", "require"),
             device_update_policy=os.environ.get("DEVICE_UPDATE_POLICY", "create-only"),
-            max_workers=_positive_int(os.environ.get("MAX_WORKERS", "1"), "MAX_WORKERS"),
+            max_workers=_positive_int(os.environ.get("MAX_WORKERS", "4"), "MAX_WORKERS"),
             use_oui_manufacturer=_bool(os.environ.get("USE_OUI_MANUFACTURER", "true")),
             oui_file=os.environ.get("OUI_FILE") or None,
             sync_unifi_devices=_bool(os.environ.get("SYNC_UNIFI_DEVICES", "false")),
