@@ -418,7 +418,7 @@ def test_ignored_site_id_filter_does_not_bind_every_unifi_site_to_site_a(caplog)
 class _CollapseToSiteA(FakeNetboxGateway):
     """Every lookup returns the first NetBox site, which is the failure mode."""
 
-    def resolve_existing_site(self, desired_slug, label, mode="normalized", unifi_site_id=""):
+    def resolve_existing_site(self, desired_slug, label, mode="normalized", unifi_site_id="", **_kwargs):
         return self.existing_sites["site-a"]
 
 

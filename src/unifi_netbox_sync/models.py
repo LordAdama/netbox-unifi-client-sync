@@ -25,8 +25,16 @@ class UnifiPort:
 
 
 @dataclass
+class UnifiOutlet:
+    """One toggleable outlet on a UniFi PDU or UPS, from its outlet_table."""
+
+    index: int
+    name: str = ""
+
+
+@dataclass
 class UnifiSwitchDevice:
-    """A UniFi network infrastructure device (switch, AP, gateway)."""
+    """A UniFi network infrastructure device (switch, AP, gateway, PDU, UPS)."""
 
     mac: str
     name: str
@@ -37,6 +45,9 @@ class UnifiSwitchDevice:
     version: str | None = None
     adopted: bool = True
     ports: list[UnifiPort] = field(default_factory=list)
+    # Product shortname from the controller ("UPS23", "USP-PDU-Pro"), when present.
+    shortname: str = ""
+    outlets: list[UnifiOutlet] = field(default_factory=list)
 
     @property
     def is_switch(self) -> bool:
@@ -91,6 +102,9 @@ class UnifiSite:
 
     name: str
     description: str = ""
+    # Controller ``_id`` (Mongo ObjectId). Immutable; ``name`` is the short id
+    # used in API paths and is what older releases stored in unifi_site_id.
+    internal_id: str = ""
 
     @property
     def label(self) -> str:
@@ -103,6 +117,10 @@ class SitePair:
 
     unifi_site: str
     netbox_site_slug: str
+    # Controller ``_id`` when the site list was readable. Empty for a SITE_MAP
+    # entry we could not enrich. Not part of equality for callers that only
+    # compare the two slugs.
+    unifi_internal_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -168,6 +186,14 @@ class SyncSummary:
     # Adopted UniFi infrastructure seen / created (SYNC_UNIFI_DEVICES)
     devices_synced: int = 0
     infra_created: int = 0
+    # Legacy unifi-client devices converted in place (MERGE_CLIENT_INFRA).
+    infra_merged: int = 0
+    # Devices moved onto the site where they are adopted now.
+    infra_moved: int = 0
+    # MAC/serial matches that were not created again (inventory or other site).
+    infra_duplicates_avoided: int = 0
+    infra_type_library: int = 0
+    infra_type_generated: int = 0
     # Work that was inspected and correctly required no write. High numbers
     # here are the healthy steady state, not a problem.
     clients_unchanged: int = 0

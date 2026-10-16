@@ -19,16 +19,84 @@ logger = logging.getLogger(__name__)
 
 CLIENT_INTERFACE_NAME = "eth0"
 UNIFI_MAC_FIELD = "unifi_mac"
-# Stored on the NetBox site so a later rename of the site's name or slug still
-# resolves to the same UniFi site. Matching on the name alone is what created
-# duplicate sites and re-created names an operator had changed.
+# unifi_site_id has always stored the UniFi *API site name* — the short id
+# used in /s/{name}/ paths ("default", "7xk2p9qr"), not the Mongo ``_id``.
+# That meaning is kept so existing NetBox data still matches. The two fields
+# below split the two identifiers explicitly:
+#   unifi_site_name        same short API name (backfilled from unifi_site_id)
+#   unifi_site_internal_id the controller ``_id`` (24-hex ObjectId)
+# Both are also applied to devices, recording which UniFi site last claimed
+# the device. That is how an inventory/staging site can avoid adopting a
+# device that already lives on a real site.
 UNIFI_SITE_ID_FIELD = "unifi_site_id"
+UNIFI_SITE_NAME_FIELD = "unifi_site_name"
+UNIFI_SITE_INTERNAL_ID_FIELD = "unifi_site_internal_id"
+
+
+def _custom_field(obj: Any, name: str) -> str:
+    raw = (getattr(obj, "custom_fields", None) or {}).get(name) or ""
+    return str(raw).strip()
 
 
 def site_unifi_id(site: Any) -> str:
-    """The UniFi site id stored on a NetBox site, or "" when it has none."""
-    raw = (getattr(site, "custom_fields", None) or {}).get(UNIFI_SITE_ID_FIELD) or ""
-    return str(raw).strip()
+    """The UniFi API site name stored on a NetBox site, or "" when it has none.
+
+    This is the historical ``unifi_site_id`` value: the short name used in
+    controller URLs, not the internal ``_id``.
+    """
+    return _custom_field(site, UNIFI_SITE_ID_FIELD)
+
+
+def site_unifi_name(site: Any) -> str:
+    """Explicit copy of the API site name. Empty until backfilled or written."""
+    return _custom_field(site, UNIFI_SITE_NAME_FIELD)
+
+
+def site_unifi_internal_id(site: Any) -> str:
+    """The controller ``_id`` stored on a NetBox site, or ""."""
+    return _custom_field(site, UNIFI_SITE_INTERNAL_ID_FIELD)
+
+
+def role_slug_of(device: Any) -> str:
+    """Role slug from a pynetbox device or the in-memory fake."""
+    direct = getattr(device, "role_slug", None)
+    if isinstance(direct, str) and direct:
+        return direct
+    role = getattr(device, "role", None)
+    if isinstance(role, str):
+        return role
+    slug = getattr(role, "slug", None)
+    return str(slug or "")
+
+
+def _custom_field_object_types(field: Any) -> set[str]:
+    """Content-type strings already attached to a custom field."""
+    found: set[str] = set()
+    for item in getattr(field, "object_types", None) or []:
+        if isinstance(item, str):
+            found.add(item)
+            continue
+        app = getattr(item, "app_label", None)
+        model = getattr(item, "model", None)
+        if app and model:
+            found.add(f"{app}.{model}")
+            continue
+        text = str(item).strip()
+        if text:
+            found.add(text)
+    return found
+
+
+def device_site_slug(device: Any) -> str:
+    """Site slug from a pynetbox device or the in-memory fake."""
+    direct = getattr(device, "site_slug", None)
+    if isinstance(direct, str) and direct:
+        return direct
+    site = getattr(device, "site", None)
+    if isinstance(site, str):
+        return site
+    slug = getattr(site, "slug", None)
+    return str(slug or "")
 
 # "IP address … is configured as the primary IP for device phone-01 and cannot be reassigned"
 _PRIMARY_DEVICE_RE = re.compile(
@@ -128,6 +196,7 @@ class NetboxGateway(Protocol):
         tag_slug: str,
         serial: str = "",
         update_policy: str = "sync",
+        **kwargs: Any,
     ) -> tuple[Any, bool, bool]: ...
 
     def find_interface_by_name_candidates(self, device: Any, candidates: list[str]) -> Any | None: ...
@@ -147,18 +216,36 @@ class NetboxGateway(Protocol):
     def find_site(self, site_slug: str) -> Any | None: ...
 
     def ensure_site(
-        self, site_slug: str, policy: str, name: str = "", unifi_site_id: str = ""
+        self,
+        site_slug: str,
+        policy: str,
+        name: str = "",
+        unifi_site_id: str = "",
+        unifi_internal_id: str = "",
     ) -> tuple[Any, bool]: ...
 
     def ensure_site_identity_field(self) -> None: ...
 
-    def remember_site_link(self, site: Any, unifi_site_id: str) -> bool: ...
+    def remember_site_link(
+        self, site: Any, unifi_site_id: str, unifi_internal_id: str = ""
+    ) -> bool: ...
 
     def list_sites(self) -> list[Any]: ...
 
     def resolve_existing_site(
-        self, desired_slug: str, label: str, mode: str = "normalized", unifi_site_id: str = ""
+        self,
+        desired_slug: str,
+        label: str,
+        mode: str = "normalized",
+        unifi_site_id: str = "",
+        unifi_internal_id: str = "",
     ) -> Any | None: ...
+
+    def find_unifi_device(
+        self, mac: str, serial: str, name: str, site_slug: str
+    ) -> tuple[Any | None, str]: ...
+
+    def legacy_eth0_plan(self, device: Any, interface_names: list[str]) -> str: ...
 
     def upsert_client_device(
         self,
@@ -273,31 +360,80 @@ class PynetboxGateway:
         self._ensure_device_role(role_slug)
 
     def _ensure_custom_field(self, name: str, label: str, object_types: list[str]) -> None:
-        if self.api.extras.custom_fields.get(name=name):
+        existing = self.api.extras.custom_fields.get(name=name)
+        if existing:
+            self._extend_custom_field_types(existing, object_types)
             return
         self.api.extras.custom_fields.create(
             object_types=object_types,
             type="text",
             name=name,
             label=label,
+            description=label,
             filter_logic="exact",
         )
 
+    def _extend_custom_field_types(self, field: Any, object_types: list[str]) -> None:
+        """Add object types to a custom field that already exists.
+
+        ``unifi_site_name`` starts on sites and is also stored on devices.
+        A field created by an older release only lists ``dcim.site``.
+        """
+        current = _custom_field_object_types(field)
+        missing = [item for item in object_types if item not in current]
+        if not missing:
+            return
+        try:
+            field.object_types = sorted(current | set(object_types))
+            field.save()
+            logger.info(
+                "Extended custom field %r to %s",
+                getattr(field, "name", ""),
+                ", ".join(sorted(current | set(object_types))),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not add %s to custom field %r (%s); device site fields may not filter until updated",
+                ", ".join(missing),
+                getattr(field, "name", ""),
+                exc,
+            )
+
     def ensure_site_identity_field(self) -> None:
-        """Create the site custom field that stores the UniFi site id.
+        """Create the site custom fields that identify a UniFi site.
 
         Called before site linking, which is earlier than ensure_prerequisites,
         so a renamed site can be found on this run rather than the next one.
+
+        ``unifi_site_id`` stays the API site name, which is what every
+        existing install already stored. ``unifi_site_name`` is that same
+        value under an explicit name (backfilled on the next link).
+        ``unifi_site_internal_id`` is the controller ``_id``. The latter two
+        also apply to devices.
         """
         self._ensure_custom_field(UNIFI_SITE_ID_FIELD, "UniFi Site ID", ["dcim.site"])
+        self._ensure_custom_field(
+            UNIFI_SITE_NAME_FIELD,
+            "UniFi Site Name",
+            ["dcim.site", "dcim.device"],
+        )
+        self._ensure_custom_field(
+            UNIFI_SITE_INTERNAL_ID_FIELD,
+            "UniFi Site Internal ID",
+            ["dcim.site", "dcim.device"],
+        )
 
     def _ensure_device_role(self, role_slug: str) -> None:
         existing = self.api.dcim.device_roles.get(slug=role_slug)
         if existing:
+            # A configured slug that already exists is reused. Never create a
+            # second role beside it.
+            logger.info("Reusing existing NetBox device role %r", role_slug)
             return
         self.api.dcim.device_roles.create(
             name=role_slug.replace("-", " ").title(), slug=role_slug, color="9e9e9e"
         )
+        logger.info("Created NetBox device role %r", role_slug)
 
     # -- lookups -----------------------------------------------------------
 
@@ -478,31 +614,51 @@ class PynetboxGateway:
         return sites
 
     def resolve_existing_site(
-        self, desired_slug: str, label: str, mode: str = "normalized", unifi_site_id: str = ""
+        self,
+        desired_slug: str,
+        label: str,
+        mode: str = "normalized",
+        unifi_site_id: str = "",
+        unifi_internal_id: str = "",
     ) -> Any | None:
         """Find a NetBox site that already represents this UniFi site.
 
         Tried in order, each an exact comparison (never fuzzy, so two genuinely
         different sites can't be bound together):
 
-        1. custom field ``unifi_site_id`` == the UniFi site id. This survives
-           a rename of the NetBox site's name and slug.
-        2. slug == desired_slug
-        3. name == the UniFi site's label
-        4. slug or name folded to alphanumerics matches either of the above
+        1. ``unifi_site_internal_id`` == the controller ``_id``. This survives
+           a rename of the UniFi description and of the NetBox name and slug.
+        2. ``unifi_site_id`` or ``unifi_site_name`` == the API site name (the
+           short id used in controller URLs). ``unifi_site_id`` is what older
+           releases stored, and it still holds that short name.
+        3. slug == desired_slug
+        4. name == the UniFi site's label
+        5. slug or name folded to alphanumerics matches either of the above
 
-        Step 4 is what stops a duplicate when punctuation differs: "Acme's
+        Step 5 is what stops a duplicate when punctuation differs: "Acme's
         Depot - North Yard" slugifies to `acme-s-depot-north-yard`, which
         would miss an existing `acmes-depot-north-yard` on an exact match.
 
-        Name and slug matching still runs when the id is not stored yet. A
-        site whose ``unifi_site_id`` is already set to a *different* UniFi
-        site is not a match: that field is never overwritten and is never
-        shared. Callers treat two UniFi sites that still land on one NetBox
-        site as a conflict and skip both.
+        Name and slug matching still runs when no id is stored yet. A site
+        already bound to a *different* UniFi site is not a match: those
+        fields are never overwritten and are never shared. Callers treat two
+        UniFi sites that still land on one NetBox site as a conflict and skip
+        both.
 
         Read-only. The matched site's name and slug are never modified.
         """
+        if unifi_internal_id and not self._site_field_filter_unusable(UNIFI_SITE_INTERNAL_ID_FIELD):
+            linked = self._match_site_by_field(UNIFI_SITE_INTERNAL_ID_FIELD, unifi_internal_id)
+            if linked is not None:
+                logger.info(
+                    "Matched UniFi site %s to NetBox site %r (%r) via custom field %s",
+                    unifi_internal_id,
+                    linked.slug,
+                    getattr(linked, "name", ""),
+                    UNIFI_SITE_INTERNAL_ID_FIELD,
+                )
+                return linked
+
         if unifi_site_id and not getattr(self, "_unifi_site_id_filter_unusable", False):
             linked = self._match_site_by_unifi_id(unifi_site_id)
             if linked is not None:
@@ -514,41 +670,92 @@ class PynetboxGateway:
                     UNIFI_SITE_ID_FIELD,
                 )
                 return linked
+            # Only when the id filter is a real filter that simply missed.
+            # If NetBox ignored it (field not created yet), do not issue a
+            # second custom-field query — that would consume the fallback
+            # name lookup and bind the wrong site.
+            if not getattr(self, "_unifi_site_id_filter_unusable", False) and not self._site_field_filter_unusable(
+                UNIFI_SITE_NAME_FIELD
+            ):
+                linked = self._match_site_by_field(UNIFI_SITE_NAME_FIELD, unifi_site_id)
+                if linked is not None:
+                    logger.info(
+                        "Matched UniFi site %s to NetBox site %r (%r) via custom field %s",
+                        unifi_site_id,
+                        linked.slug,
+                        getattr(linked, "name", ""),
+                        UNIFI_SITE_NAME_FIELD,
+                    )
+                    return linked
 
         exact = self.find_site(desired_slug)
-        if exact is not None and self._site_id_allows(exact, unifi_site_id):
+        if exact is not None and self._site_id_allows(exact, unifi_site_id, unifi_internal_id):
             return exact
         if mode == "slug":
             return None
 
         by_name = self._first(self.api.dcim.sites.filter(name=label)) if label else None
-        if by_name is not None and self._site_id_allows(by_name, unifi_site_id):
+        if by_name is not None and self._site_id_allows(by_name, unifi_site_id, unifi_internal_id):
             return by_name
         if mode != "normalized":
             return None
 
         wanted = {normalize_key(desired_slug), normalize_key(label)} - {""}
         for site in self.list_sites():
-            if not self._site_id_allows(site, unifi_site_id):
+            if not self._site_id_allows(site, unifi_site_id, unifi_internal_id):
                 continue
             candidates = {normalize_key(site.slug or ""), normalize_key(site.name or "")}
             if candidates & wanted:
                 return site
         return None
 
-    def _site_id_allows(self, site: Any, unifi_site_id: str) -> bool:
+    def _site_field_filter_unusable(self, field_name: str) -> bool:
+        flags = getattr(self, "_site_field_filters_unusable", None)
+        if flags is None:
+            return False
+        return field_name in flags
+
+    def _mark_site_field_filter_unusable(self, field_name: str) -> None:
+        flags = getattr(self, "_site_field_filters_unusable", None)
+        if flags is None:
+            flags = set()
+            self._site_field_filters_unusable = flags
+        flags.add(field_name)
+
+    def _site_id_allows(self, site: Any, unifi_site_id: str, unifi_internal_id: str = "") -> bool:
         """False when the site is already bound to a different UniFi site."""
         current = site_unifi_id(site)
-        if not current or not unifi_site_id or current == unifi_site_id:
-            return True
-        logger.info(
-            "NetBox site %r (%r) is already linked to UniFi site %r; not also linking %r",
-            getattr(site, "slug", ""),
-            getattr(site, "name", ""),
-            current,
-            unifi_site_id,
-        )
-        return False
+        if current and unifi_site_id and current != unifi_site_id:
+            logger.info(
+                "NetBox site %r (%r) is already linked to UniFi site %r; not also linking %r",
+                getattr(site, "slug", ""),
+                getattr(site, "name", ""),
+                current,
+                unifi_site_id,
+            )
+            return False
+        current_name = site_unifi_name(site)
+        if current_name and unifi_site_id and current_name != unifi_site_id:
+            logger.info(
+                "NetBox site %r (%r) is already linked to UniFi site %r via %s; not also linking %r",
+                getattr(site, "slug", ""),
+                getattr(site, "name", ""),
+                current_name,
+                UNIFI_SITE_NAME_FIELD,
+                unifi_site_id,
+            )
+            return False
+        current_internal = site_unifi_internal_id(site)
+        if current_internal and unifi_internal_id and current_internal != unifi_internal_id:
+            logger.info(
+                "NetBox site %r (%r) is already linked to UniFi _id %r; not also linking %r",
+                getattr(site, "slug", ""),
+                getattr(site, "name", ""),
+                current_internal,
+                unifi_internal_id,
+            )
+            return False
+        return True
 
     def _match_site_by_unifi_id(self, unifi_site_id: str) -> Any | None:
         """Return the one site whose stored id equals ``unifi_site_id``.
@@ -599,79 +806,166 @@ class PynetboxGateway:
             return None
         return first
 
-    def remember_site_link(self, site: Any, unifi_site_id: str) -> bool:
-        """Record the UniFi site id on an existing site, if it has none.
+    def _match_site_by_field(self, field_name: str, value: str) -> Any | None:
+        """Return the one site whose custom field equals ``value``.
 
-        This is the only write site-linking performs. Name, slug, status, and
-        an id that is already set are left alone, so a rename made in NetBox
-        is never reverted and a site is never rebound to a different UniFi site.
+        Same ignored-filter guard as ``unifi_site_id``: a dry-run before the
+        field exists makes NetBox return every site, and the first is not a hit.
         """
-        if not unifi_site_id:
+        try:
+            iterator = iter(self.api.dcim.sites.filter(**{f"cf_{field_name}": value}))
+            first = next(iterator, None)
+            second = next(iterator, None) if first is not None else None
+        except pynetbox.RequestError as exc:
+            logger.warning(
+                "Could not look up sites by %s (%s); falling back to name/slug matching",
+                field_name,
+                exc,
+            )
+            self._mark_site_field_filter_unusable(field_name)
+            return None
+        if first is None:
+            return None
+        if _custom_field(first, field_name) != value:
+            logger.warning(
+                "NetBox returned site %r (%r) for %s=%r but that site's field is %r. "
+                "The filter is being ignored, which happens when the custom field does "
+                "not exist yet (a dry-run does not create it). Ignoring this result and "
+                "falling back to name/slug matching.",
+                getattr(first, "slug", ""),
+                getattr(first, "name", ""),
+                field_name,
+                value,
+                _custom_field(first, field_name) or "<empty>",
+            )
+            self._mark_site_field_filter_unusable(field_name)
+            return None
+        if second is not None and _custom_field(second, field_name) == value:
+            logger.error(
+                "UniFi value %s is stored on more than one NetBox site (%r and %r); not choosing one",
+                value,
+                getattr(first, "slug", ""),
+                getattr(second, "slug", ""),
+            )
+            return None
+        return first
+
+    def remember_site_link(
+        self, site: Any, unifi_site_id: str, unifi_internal_id: str = ""
+    ) -> bool:
+        """Record UniFi identifiers on an existing site, without renaming it.
+
+        ``unifi_site_id`` keeps meaning "API site name" (the short id in
+        controller URLs). It is never overwritten. When it is already set to
+        that name, empty companion fields are filled:
+
+        * ``unifi_site_name`` is backfilled from ``unifi_site_id`` (that is
+          the value older releases stored there).
+        * ``unifi_site_internal_id`` is set from the controller ``_id`` when
+          we know it.
+
+        Name, slug, and status are not written.
+        """
+        if not unifi_site_id and not unifi_internal_id:
             return False
         current = site_unifi_id(site)
-        if current:
-            if current != unifi_site_id:
-                logger.warning(
-                    "Not overwriting %s on NetBox site %r (%r): already %r, refusing %r",
-                    UNIFI_SITE_ID_FIELD,
-                    getattr(site, "slug", ""),
-                    getattr(site, "name", ""),
-                    current,
-                    unifi_site_id,
-                )
+        if current and unifi_site_id and current != unifi_site_id:
+            logger.warning(
+                "Not overwriting %s on NetBox site %r (%r): already %r, refusing %r",
+                UNIFI_SITE_ID_FIELD,
+                getattr(site, "slug", ""),
+                getattr(site, "name", ""),
+                current,
+                unifi_site_id,
+            )
             return False
-        for other in self.list_sites():
-            if getattr(other, "id", None) == getattr(site, "id", None):
-                continue
-            if site_unifi_id(other) == unifi_site_id:
-                logger.warning(
-                    "Not recording %s=%r on NetBox site %r; UniFi site %s is already recorded on %r",
-                    UNIFI_SITE_ID_FIELD,
-                    unifi_site_id,
-                    getattr(site, "slug", ""),
-                    unifi_site_id,
-                    getattr(other, "slug", ""),
-                )
-                return False
-        site.custom_fields = {**(site.custom_fields or {}), UNIFI_SITE_ID_FIELD: unifi_site_id}
+        current_internal = site_unifi_internal_id(site)
+        if current_internal and unifi_internal_id and current_internal != unifi_internal_id:
+            logger.warning(
+                "Not overwriting %s on NetBox site %r (%r): already %r, refusing %r",
+                UNIFI_SITE_INTERNAL_ID_FIELD,
+                getattr(site, "slug", ""),
+                getattr(site, "name", ""),
+                current_internal,
+                unifi_internal_id,
+            )
+            return False
+        if not current and unifi_site_id:
+            for other in self.list_sites():
+                if getattr(other, "id", None) == getattr(site, "id", None):
+                    continue
+                if site_unifi_id(other) == unifi_site_id or site_unifi_name(other) == unifi_site_id:
+                    logger.warning(
+                        "Not recording %s=%r on NetBox site %r; UniFi site %s is already recorded on %r",
+                        UNIFI_SITE_ID_FIELD,
+                        unifi_site_id,
+                        getattr(site, "slug", ""),
+                        unifi_site_id,
+                        getattr(other, "slug", ""),
+                    )
+                    return False
+        if unifi_internal_id and not current_internal:
+            for other in self.list_sites():
+                if getattr(other, "id", None) == getattr(site, "id", None):
+                    continue
+                if site_unifi_internal_id(other) == unifi_internal_id:
+                    logger.warning(
+                        "Not recording %s=%r on NetBox site %r; it is already recorded on %r",
+                        UNIFI_SITE_INTERNAL_ID_FIELD,
+                        unifi_internal_id,
+                        getattr(site, "slug", ""),
+                        getattr(other, "slug", ""),
+                    )
+                    return False
+
+        fields = dict(site.custom_fields or {})
+        changed = False
+        # The short API name. Prefer the value already stored in unifi_site_id
+        # so a backfill cannot disagree with history.
+        short_name = current or unifi_site_id
+        if short_name and not current:
+            fields[UNIFI_SITE_ID_FIELD] = short_name
+            changed = True
+        if short_name and not site_unifi_name(site):
+            fields[UNIFI_SITE_NAME_FIELD] = short_name
+            changed = True
+        if unifi_internal_id and not current_internal:
+            fields[UNIFI_SITE_INTERNAL_ID_FIELD] = unifi_internal_id
+            changed = True
+        if not changed:
+            return False
+        site.custom_fields = fields
         site.save()
-        # The cached site list may be a different object than `site`. Drop it
-        # so a later stamp sees this id and does not copy it onto a second site.
         with self._memo_lock:
             self._all_sites = None
         logger.info(
-            "Recorded %s=%r on NetBox site %r (%r); name and slug were not changed",
-            UNIFI_SITE_ID_FIELD,
-            unifi_site_id,
+            "Recorded UniFi site identity on NetBox site %r (%r): %s=%r %s=%r %s=%r; "
+            "name and slug were not changed",
             site.slug,
             getattr(site, "name", ""),
+            UNIFI_SITE_ID_FIELD,
+            fields.get(UNIFI_SITE_ID_FIELD, ""),
+            UNIFI_SITE_NAME_FIELD,
+            fields.get(UNIFI_SITE_NAME_FIELD, ""),
+            UNIFI_SITE_INTERNAL_ID_FIELD,
+            fields.get(UNIFI_SITE_INTERNAL_ID_FIELD, ""),
         )
         return True
 
     def ensure_device_type_from_spec(self, spec: Any) -> str:
         """Find or create a NetBox device type, with its interface templates.
 
-        Matching is by slug, then by normalized part number, so a device type
-        already imported from devicetype-library is reused rather than
-        duplicated. Interface *templates* are used (not per-device
-        interfaces): NetBox instantiates them automatically on every device of
-        this type, which is both idiomatic and far fewer API calls.
+        Matching is by slug, then by normalized part number, model, or slug,
+        so a device type already imported from devicetype-library is reused
+        rather than duplicated. Interface, power-port, and power-outlet
+        *templates* are used (not per-device components): NetBox instantiates
+        them automatically on every new device of this type.
         """
         with self._memo_lock:
             if spec.slug in self._infra_type_memo:
                 return self._infra_type_memo[spec.slug]
 
-        existing = self.api.dcim.device_types.get(slug=spec.slug)
-        if existing is None and spec.part_number:
-            wanted = normalize_model(spec.part_number)
-            existing = next(
-                (
-                    dt
-                    for dt in self.api.dcim.device_types.filter(manufacturer=slugify(spec.manufacturer))
-                    if normalize_model(getattr(dt, "part_number", "") or "") == wanted
-                ),
-                None,
-            )
+        existing = self._find_device_type(spec)
 
         if existing is not None:
             resolved = existing.slug
@@ -694,15 +988,71 @@ class PynetboxGateway:
                         for name, iface_type in spec.interfaces
                     ]
                 )
+            self._create_power_templates(created.id, spec)
             logger.info(
-                "Created NetBox device type %r with %d interface template(s)",
+                "Created NetBox device type %r with %d interface template(s), "
+                "%d power port template(s), %d power outlet template(s)",
                 spec.model,
                 len(spec.interfaces),
+                len(getattr(spec, "power_ports", None) or []),
+                len(getattr(spec, "power_outlets", None) or []),
             )
 
         with self._memo_lock:
             self._infra_type_memo[spec.slug] = resolved
         return resolved
+
+    def _find_device_type(self, spec: Any) -> Any | None:
+        existing = self.api.dcim.device_types.get(slug=spec.slug)
+        if existing is not None:
+            return existing
+        keys = {
+            normalize_model(getattr(spec, "part_number", "") or ""),
+            normalize_model(getattr(spec, "model", "") or ""),
+            normalize_model(getattr(spec, "slug", "") or ""),
+        } - {""}
+        if not keys:
+            return None
+        if spec.part_number:
+            hit = self.api.dcim.device_types.get(part_number=spec.part_number)
+            if hit is not None:
+                return hit
+        candidates = list(self.api.dcim.device_types.filter(manufacturer=slugify(spec.manufacturer)))
+        for dt in candidates:
+            ids = {
+                normalize_model(getattr(dt, "part_number", "") or ""),
+                normalize_model(getattr(dt, "model", "") or ""),
+                normalize_model(getattr(dt, "slug", "") or ""),
+            }
+            if ids & keys:
+                return dt
+        return None
+
+    def _create_power_templates(self, device_type_id: int, spec: Any) -> None:
+        port_ids: dict[str, int] = {}
+        for port in getattr(spec, "power_ports", None) or []:
+            payload: dict[str, Any] = {
+                "device_type": device_type_id,
+                "name": port.name,
+                "type": port.type,
+            }
+            if port.maximum_draw:
+                payload["maximum_draw"] = port.maximum_draw
+            created = self.api.dcim.power_port_templates.create(**payload)
+            port_ids[port.name] = created.id
+        outlets = []
+        for outlet in getattr(spec, "power_outlets", None) or []:
+            item: dict[str, Any] = {
+                "device_type": device_type_id,
+                "name": outlet.name,
+                "type": outlet.type,
+            }
+            feed = port_ids.get(outlet.power_port)
+            if feed is not None:
+                item["power_port"] = feed
+            outlets.append(item)
+        if outlets:
+            self.api.dcim.power_outlet_templates.create(outlets)
 
     def _ensure_manufacturer(self, name: str) -> Any:
         slug = slugify(name)
@@ -711,6 +1061,191 @@ class PynetboxGateway:
             manufacturer = self.api.dcim.manufacturers.create(name=name, slug=slug)
             logger.info("Created NetBox manufacturer %r", name)
         return manufacturer
+
+    def find_unifi_device(
+        self, mac: str, serial: str, name: str, site_slug: str
+    ) -> tuple[Any | None, str]:
+        """Find a NetBox device for an adopted UniFi device.
+
+        Order, most precise first:
+
+        1. ``unifi_mac`` anywhere (cross-site).
+        2. A device whose name *is* the MAC, anywhere. That is how older
+           releases named infrastructure they had created as clients.
+        3. Serial anywhere (cross-site).
+        4. Name, and only inside ``site_slug``.
+
+        Name is same-site on purpose: two sites may both have a device called
+        "core-switch". MAC and serial are the chassis, so they are global and
+        a hit means "do not create another one".
+        """
+        mac = (mac or "").lower()
+        compact = mac.replace(":", "")
+        by_mac = self._device_by_unifi_mac(mac) if mac else None
+        if by_mac is not None:
+            return by_mac, "mac"
+        for candidate in (compact, mac):
+            if not candidate:
+                continue
+            named = self._first(self.api.dcim.devices.filter(name=candidate))
+            if named is not None:
+                return named, "mac-name"
+        if serial:
+            by_serial = self._first(self.api.dcim.devices.filter(serial=serial))
+            if by_serial is not None:
+                return by_serial, "serial"
+        if name and site_slug and name.lower() not in {compact, mac} and self._site_exists(site_slug):
+            by_name = self._first(self.api.dcim.devices.filter(name=name, site=site_slug))
+            if by_name is not None:
+                return by_name, "name"
+        return None, ""
+
+    def _device_by_unifi_mac(self, mac: str) -> Any | None:
+        if getattr(self, "_unifi_mac_filter_unusable", False):
+            return None
+        try:
+            first = self._first(self.api.dcim.devices.filter(**{f"cf_{UNIFI_MAC_FIELD}": mac}))
+        except pynetbox.RequestError as exc:
+            logger.warning("Could not look up devices by %s (%s)", UNIFI_MAC_FIELD, exc)
+            self._unifi_mac_filter_unusable = True
+            return None
+        if first is None:
+            return None
+        stored = _custom_field(first, UNIFI_MAC_FIELD).lower()
+        if stored != mac.lower():
+            logger.warning(
+                "NetBox returned device %r for %s=%r but that device's field is %r; "
+                "ignoring the filter",
+                getattr(first, "name", ""),
+                UNIFI_MAC_FIELD,
+                mac,
+                stored or "<empty>",
+            )
+            self._unifi_mac_filter_unusable = True
+            return None
+        return first
+
+    def legacy_eth0_plan(self, device: Any, interface_names: list[str]) -> str:
+        """What would happen to a legacy client ``eth0``, without writing."""
+        if CLIENT_INTERFACE_NAME in set(interface_names):
+            return "kept (eth0 is part of the device type)"
+        interfaces = {iface.name: iface for iface in self.list_device_interfaces(device)}
+        eth0 = interfaces.get(CLIENT_INTERFACE_NAME)
+        if eth0 is None:
+            return "absent"
+        ips = self._interface_addresses(eth0)
+        if ips is None:
+            return "kept (could not tell whether eth0 has an IP)"
+        cabled = bool(getattr(eth0, "cable", None))
+        if not ips and not cabled:
+            return "deleted (eth0 has no IP or cable)"
+        target = interface_names[0] if interface_names else ""
+        if not target:
+            return "kept (eth0 has an IP or cable and there is no interface to move it to)"
+        return f"migrated onto {target}"
+
+    def _interface_addresses(self, interface: Any) -> list[Any] | None:
+        try:
+            return list(self.api.ipam.ip_addresses.filter(interface_id=interface.id))
+        except Exception as exc:
+            logger.warning(
+                "Could not list IP addresses on interface %s (%s)",
+                getattr(interface, "name", ""),
+                exc,
+            )
+            return None
+
+    def align_device_components(self, device: Any, spec: Any, tag_slug: str) -> str:
+        """Add missing interfaces and power components, then retire a stale eth0.
+
+        Used when an existing device changes type (a legacy client merge). A
+        brand-new device gets its components from the device-type templates
+        and does not need this. Returns what happened to eth0.
+        """
+        interfaces = {iface.name: iface for iface in self.api.dcim.interfaces.filter(device_id=device.id)}
+        for name, iface_type in spec.interfaces:
+            if name not in interfaces:
+                created = self.api.dcim.interfaces.create(device=device.id, name=name, type=iface_type)
+                interfaces[name] = created
+        power_ports = {port.name: port for port in self.api.dcim.power_ports.filter(device_id=device.id)}
+        for port in getattr(spec, "power_ports", None) or []:
+            if port.name in power_ports:
+                continue
+            payload: dict[str, Any] = {"device": device.id, "name": port.name, "type": port.type}
+            if port.maximum_draw:
+                payload["maximum_draw"] = port.maximum_draw
+            power_ports[port.name] = self.api.dcim.power_ports.create(**payload)
+        outlet_names = {outlet.name for outlet in self.api.dcim.power_outlets.filter(device_id=device.id)}
+        for outlet in getattr(spec, "power_outlets", None) or []:
+            if outlet.name in outlet_names:
+                continue
+            payload = {"device": device.id, "name": outlet.name, "type": outlet.type}
+            feed = power_ports.get(outlet.power_port)
+            if feed is not None:
+                payload["power_port"] = feed.id
+            self.api.dcim.power_outlets.create(**payload)
+            outlet_names.add(outlet.name)
+        return self._retire_eth0(device, spec, interfaces, tag_slug)
+
+    def _retire_eth0(self, device: Any, spec: Any, interfaces: dict[str, Any], tag_slug: str) -> str:
+        template_names = [name for name, _ in spec.interfaces]
+        if CLIENT_INTERFACE_NAME in template_names:
+            return "kept"
+        eth0 = interfaces.get(CLIENT_INTERFACE_NAME)
+        if eth0 is None:
+            return "absent"
+        ips = self._interface_addresses(eth0)
+        if ips is None:
+            logger.warning(
+                "Leaving eth0 on device %r; could not tell whether it has an IP",
+                getattr(device, "name", ""),
+            )
+            return "kept"
+        cabled = bool(getattr(eth0, "cable", None))
+        if not ips and not cabled:
+            eth0.delete()
+            logger.info("Removed empty legacy eth0 from device %r", getattr(device, "name", ""))
+            return "deleted"
+        if not template_names:
+            logger.info(
+                "Keeping eth0 on device %r; it has an IP or cable and the new type has no interface",
+                getattr(device, "name", ""),
+            )
+            return "kept"
+        target_name = template_names[0]
+        target = interfaces.get(target_name)
+        if target is None:
+            return "kept"
+        if cabled and getattr(target, "cable", None):
+            logger.info(
+                "Keeping eth0 on device %r; %s is already cabled",
+                getattr(device, "name", ""),
+                target_name,
+            )
+            return "kept"
+        for ip in ips:
+            ip.assigned_object_type = "dcim.interface"
+            ip.assigned_object_id = target.id
+            ip.save()
+        if cabled:
+            peers = list(getattr(eth0, "link_peers", None) or [])
+            cable = eth0.cable
+            if cable is not None:
+                cable.delete()
+            for peer in peers:
+                self.api.dcim.cables.create(
+                    a_terminations=[{"object_type": "dcim.interface", "object_id": target.id}],
+                    b_terminations=[{"object_type": "dcim.interface", "object_id": peer.id}],
+                    status="connected",
+                    tags=[{"slug": tag_slug}],
+                )
+        eth0.delete()
+        logger.info(
+            "Migrated eth0 IP/cable onto %s and removed eth0 from device %r",
+            target_name,
+            getattr(device, "name", ""),
+        )
+        return "migrated"
 
     def upsert_infrastructure_device(
         self,
@@ -722,62 +1257,148 @@ class PynetboxGateway:
         tag_slug: str,
         serial: str = "",
         update_policy: str = "sync",
+        *,
+        status: str = "active",
+        merge_client: bool = False,
+        client_role_slug: str = "unifi-client",
+        move_site: bool = False,
+        source_site_name: str = "",
+        source_site_internal_id: str = "",
+        spec: Any = None,
+        looked_up: bool = False,
+        existing: Any | None = None,
+        match: str = "",
     ) -> tuple[Any, bool, bool]:
         """Create or update an adopted UniFi device. Returns (device, created, updated).
 
-        The unifi_mac custom field is always set, which makes this device
-        findable by the exact-match strategy the cable code tries second — so
-        devices created here wire up reliably regardless of naming.
+        MAC and serial matches are global, so a device that already exists
+        under another site is reused instead of duplicated. Name matches stay
+        inside ``site_slug``.
+
+        ``merge_client`` converts a tagged client-role device with this MAC
+        in place (same NetBox id). That runs even when ``update_policy`` is
+        ``create-only``. ``move_site`` moves the device onto ``site_slug`` and
+        sets ``status``; the caller decides when create-only still allows it
+        (an inventory device showing up at a real site).
         """
-        device = next(iter(self.api.dcim.devices.filter(cf_unifi_mac=mac)), None)
-        if device is None and name:
-            device = next(iter(self.api.dcim.devices.filter(name=name, site=site_slug)), None)
-        if device is None and serial:
-            device = next(iter(self.api.dcim.devices.filter(serial=serial)), None)
+        mac = (mac or "").lower()
+        if not looked_up:
+            existing, match = self.find_unifi_device(mac, serial, name, site_slug)
 
         site = self.find_site(site_slug)
         if site is None:
             raise LookupError(f"NetBox site '{site_slug}' does not exist")
 
-        if device is not None and not device_has_tag(device, tag_slug):
+        if existing is not None and not device_has_tag(existing, tag_slug):
             logger.warning(
                 "UniFi device %s matches NetBox device %r, which is not tagged %r; "
                 "leaving it unchanged and not creating a duplicate",
                 mac,
-                device.name,
+                existing.name,
                 tag_slug,
             )
-            return device, False, False
+            return existing, False, False
 
-        if device is None:
+        identity = self._source_site_fields(mac, source_site_name, source_site_internal_id)
+        if existing is None:
             device = self.api.dcim.devices.create(
                 name=name,
                 device_type=self._get_device_type(device_type_slug).id,
                 role=self._get_role(role_slug).id,
                 site=site.id,
                 serial=serial,
-                status="active",
-                custom_fields={"unifi_mac": mac},
+                status=status,
+                custom_fields=identity,
                 tags=[{"slug": tag_slug}],
             )
             return device, True, False
 
-        if update_policy == "create-only":
-            return device, False, False
+        legacy = (
+            merge_client
+            and role_slug_of(existing) == client_role_slug
+            and _custom_field(existing, UNIFI_MAC_FIELD).lower() == mac
+        )
+        current_site = device_site_slug(existing)
+        cross_site = bool(current_site and site_slug and current_site != site_slug)
+        if not legacy and not (move_site and cross_site) and update_policy == "create-only":
+            return existing, False, False
 
-        updated = False
-        if name and device.name != name:
-            device.name = name
-            updated = True
-        if serial and (device.serial or "") != serial:
-            device.serial = serial
-            updated = True
-        if (device.custom_fields or {}).get("unifi_mac") != mac:
-            device.custom_fields = {**(device.custom_fields or {}), "unifi_mac": mac}
-            updated = True
-        if updated:
-            device.save()
-        return device, False, updated
+        changes: dict[str, Any] = {}
+        if legacy or update_policy != "create-only":
+            if name and existing.name != name:
+                changes["name"] = name
+            if serial and (existing.serial or "") != serial:
+                changes["serial"] = serial
+            if role_slug_of(existing) != role_slug:
+                changes["role"] = self._get_role(role_slug).id
+            current_type = getattr(getattr(existing, "device_type", None), "slug", None)
+            fake_type = getattr(existing, "device_type_slug", None)
+            if (current_type or fake_type) != device_type_slug:
+                changes["device_type"] = self._get_device_type(device_type_slug).id
+            status_now = getattr(getattr(existing, "status", None), "value", None) or ""
+            if status and status_now != status:
+                changes["status"] = status
+        if (legacy or move_site) and cross_site:
+            changes["site"] = site.id
+            if status:
+                changes["status"] = status
+        fields = dict(existing.custom_fields or {})
+        fields_changed = False
+        for key, value in identity.items():
+            if value and str(fields.get(key) or "") != value:
+                fields[key] = value
+                fields_changed = True
+        if fields_changed:
+            changes["custom_fields"] = fields
+        if changes:
+            self._patch_device(existing, changes)
+            if "name" in changes:
+                existing.name = name
+            if "serial" in changes:
+                existing.serial = serial
+            if "status" in changes:
+                existing.status = changes["status"]
+            if "site" in changes:
+                existing.site = site
+            if fields_changed:
+                existing.custom_fields = fields
+        if legacy or "device_type" in changes:
+            if spec is not None:
+                eth0 = self.align_device_components(existing, spec, tag_slug)
+                logger.info(
+                    "Aligned components on device %r after %s; eth0 %s",
+                    existing.name,
+                    "merge" if legacy else "device-type change",
+                    eth0,
+                )
+        if legacy:
+            logger.info(
+                "Merged legacy client device id=%s %r into infrastructure %r (role %s, type %s); "
+                "NetBox id, journal, and IPs kept",
+                getattr(existing, "id", ""),
+                name,
+                name,
+                role_slug,
+                device_type_slug,
+            )
+        elif cross_site and "site" in changes:
+            logger.info(
+                "Moved device %r from site %r to %r (matched by %s)",
+                existing.name,
+                current_site,
+                site_slug,
+                match or "mac/serial",
+            )
+        return existing, False, bool(changes)
+
+    @staticmethod
+    def _source_site_fields(mac: str, source_site_name: str, source_site_internal_id: str) -> dict[str, str]:
+        fields = {UNIFI_MAC_FIELD: mac}
+        if source_site_name:
+            fields[UNIFI_SITE_NAME_FIELD] = source_site_name
+        if source_site_internal_id:
+            fields[UNIFI_SITE_INTERNAL_ID_FIELD] = source_site_internal_id
+        return fields
 
     def ensure_device_role(self, role_slug: str) -> None:
         self._ensure_device_role(role_slug)
@@ -819,7 +1440,12 @@ class PynetboxGateway:
     # -- mutations -----------------------------------------------------------
 
     def ensure_site(
-        self, site_slug: str, policy: str, name: str = "", unifi_site_id: str = ""
+        self,
+        site_slug: str,
+        policy: str,
+        name: str = "",
+        unifi_site_id: str = "",
+        unifi_internal_id: str = "",
     ) -> tuple[Any, bool]:
         """Resolve the NetBox site, honoring SITE_POLICY.
 
@@ -842,8 +1468,15 @@ class PynetboxGateway:
             "slug": site_slug,
             "status": "active",
         }
+        custom: dict[str, str] = {}
         if unifi_site_id:
-            payload["custom_fields"] = {UNIFI_SITE_ID_FIELD: unifi_site_id}
+            # Same value in both fields: the API site name, not the _id.
+            custom[UNIFI_SITE_ID_FIELD] = unifi_site_id
+            custom[UNIFI_SITE_NAME_FIELD] = unifi_site_id
+        if unifi_internal_id:
+            custom[UNIFI_SITE_INTERNAL_ID_FIELD] = unifi_internal_id
+        if custom:
+            payload["custom_fields"] = custom
         site = self.api.dcim.sites.create(**payload)
         with self._memo_lock:
             self._site_memo[site_slug] = site
@@ -893,6 +1526,19 @@ class PynetboxGateway:
                 tag_slug,
             )
             return device, False, True, False
+
+        if device is not None:
+            # A MAC that already belongs to infrastructure (including a client
+            # device just merged into a switch) must not be rewritten as a client.
+            current_role = role_slug_of(device)
+            if current_role and current_role != role_slug:
+                logger.info(
+                    "Not treating %s as a client; NetBox device %r has role %s",
+                    mac,
+                    device.name,
+                    current_role,
+                )
+                return device, False, False, False
 
         if device is None:
             # Only needed on the create path — memoized so this costs at most

@@ -5,7 +5,14 @@ import logging
 import requests
 import urllib3
 
-from .models import UnifiClient, UnifiKnownClient, UnifiPort, UnifiSite, UnifiSwitchDevice
+from .models import (
+    UnifiClient,
+    UnifiKnownClient,
+    UnifiOutlet,
+    UnifiPort,
+    UnifiSite,
+    UnifiSwitchDevice,
+)
 from .portmatch import coerce_port
 
 logger = logging.getLogger(__name__)
@@ -43,8 +50,8 @@ def _epoch_seconds(value: object) -> float | None:
 def _parse_port_table(raw: list[dict]) -> list[UnifiPort]:
     """Physical ports as the controller reports them.
 
-    This is the authoritative port list for the actual hardware, which is why
-    it is preferred over a static device-type library for building interfaces.
+    Used when devicetype-library has no match for the model. A library hit
+    uses that YAML's interface templates instead.
     """
     ports = []
     for entry in raw:
@@ -61,6 +68,19 @@ def _parse_port_table(raw: list[dict]) -> list[UnifiPort]:
             )
         )
     return sorted(ports, key=lambda p: p.index)
+
+
+def _parse_outlet_table(raw: list[dict]) -> list[UnifiOutlet]:
+    """Toggleable PDU/UPS outlets. These are not switch ports."""
+    outlets = []
+    for entry in raw:
+        index = entry.get("index", entry.get("outlet_idx"))
+        if index is None:
+            continue
+        outlets.append(
+            UnifiOutlet(index=int(index), name=(entry.get("name") or "").strip())
+        )
+    return sorted(outlets, key=lambda o: o.index)
 
 
 class UnifiClientAPI:
@@ -168,7 +188,13 @@ class UnifiClientAPI:
             name = entry.get("name")
             if not name:
                 continue
-            sites.append(UnifiSite(name=name, description=(entry.get("desc") or "").strip()))
+            sites.append(
+                UnifiSite(
+                    name=name,
+                    description=(entry.get("desc") or "").strip(),
+                    internal_id=str(entry.get("_id") or "").strip(),
+                )
+            )
         return sites
 
     def get_devices(self, site: str) -> list[UnifiSwitchDevice]:
@@ -188,6 +214,8 @@ class UnifiClientAPI:
                     # /stat/device only lists devices the controller manages.
                     adopted=bool(entry.get("adopted", True)),
                     ports=_parse_port_table(entry.get("port_table") or []),
+                    shortname=(entry.get("shortname") or "").strip(),
+                    outlets=_parse_outlet_table(entry.get("outlet_table") or []),
                 )
             )
         return devices

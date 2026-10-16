@@ -232,6 +232,7 @@ def test_get_sites_parses_name_and_description():
         ("nodesc", ""),
     ]
     assert sites[2].label == "nodesc"  # falls back to the id
+    assert [s.internal_id for s in sites] == ["abc", "def", "ghi"]
 
 
 @responses.activate
@@ -280,3 +281,40 @@ def test_known_clients_keep_last_seen_and_string_ports_are_ints():
         ("02:00:00:00:00:02", 1_700_000_000),
         ("02:00:00:00:00:03", None),
     ]
+
+
+@responses.activate
+def test_devices_keep_shortname_and_outlet_table():
+    host = "https://udm.example.com"
+    responses.add(
+        responses.GET,
+        f"{host}/proxy/network/api/s/default/stat/device",
+        json={
+            "data": [
+                {
+                    "mac": "AA:BB:CC:DD:EE:23",
+                    "name": "ups-1",
+                    "model": "USWDA23",
+                    "type": "usw",
+                    "shortname": "UPS23",
+                    "port_table": [{"port_idx": 1, "media": "GE", "speed": 1000}],
+                    "outlet_table": [
+                        {"index": 2, "name": "Outlet 2"},
+                        {"outlet_idx": 1, "name": "Outlet 1"},
+                    ],
+                }
+            ]
+        },
+        status=200,
+    )
+
+    client = UnifiClientAPI(host=host, api_key="k", is_udm=True)
+    with client:
+        devices = client.get_devices("default")
+
+    assert devices[0].shortname == "UPS23"
+    assert [(outlet.index, outlet.name) for outlet in devices[0].outlets] == [
+        (1, "Outlet 1"),
+        (2, "Outlet 2"),
+    ]
+    assert devices[0].ports[0].index == 1

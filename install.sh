@@ -96,6 +96,13 @@ write_env() {
     printf '%s\n' "SYNC_UNIFI_DEVICES=false" >> .env
     printf '%s\n' "DEVICETYPE_LIBRARY_PATH=" >> .env
     printf '%s\n' "UNIFI_DEVICE_ROLE_SLUG=network-device" >> .env
+    printf '%s\n' "UNIFI_SWITCH_ROLE_SLUG=switch" >> .env
+    printf '%s\n' "UNIFI_AP_ROLE_SLUG=wireless-ap" >> .env
+    printf '%s\n' "UNIFI_GATEWAY_ROLE_SLUG=router" >> .env
+    printf '%s\n' "UNIFI_POWER_ROLE_SLUG=pdu" >> .env
+    printf '%s\n' "MERGE_CLIENT_INFRA=true" >> .env
+    printf '%s\n' "UNIFI_INVENTORY_SITES=" >> .env
+    printf '%s\n' "INVENTORY_DEVICE_STATUS=inventory" >> .env
     printf '%s\n' "CABLE_CONFLICT_POLICY=skip" >> .env
     printf '%s\n' "MARK_STALE_OFFLINE=true" >> .env
     printf '%s\n' "STALE_OFFLINE_GRACE=7d" >> .env

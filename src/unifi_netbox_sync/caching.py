@@ -138,9 +138,16 @@ class CachingNetboxGateway:
     # -- pass-through ----------------------------------------------------
 
     def ensure_site(
-        self, site_slug: str, policy: str, name: str = "", unifi_site_id: str = ""
+        self,
+        site_slug: str,
+        policy: str,
+        name: str = "",
+        unifi_site_id: str = "",
+        unifi_internal_id: str = "",
     ) -> tuple[Any, bool]:
-        site, created = self._inner.ensure_site(site_slug, policy, name, unifi_site_id)
+        site, created = self._inner.ensure_site(
+            site_slug, policy, name, unifi_site_id, unifi_internal_id
+        )
         with self._lock:
             self._sites[site_slug] = site
         return site, created
@@ -148,8 +155,15 @@ class CachingNetboxGateway:
     def ensure_site_identity_field(self) -> None:
         self._inner.ensure_site_identity_field()
 
-    def remember_site_link(self, site: Any, unifi_site_id: str) -> bool:
-        return self._inner.remember_site_link(site, unifi_site_id)
+    def remember_site_link(self, site: Any, unifi_site_id: str, unifi_internal_id: str = "") -> bool:
+        return self._inner.remember_site_link(site, unifi_site_id, unifi_internal_id)
+
+    def find_unifi_device(self, mac: str, serial: str, name: str, site_slug: str):
+        # Not cached: infrastructure devices are created and merged during the run.
+        return self._inner.find_unifi_device(mac, serial, name, site_slug)
+
+    def legacy_eth0_plan(self, device: Any, interface_names: list[str]) -> str:
+        return self._inner.legacy_eth0_plan(device, interface_names)
 
     def find_client_device_by_mac(self, mac: str) -> Any | None:
         return self._inner.find_client_device_by_mac(mac)
@@ -201,9 +215,16 @@ class CachingNetboxGateway:
         return self._inner.list_sites()
 
     def resolve_existing_site(
-        self, desired_slug: str, label: str, mode: str = "normalized", unifi_site_id: str = ""
+        self,
+        desired_slug: str,
+        label: str,
+        mode: str = "normalized",
+        unifi_site_id: str = "",
+        unifi_internal_id: str = "",
     ) -> Any | None:
-        site = self._inner.resolve_existing_site(desired_slug, label, mode, unifi_site_id)
+        site = self._inner.resolve_existing_site(
+            desired_slug, label, mode, unifi_site_id, unifi_internal_id
+        )
         if site is not None:
             with self._lock:
                 # Cache under the resolved slug, which is what every later
