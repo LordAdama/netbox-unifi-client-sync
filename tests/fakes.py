@@ -242,6 +242,14 @@ class FakeNetboxGateway:
                     return device, "name"
         return None, ""
 
+    def find_device_name_conflict(self, name, site_slug, exclude_id):
+        if not name or self.find_site(site_slug) is None:
+            return None
+        for device in self._iter_devices():
+            if device.name == name and device.site_slug == site_slug and device.id != exclude_id:
+                return device
+        return None
+
     def legacy_eth0_plan(self, device, interface_names):
         if "eth0" in set(interface_names):
             return "kept (eth0 is part of the device type)"

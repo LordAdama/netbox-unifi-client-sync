@@ -197,6 +197,7 @@ def _merge_summaries(summaries: list[SyncSummary]) -> SyncSummary:
         merged.infra_merged += s.infra_merged
         merged.infra_moved += s.infra_moved
         merged.infra_duplicates_avoided += s.infra_duplicates_avoided
+        merged.infra_name_conflicts += s.infra_name_conflicts
         merged.infra_type_library += s.infra_type_library
         merged.infra_type_generated += s.infra_type_generated
         merged.stale_marked_offline += s.stale_marked_offline
@@ -768,6 +769,8 @@ class SyncEngine:
             summary.infra_merged = infra.infra_merged
             summary.infra_moved = infra.infra_moved
             summary.infra_duplicates_avoided = infra.infra_duplicates_avoided
+            summary.infra_name_conflicts = infra.infra_name_conflicts
+            summary.errors.extend(infra.errors or [])
             summary.infra_type_library = infra.infra_type_library
             summary.infra_type_generated = infra.infra_type_generated
 
@@ -951,13 +954,16 @@ class SyncEngine:
                         prefix,
                     )
                 except EXPECTED_CLIENT_ERRORS as exc:
+                    # One device failing must not abandon the rest of the site:
+                    # record it and keep going so later devices, clients and
+                    # cables still sync.
                     logger.exception("Failed syncing UniFi device %s (%s)", device.mac, device.name)
-                    raise LookupError(f"UniFi device {device.name} ({device.mac}): {exc}") from exc
+                    summary.errors.append(f"{pair.unifi_site}/{device.mac}: UniFi device {device.name}: {exc}")
 
         kind_text = ", ".join(f"{name}={created_by_kind[name]}" for name in ("switch", "ap", "gateway", "power"))
         logger.info(
             "%sSite '%s': %d adopted UniFi device(s); creates by kind: %s; "
-            "merged=%d; moved=%d; cross-site matches avoided=%d; "
+            "merged=%d; moved=%d; cross-site matches avoided=%d; name conflicts=%d; errors=%d; "
             "type sources library=%d generated=%d",
             prefix,
             pair.unifi_site,
@@ -966,6 +972,8 @@ class SyncEngine:
             summary.infra_merged,
             summary.infra_moved,
             summary.infra_duplicates_avoided,
+            summary.infra_name_conflicts,
+            len(summary.errors),
             summary.infra_type_library,
             summary.infra_type_generated,
         )
@@ -973,7 +981,13 @@ class SyncEngine:
             # Dry-run logs the plan and writes nothing. Counters stay at zero
             # so a preview is not mistaken for a completed write. The lines
             # above are the record of what would have happened.
-            return SyncSummary(devices_synced=len(adopted))
+            # Name conflicts and errors are findings, not writes, so they
+            # are kept: a dry-run must surface what a real run would hit.
+            return SyncSummary(
+                devices_synced=len(adopted),
+                infra_name_conflicts=summary.infra_name_conflicts,
+                errors=list(summary.errors),
+            )
         return summary
 
     def _sync_one_unifi_device(
@@ -1082,6 +1096,35 @@ class SyncEngine:
                 device.name,
             )
             return
+
+        if legacy and device.name and getattr(existing, "name", None) != device.name:
+            target_site = (
+                current_site if cross_site and not move_site and current_site else pair.netbox_site_slug
+            )
+            holder = self.netbox.find_device_name_conflict(
+                device.name, target_site, getattr(existing, "id", None)
+            )
+            if holder is not None:
+                # NetBox requires names to be unique per site and tenant, so the
+                # rename would be rejected. The device holding the name is the
+                # one people already use: link to it, leave the old client
+                # record alone, and delete nothing.
+                summary.infra_duplicates_avoided += 1
+                summary.infra_name_conflicts += 1
+                logger.warning(
+                    "%slegacy client device id=%s %r (MAC %s) not merged: device id=%s already "
+                    "named %r at site %r; treating the client record as a duplicate of it, "
+                    "not renaming and not deleting anything. Remove or merge the old client "
+                    "record by hand to clear this.",
+                    prefix,
+                    getattr(existing, "id", ""),
+                    getattr(existing, "name", ""),
+                    mac,
+                    getattr(holder, "id", ""),
+                    device.name,
+                    target_site,
+                )
+                return
 
         eth0_plan = ""
         if legacy:

@@ -195,6 +195,9 @@ class SyncSummary:
     infra_moved: int = 0
     # MAC/serial matches that were not created again (inventory or other site).
     infra_duplicates_avoided: int = 0
+    # Legacy merges skipped because another device already holds the target
+    # name at the site. Also counted in infra_duplicates_avoided.
+    infra_name_conflicts: int = 0
     infra_type_library: int = 0
     infra_type_generated: int = 0
     # Work that was inspected and correctly required no write. High numbers

@@ -314,6 +314,8 @@ class NetboxGateway(Protocol):
     def find_client_device_by_mac(self, mac: str) -> Any | None: ...
 
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool: ...
+
+    def find_device_name_conflict(self, name: str, site_slug: str, exclude_id: Any) -> Any | None: ...
     """Is `name` used by a device other than `mac` in this site?
 
     Implementations must return False for a site that does not exist: an
@@ -834,6 +836,34 @@ class PynetboxGateway:
             by_mac.setdefault(str(raw).lower(), []).append(iface)
         with self._memo_lock:
             self._pref_ifaces_by_mac = by_mac
+
+    def find_device_name_conflict(self, name: str, site_slug: str, exclude_id: Any) -> Any | None:
+        """Another device already named ``name`` at ``site_slug``, or None.
+
+        Used before a legacy merge renames a client record, so a NetBox
+        uniqueness rejection becomes a logged duplicate instead of an error.
+        The prefetch index answers hits without a query; a miss there is not
+        proof (it keeps one device per name), so it falls back to the filter.
+        """
+        if not name or not self._site_exists(site_slug):
+            return None
+        with self._memo_lock:
+            cached = (self._pref_by_name or {}).get(name)
+        if (
+            cached is not None
+            and getattr(cached, "id", None) != exclude_id
+            and device_site_slug(cached) == site_slug
+        ):
+            return cached
+        try:
+            for device in self.api.dcim.devices.filter(name=name, site=site_slug):
+                if getattr(device, "id", None) != exclude_id:
+                    return device
+        except pynetbox.RequestError as exc:
+            if getattr(exc, "req", None) is not None and exc.req.status_code == 400:
+                return None
+            raise
+        return None
 
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool:
         # NetBox validates ?site=<slug> against existing sites and answers a
