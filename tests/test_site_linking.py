@@ -122,12 +122,16 @@ def test_slug_mode_restores_exact_matching_only():
     assert summary.sites_created == 1, "opt-out must behave as before"
 
 
-def test_two_unifi_sites_linking_to_one_netbox_site_share_a_group():
-    """Resolution happens before grouping, so the stale-marking union still
-    covers both — the property that would silently break if two pairs landed
-    on the same NetBox site in separate groups."""
+def test_two_unifi_sites_linking_to_one_netbox_site_are_skipped():
+    """Two UniFi sites that fold onto one NetBox site are a conflict.
+
+    Sharing used to put them in one group so stale-marking would not offline
+    the other's clients. That also let a bad match dump every UniFi site into
+    a single NetBox site. Skip both, leave the stored id alone, and do not
+    touch the devices already there.
+    """
     netbox = FakeNetboxGateway()
-    netbox.seed_site("shared", "Shared Site")
+    site = netbox.seed_site("shared", "Shared Site")
     netbox.upsert_client_device(
         "aa:aa:aa:aa:aa:01", "from-a", "shared", "unifi-client", "generic-network-client", "unifi-sync"
     )
@@ -144,7 +148,10 @@ def test_two_unifi_sites_linking_to_one_netbox_site_share_a_group():
         },
     )
 
-    assert summary.stale_marked_offline == 0, "neither pair may stale the other's clients"
+    assert summary.errors
+    assert summary.clients_seen == 0
+    assert summary.stale_marked_offline == 0
+    assert "unifi_site_id" not in site.custom_fields
     assert netbox.clients_by_mac["aa:aa:aa:aa:aa:01"].status.value == "active"
     assert netbox.clients_by_mac["bb:bb:bb:bb:bb:02"].status.value == "active"
 

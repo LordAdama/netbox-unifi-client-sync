@@ -237,23 +237,33 @@ class FakeNetboxGateway:
 
     def resolve_existing_site(self, desired_slug: str, label: str, mode: str = "normalized", unifi_site_id: str = ""):
         from unifi_netbox_sync.naming import normalize_key
+        from unifi_netbox_sync.netbox_client import site_unifi_id
 
         if unifi_site_id:
-            for site in self.list_sites():
-                if (site.custom_fields or {}).get("unifi_site_id") == unifi_site_id:
-                    return site
+            holders = [site for site in self.list_sites() if site_unifi_id(site) == unifi_site_id]
+            if len(holders) == 1:
+                return holders[0]
+            if len(holders) > 1:
+                return None
+
+        def allowed(site) -> bool:
+            current = site_unifi_id(site)
+            return not current or not unifi_site_id or current == unifi_site_id
+
         exact = self.find_site(desired_slug)
-        if exact is not None:
+        if exact is not None and allowed(exact):
             return exact
         if mode == "slug":
             return None
         for site in self.list_sites():
-            if label and site.name == label:
+            if label and site.name == label and allowed(site):
                 return site
         if mode != "normalized":
             return None
         wanted = {normalize_key(desired_slug), normalize_key(label)} - {""}
         for site in self.list_sites():
+            if not allowed(site):
+                continue
             if {normalize_key(site.slug), normalize_key(site.name)} & wanted:
                 return site
         return None
@@ -262,11 +272,18 @@ class FakeNetboxGateway:
         self.site_identity_field_ready = True
 
     def remember_site_link(self, site, unifi_site_id: str) -> bool:
+        from unifi_netbox_sync.netbox_client import site_unifi_id as stored_id
+
         if not unifi_site_id:
             return False
-        current = (site.custom_fields or {}).get("unifi_site_id") or ""
+        current = stored_id(site)
         if current:
             return False
+        for other in self.list_sites():
+            if other.id == site.id:
+                continue
+            if stored_id(other) == unifi_site_id:
+                return False
         site.custom_fields["unifi_site_id"] = unifi_site_id
         return True
 

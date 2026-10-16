@@ -22,6 +22,12 @@ UNIFI_MAC_FIELD = "unifi_mac"
 # duplicate sites and re-created names an operator had changed.
 UNIFI_SITE_ID_FIELD = "unifi_site_id"
 
+
+def site_unifi_id(site: Any) -> str:
+    """The UniFi site id stored on a NetBox site, or "" when it has none."""
+    raw = (getattr(site, "custom_fields", None) or {}).get(UNIFI_SITE_ID_FIELD) or ""
+    return str(raw).strip()
+
 # "IP address … is configured as the primary IP for device Pixel-10a and cannot be reassigned"
 _PRIMARY_DEVICE_RE = re.compile(
     r"device\s+(.+?)(?:\s+and\b|\s*\(|\s*$)",
@@ -210,6 +216,10 @@ class PynetboxGateway:
         self._site_missing: set[str] = set()
         self._warned: set[str] = set()
         self._all_sites: list[Any] | None = None
+        # Set when cf_unifi_site_id is not a real filter. NetBox then ignores
+        # the parameter and returns every site; trusting the first one bound
+        # every UniFi site to whichever site sorts first.
+        self._unifi_site_id_filter_unusable = False
 
     def _memoized(self, memo: dict[str, Any], key: str, fetch: Callable[[], Any]) -> Any:
         with self._memo_lock:
@@ -480,28 +490,16 @@ class PynetboxGateway:
         Depot - North Yard" slugifies to `acme-s-depot-north-yard`, which
         would miss an existing `acmes-depot-north-yard` on an exact match.
 
-        Name and slug matching still runs when the id is not stored yet, which
-        is what lets two UniFi sites that fold to one NetBox site share it.
-        An id that is already stored is never overwritten, so a rename in
-        NetBox keeps pointing at the UniFi site it was linked to.
+        Name and slug matching still runs when the id is not stored yet. A
+        site whose ``unifi_site_id`` is already set to a *different* UniFi
+        site is not a match: that field is never overwritten and is never
+        shared. Callers treat two UniFi sites that still land on one NetBox
+        site as a conflict and skip both.
 
         Read-only. The matched site's name and slug are never modified.
         """
-        if unifi_site_id:
-            # The custom field may not exist yet (a dry-run, or the ensure call
-            # failed). A 400 here must fall through to name/slug matching
-            # rather than abandoning the site.
-            try:
-                linked = self._first(
-                    self.api.dcim.sites.filter(**{f"cf_{UNIFI_SITE_ID_FIELD}": unifi_site_id})
-                )
-            except pynetbox.RequestError as exc:
-                logger.warning(
-                    "Could not look up sites by %s (%s); falling back to name/slug matching",
-                    UNIFI_SITE_ID_FIELD,
-                    exc,
-                )
-                linked = None
+        if unifi_site_id and not getattr(self, "_unifi_site_id_filter_unusable", False):
+            linked = self._match_site_by_unifi_id(unifi_site_id)
             if linked is not None:
                 logger.info(
                     "Matched UniFi site %s to NetBox site %r (%r) via %s",
@@ -513,23 +511,89 @@ class PynetboxGateway:
                 return linked
 
         exact = self.find_site(desired_slug)
-        if exact is not None:
+        if exact is not None and self._site_id_allows(exact, unifi_site_id):
             return exact
         if mode == "slug":
             return None
 
         by_name = self._first(self.api.dcim.sites.filter(name=label)) if label else None
-        if by_name is not None:
+        if by_name is not None and self._site_id_allows(by_name, unifi_site_id):
             return by_name
         if mode != "normalized":
             return None
 
         wanted = {normalize_key(desired_slug), normalize_key(label)} - {""}
         for site in self.list_sites():
+            if not self._site_id_allows(site, unifi_site_id):
+                continue
             candidates = {normalize_key(site.slug or ""), normalize_key(site.name or "")}
             if candidates & wanted:
                 return site
         return None
+
+    def _site_id_allows(self, site: Any, unifi_site_id: str) -> bool:
+        """False when the site is already bound to a different UniFi site."""
+        current = site_unifi_id(site)
+        if not current or not unifi_site_id or current == unifi_site_id:
+            return True
+        logger.info(
+            "NetBox site %r (%r) is already linked to UniFi site %r; not also linking %r",
+            getattr(site, "slug", ""),
+            getattr(site, "name", ""),
+            current,
+            unifi_site_id,
+        )
+        return False
+
+    def _match_site_by_unifi_id(self, unifi_site_id: str) -> Any | None:
+        """Return the one site whose stored id equals ``unifi_site_id``.
+
+        NetBox ignores query parameters it does not know. On a dry-run the
+        ``unifi_site_id`` custom field often does not exist yet, so
+        ``?cf_unifi_site_id=<id>`` comes back 200 with *every* site, and the
+        first record (BanditoNet, in the October 2026 production run) looks
+        like a hit for every UniFi id. A result counts only when that site's
+        own field equals the id we asked for.
+        """
+        try:
+            iterator = iter(
+                self.api.dcim.sites.filter(**{f"cf_{UNIFI_SITE_ID_FIELD}": unifi_site_id})
+            )
+            first = next(iterator, None)
+            second = next(iterator, None) if first is not None else None
+        except pynetbox.RequestError as exc:
+            logger.warning(
+                "Could not look up sites by %s (%s); falling back to name/slug matching",
+                UNIFI_SITE_ID_FIELD,
+                exc,
+            )
+            self._unifi_site_id_filter_unusable = True
+            return None
+        if first is None:
+            return None
+        if site_unifi_id(first) != unifi_site_id:
+            logger.warning(
+                "NetBox returned site %r (%r) for %s=%r but that site's field is %r. "
+                "The filter is being ignored, which happens when the custom field does "
+                "not exist yet (a dry-run does not create it). Ignoring this result and "
+                "falling back to name/slug matching.",
+                getattr(first, "slug", ""),
+                getattr(first, "name", ""),
+                UNIFI_SITE_ID_FIELD,
+                unifi_site_id,
+                site_unifi_id(first) or "<empty>",
+            )
+            self._unifi_site_id_filter_unusable = True
+            return None
+        if second is not None and site_unifi_id(second) == unifi_site_id:
+            logger.error(
+                "UniFi site %s is stored on more than one NetBox site (%r and %r); not choosing one",
+                unifi_site_id,
+                getattr(first, "slug", ""),
+                getattr(second, "slug", ""),
+            )
+            return None
+        return first
 
     def remember_site_link(self, site: Any, unifi_site_id: str) -> bool:
         """Record the UniFi site id on an existing site, if it has none.
@@ -540,11 +604,37 @@ class PynetboxGateway:
         """
         if not unifi_site_id:
             return False
-        current = ((getattr(site, "custom_fields", None) or {}).get(UNIFI_SITE_ID_FIELD) or "")
+        current = site_unifi_id(site)
         if current:
+            if current != unifi_site_id:
+                logger.warning(
+                    "Not overwriting %s on NetBox site %r (%r): already %r, refusing %r",
+                    UNIFI_SITE_ID_FIELD,
+                    getattr(site, "slug", ""),
+                    getattr(site, "name", ""),
+                    current,
+                    unifi_site_id,
+                )
             return False
+        for other in self.list_sites():
+            if getattr(other, "id", None) == getattr(site, "id", None):
+                continue
+            if site_unifi_id(other) == unifi_site_id:
+                logger.warning(
+                    "Not recording %s=%r on NetBox site %r; UniFi site %s is already recorded on %r",
+                    UNIFI_SITE_ID_FIELD,
+                    unifi_site_id,
+                    getattr(site, "slug", ""),
+                    unifi_site_id,
+                    getattr(other, "slug", ""),
+                )
+                return False
         site.custom_fields = {**(site.custom_fields or {}), UNIFI_SITE_ID_FIELD: unifi_site_id}
         site.save()
+        # The cached site list may be a different object than `site`. Drop it
+        # so a later stamp sees this id and does not copy it onto a second site.
+        with self._memo_lock:
+            self._all_sites = None
         logger.info(
             "Recorded %s=%r on NetBox site %r (%r); name and slug were not changed",
             UNIFI_SITE_ID_FIELD,

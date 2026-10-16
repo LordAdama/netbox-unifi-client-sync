@@ -130,12 +130,14 @@ def test_stale_marking_only_affects_devices_in_the_missing_site():
     assert netbox.clients_by_mac["22:22:22:22:22:22"].status.value == "active"
 
 
-def test_shared_netbox_site_stale_marking_uses_union_of_both_pairs():
-    """Regression guard for the case two UniFi sites map to the same NetBox
-    site: without unioning seen_macs across both pairs first, each pair's
-    stale pass would see the *other* pair's device (same NetBox site, via
-    list_synced_client_devices) as unseen and wrongly mark it offline."""
+def test_shared_netbox_site_is_a_conflict_and_is_not_synced():
+    """Two UniFi sites explicitly mapped to one NetBox site used to share it.
+
+    That is now a conflict: nothing is written, including unifi_site_id, and
+    the devices already in the site are not marked offline.
+    """
     netbox = FakeNetboxGateway()
+    site = netbox.seed_site("shared-site", "Shared Site")
     netbox.upsert_client_device(
         "11:11:11:11:11:11", "device-a", "shared-site", "unifi-client", "generic-network-client", "unifi-sync"
     )
@@ -153,13 +155,17 @@ def test_shared_netbox_site_stale_marking_uses_union_of_both_pairs():
 
     summary = engine.run()
 
+    assert summary.errors
+    assert summary.clients_seen == 0
+    assert summary.stale_marked_offline == 0
+    assert "unifi_site_id" not in site.custom_fields
     assert netbox.clients_by_mac["11:11:11:11:11:11"].status.value == "active"
     assert netbox.clients_by_mac["22:22:22:22:22:22"].status.value == "active"
-    assert summary.stale_marked_offline == 0
 
 
-def test_shared_netbox_site_skips_stale_marking_if_one_pair_fails():
+def test_shared_netbox_site_conflict_does_not_run_either_pair():
     netbox = FakeNetboxGateway()
+    netbox.seed_site("shared-site", "Shared Site")
     netbox.upsert_client_device(
         "11:11:11:11:11:11", "device-a", "shared-site", "unifi-client", "generic-network-client", "unifi-sync"
     )
@@ -178,9 +184,8 @@ def test_shared_netbox_site_skips_stale_marking_if_one_pair_fails():
 
     summary = engine.run()
 
-    assert len(summary.errors) == 1
-    # site-b's failure means we don't know its clients, so stale-marking for
-    # "shared-site" must be skipped entirely rather than acting on partial data.
+    assert summary.errors
+    assert all("simulated failure" not in error for error in summary.errors)
     assert netbox.clients_by_mac["11:11:11:11:11:11"].status.value == "active"
     assert netbox.clients_by_mac["22:22:22:22:22:22"].status.value == "active"
     assert summary.stale_marked_offline == 0
