@@ -156,6 +156,9 @@ class ClientSyncResult:
     cable_unchanged: bool = False
     # True when nothing at all was written for this client.
     unchanged: bool = False
+    # True when this client was answered from the in-memory index without
+    # the per-object write path. Not a NetBox outcome; timing only.
+    fast_path: bool = False
     error: str | None = None
 
 
@@ -201,6 +204,12 @@ class SyncSummary:
     cables_unchanged: int = 0
     cache_hits: int = 0
     cache_misses: int = 0
+    # Clients answered from the prefetched index without the write path.
+    clients_fast_path: int = 0
+    # Wall time spent bulk-loading NetBox before per-client work.
+    prefetch_seconds: float = 0.0
+    # Lookups served from that bulk index (device, name, interface, cable).
+    prefetch_hits: int = 0
     duration_seconds: float = 0.0
     errors: list[str] | None = None
     client_results: list[ClientSyncResult] | None = None

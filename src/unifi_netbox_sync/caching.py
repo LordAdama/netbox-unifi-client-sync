@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any
 
 from .netbox_client import NetboxGateway
@@ -12,21 +13,20 @@ logger = logging.getLogger(__name__)
 class CachingNetboxGateway:
     """Run-scoped read cache in front of any NetboxGateway.
 
-    Only caches lookups whose answers are stable for the lifetime of one sync
-    run. Deliberately NOT cached:
+    Stable lookups (site, switch, switch interfaces, prerequisites) are
+    memoized for the run. A switch's interfaces are fetched once and then
+    matched in memory.
 
-    - ``find_client_device_by_mac`` — this tool creates and mutates client
-      devices as it goes, so a cached miss would go stale the moment we
-      create one.
-    - ``device_name_taken_by_other`` — names change as devices are created
-      during the run.
-    - ``ensure_cable`` / ``list_synced_client_devices`` — these need live
-      cable/status state to stay correct.
+    When the inner gateway can bulk-load, ``prepare_prefetch`` also builds an
+    index of every device with ``unifi_mac`` set and of the devices and
+    interfaces at each site in the run. Client MAC and name checks read that
+    index. Devices created or updated during the run are written through, so
+    a later client in the same run sees them. A failed bulk load leaves that
+    slice unloaded and the per-object lookup runs instead.
 
-    Switch devices and their interfaces *are* cached: this tool never mutates
-    switches, and the identity of a switch port doesn't change mid-run. Cable
-    state hangs off those interfaces, but ``ensure_cable`` re-reads it by id
-    on the real gateway rather than trusting the cached object.
+    ``ensure_cable`` still hits the inner gateway. Cable state is not taken
+    from the index. ``list_synced_client_devices`` uses the site snapshot
+    when one was loaded.
 
     Thread-safe: parallel site workers share one instance (see SyncEngine).
     """
@@ -41,6 +41,12 @@ class CachingNetboxGateway:
         self._prereqs_done: set[tuple[str, str, str, str]] = set()
         self.hits = 0
         self.misses = 0
+        # Bulk index. None means "not loaded"; a list (even empty) is complete.
+        self._active = False
+        self._mac_devices: list[Any] | None = None
+        self._site_devices: dict[str, list[Any]] = {}
+        self.prefetch_seconds = 0.0
+        self.index_hits = 0
 
     # -- cached ----------------------------------------------------------
 
@@ -150,6 +156,10 @@ class CachingNetboxGateway:
         )
         with self._lock:
             self._sites[site_slug] = site
+            # A site created in this run holds no devices yet. Recording that
+            # keeps name checks off the per-client filter.
+            if created and self._active and site_slug not in self._site_devices:
+                self._site_devices[site_slug] = []
         return site, created
 
     def ensure_site_identity_field(self) -> None:
@@ -166,10 +176,21 @@ class CachingNetboxGateway:
         return self._inner.legacy_eth0_plan(device, interface_names)
 
     def find_client_device_by_mac(self, mac: str) -> Any | None:
-        return self._inner.find_client_device_by_mac(mac)
+        devices = self._mac_snapshot()
+        matcher = getattr(self._inner, "match_client_device", None)
+        if devices is None or matcher is None:
+            return self._inner.find_client_device_by_mac(mac)
+        with self._lock:
+            self.index_hits += 1
+        return matcher(devices, mac)
 
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool:
-        return self._inner.device_name_taken_by_other(name, site_slug, mac)
+        devices = self._site_snapshot(site_slug)
+        among = getattr(self._inner, "device_name_taken_among", None)
+        if devices is None or among is None:
+            return self._inner.device_name_taken_by_other(name, site_slug, mac)
+        self.index_hits += 1
+        return among(devices, name, site_slug, mac)
 
     def upsert_client_device(
         self,
@@ -183,7 +204,7 @@ class CachingNetboxGateway:
         existing: Any | None = None,
         existing_looked_up: bool = False,
     ) -> tuple[Any, bool, bool, bool]:
-        return self._inner.upsert_client_device(
+        device, created, skipped, updated = self._inner.upsert_client_device(
             mac,
             name,
             site_slug,
@@ -194,9 +215,29 @@ class CachingNetboxGateway:
             existing,
             existing_looked_up,
         )
+        self._remember_device(device, site_slug)
+        return device, created, skipped, updated
+
+    def cached_interface(self, device: Any, name: str) -> Any | None:
+        """Interface loaded by prefetch, if this device was part of that load."""
+        device_id = getattr(device, "id", None)
+        with self._lock:
+            by_name = self._device_interfaces.get(device_id)
+        if not by_name:
+            return None
+        return by_name.get(name)
 
     def ensure_interface(self, device: Any, name: str, wired: bool) -> Any:
-        return self._inner.ensure_interface(device, name, wired)
+        existing = self.cached_interface(device, name)
+        if existing is not None:
+            wanted = "1000base-t" if wired else "ieee802.11ac"
+            current = getattr(getattr(existing, "type", None), "value", None)
+            if current == wanted:
+                self.index_hits += 1
+                return existing
+        iface = self._inner.ensure_interface(device, name, wired)
+        self._remember_interface(device, iface)
+        return iface
 
     def list_device_interfaces(self, device: Any) -> list[Any]:
         """The switch's interfaces, fetched once per device per run.
@@ -248,7 +289,12 @@ class CachingNetboxGateway:
         self._inner.ensure_device_role(role_slug)
 
     def upsert_infrastructure_device(self, *args: Any, **kwargs: Any) -> tuple[Any, bool, bool]:
-        return self._inner.upsert_infrastructure_device(*args, **kwargs)
+        device, created, updated = self._inner.upsert_infrastructure_device(*args, **kwargs)
+        site_slug = kwargs.get("site_slug")
+        if site_slug is None and len(args) >= 3:
+            site_slug = args[2]
+        self._remember_device(device, site_slug if isinstance(site_slug, str) else None)
+        return device, created, updated
 
     def ensure_client_device_type(self, manufacturer_name: str) -> str:
         # Already memoized inside PynetboxGateway, which is where the
@@ -273,10 +319,166 @@ class CachingNetboxGateway:
     def list_synced_client_devices(
         self, tag_slug: str, site_slug: str, role_slug: str | None = None
     ) -> list[Any]:
-        return self._inner.list_synced_client_devices(tag_slug, site_slug, role_slug)
+        devices = self._site_snapshot(site_slug)
+        select = getattr(self._inner, "select_synced_clients", None)
+        if devices is None or select is None:
+            return self._inner.list_synced_client_devices(tag_slug, site_slug, role_slug)
+        self.index_hits += 1
+        return select(devices, tag_slug, site_slug, role_slug)
 
     def mark_offline(self, device: Any) -> None:
         self._inner.mark_offline(device)
+
+    # -- prefetch --------------------------------------------------------
+
+    def prepare_prefetch(self, site_slugs: list[str]) -> None:
+        """Load NetBox objects for ``site_slugs`` into this run's index.
+
+        Failures degrade to the per-object lookups. A partial index is not
+        treated as complete: only a successful bulk load sets the snapshot.
+        """
+        start = time.monotonic()
+        self._active = True
+        slugs = list(dict.fromkeys(site_slugs))
+        mac_devices = self._load_mac_index()
+        site_devices: list[Any] = []
+        interfaces: list[Any] = []
+        for slug in slugs:
+            loaded = self._load_site(slug)
+            if loaded is None:
+                continue
+            site_devices.extend(loaded)
+            interfaces.extend(self._load_interfaces(loaded))
+        self._publish_switch_index(mac_devices, site_devices, interfaces)
+        self.prefetch_seconds = time.monotonic() - start
+        logger.info(
+            "Prefetched NetBox index for %d site(s) in %.2fs (%d device record(s), %d interface(s))",
+            len(slugs),
+            self.prefetch_seconds,
+            len(site_devices) + (0 if mac_devices is None else len(mac_devices)),
+            len(interfaces),
+        )
+
+    def _load_mac_index(self) -> list[Any] | None:
+        loader = getattr(self._inner, "bulk_devices_with_unifi_mac", None)
+        if loader is None:
+            return None
+        try:
+            devices = loader()
+        except Exception as exc:
+            logger.warning("Bulk MAC index failed (%s); per-client device lookups will be used", exc)
+            return None
+        if devices is None:
+            return None
+        with self._lock:
+            self._mac_devices = list(devices)
+        return devices
+
+    def _load_site(self, site_slug: str) -> list[Any] | None:
+        loader = getattr(self._inner, "bulk_devices_at_site", None)
+        if loader is None:
+            return None
+        try:
+            devices = loader(site_slug)
+        except Exception as exc:
+            logger.warning(
+                "Bulk device load for site %s failed (%s); that site will use per-client lookups",
+                site_slug,
+                exc,
+            )
+            return None
+        if devices is None:
+            return None
+        with self._lock:
+            self._site_devices[site_slug] = list(devices)
+        return devices
+
+    def _load_interfaces(self, devices: list[Any]) -> list[Any]:
+        loader = getattr(self._inner, "bulk_interfaces", None)
+        if loader is None or not devices:
+            return []
+        ids = [device.id for device in devices if getattr(device, "id", None) is not None]
+        try:
+            interfaces = loader(ids)
+        except Exception as exc:
+            logger.warning("Bulk interface load failed (%s); interfaces will be fetched per device", exc)
+            return []
+        if interfaces is None:
+            return []
+        self._store_interfaces(devices, interfaces)
+        return list(interfaces)
+
+    def _store_interfaces(self, devices: list[Any], interfaces: list[Any]) -> None:
+        by_device: dict[Any, list[Any]] = {}
+        for iface in interfaces:
+            device_id = getattr(getattr(iface, "device", None), "id", None)
+            if device_id is None:
+                continue
+            by_device.setdefault(device_id, []).append(iface)
+        with self._lock:
+            for device in devices:
+                device_id = getattr(device, "id", None)
+                if device_id is None:
+                    continue
+                listing = by_device.get(device_id, [])
+                self._device_interfaces[device_id] = {iface.name: iface for iface in listing}
+
+    def _publish_switch_index(
+        self,
+        mac_devices: list[Any] | None,
+        site_devices: list[Any],
+        interfaces: list[Any],
+    ) -> None:
+        note = getattr(self._inner, "note_prefetched_devices", None)
+        if note is None:
+            return
+        seen: set[int] = set()
+        union: list[Any] = []
+        for device in (mac_devices or []) + site_devices:
+            marker = id(device)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            union.append(device)
+        note(union, mac_complete=mac_devices is not None)
+        note_ifaces = getattr(self._inner, "note_prefetched_interfaces", None)
+        if note_ifaces is not None and interfaces:
+            note_ifaces(interfaces)
+
+    def _mac_snapshot(self) -> list[Any] | None:
+        with self._lock:
+            if self._mac_devices is None:
+                return None
+            return list(self._mac_devices)
+
+    def _site_snapshot(self, site_slug: str) -> list[Any] | None:
+        with self._lock:
+            devices = self._site_devices.get(site_slug)
+            if devices is None:
+                return None
+            return list(devices)
+
+    def _remember_device(self, device: Any, site_slug: str | None) -> None:
+        if device is None or not self._active:
+            return
+        with self._lock:
+            if self._mac_devices is not None and all(existing is not device for existing in self._mac_devices):
+                self._mac_devices.append(device)
+            if site_slug and site_slug in self._site_devices:
+                listing = self._site_devices[site_slug]
+                if all(existing is not device for existing in listing):
+                    listing.append(device)
+
+    def _remember_interface(self, device: Any, iface: Any) -> None:
+        if iface is None:
+            return
+        device_id = getattr(device, "id", None)
+        name = getattr(iface, "name", None)
+        if device_id is None or not name:
+            return
+        with self._lock:
+            by_name = self._device_interfaces.setdefault(device_id, {})
+            by_name[name] = iface
 
     def log_stats(self) -> None:
         total = self.hits + self.misses

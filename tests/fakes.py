@@ -415,14 +415,77 @@ class FakeNetboxGateway:
         # that used to be a client. Looking only in clients_by_mac would create
         # a second device for that MAC after a merge.
         with self._lock:
-            found = self.clients_by_mac.get(mac)
-            if found is not None:
-                return found
+            return self._match_client_locked(self._iter_devices(), mac)
+
+    def _match_client_locked(self, devices, mac: str):
+        found = self.clients_by_mac.get(mac)
+        if found is not None:
+            return found
+        mac_l = (mac or "").lower()
+        for device in devices:
+            stored = (device.custom_fields or {}).get("unifi_mac") or ""
+            if stored.lower() == mac_l:
+                return device
+        return None
+
+    def match_client_device(self, devices, mac: str):
+        """Same answer as ``find_client_device_by_mac`` against ``devices`` plus the live map."""
+        with self._lock:
+            return self._match_client_locked(devices, mac)
+
+    def device_name_taken_among(self, devices, name: str, site_slug: str, mac: str) -> bool:
+        """Same predicate as ``device_name_taken_by_other``.
+
+        The live client map is the source of truth, matching the per-call
+        method. ``devices`` is accepted so the cache can share one call shape
+        with the real gateway.
+        """
+        del devices
+        return self.device_name_taken_by_other(name, site_slug, mac)
+
+    def bulk_devices_with_unifi_mac(self):
+        """One round-trip covering every device ``find_client_device_by_mac`` can see."""
+        with self._lock:
+            return self._iter_devices()
+
+    def bulk_devices_at_site(self, site_slug: str):
+        if self.find_site(site_slug) is None:
+            return []
+        with self._lock:
+            devices = self._iter_devices()
+        return [device for device in devices if (device.site_slug or "") == site_slug]
+
+    def bulk_interfaces(self, device_ids):
+        wanted = set(device_ids)
+        found = []
+        with self._lock:
             for device in self._iter_devices():
-                stored = (device.custom_fields or {}).get("unifi_mac") or ""
-                if stored.lower() == (mac or "").lower():
-                    return device
-            return None
+                if device.id not in wanted:
+                    continue
+                found.extend(device.interfaces.values())
+        return found
+
+    def select_synced_clients(self, devices, tag_slug: str, site_slug: str, role_slug: str | None):
+        """Same devices as ``list_synced_client_devices``, in that method's order.
+
+        Membership is limited to ``devices`` so a prefetched site list cannot
+        pick up a switch that the per-call method never saw.
+        """
+        if self.find_site(site_slug) is None:
+            return []
+        allowed = {id(device) for device in devices}
+        with self._lock:
+            pool = list(self.clients_by_mac.values()) + list(self.infra_by_mac.values())
+        selected = []
+        for device in pool:
+            if id(device) not in allowed:
+                continue
+            if tag_slug not in device.tags or device.site_slug != site_slug:
+                continue
+            if role_slug is not None and device.role_slug != role_slug:
+                continue
+            selected.append(device)
+        return selected
 
     def device_name_taken_by_other(self, name: str, site_slug: str, mac: str) -> bool:
         # Real NetBox 400s on a filter naming a site that doesn't exist, rather

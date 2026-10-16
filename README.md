@@ -453,7 +453,12 @@ full list and defaults. Key ones:
 | `SITE_MATCH` | `normalized` (default), `name`, or `slug` — fallback after the UniFi site id fields; see "Linking to sites you already have" |
 | `SITE_POLICY` | `require` (default) or `create` — creating sites is opt-in; see "Site & update policies" |
 | `DEVICE_UPDATE_POLICY` | `create-only` (default) or `sync` — see "Site & update policies" |
-| `NETBOX_TIMEOUT` / `UNIFI_TIMEOUT` | Per-request HTTP timeouts in seconds (default `30`). A NetBox call with no timeout is what hung a run indefinitely |
+| `NETBOX_TIMEOUT` / `UNIFI_TIMEOUT` | Per-request HTTP timeouts in seconds (default `30`). A NetBox call with no timeout is what hung a run indefinitely. A NetBox read that times out is retried twice; writes are not |
+| `NETBOX_PREFETCH` | Bulk-load devices and interfaces once per site and answer client MAC lookups from that index (default `true`). `false` restores one device lookup per client |
+| `NETBOX_FAST_PATH` | Skip the write path when the prefetched client already matches (default `true`). Creates, updates, skips, and offline marks stay the same |
+| `NETBOX_PAGE_SIZE` | Page size for NetBox list calls (default `1000`) |
+| `NETBOX_MAX_INFLIGHT` | Concurrent NetBox HTTP calls across site workers (default `4`). `0` means no extra cap. A 429 wait does not hold a slot |
+| `NETBOX_RATE_LIMIT_RETRIES` | How many times to retry HTTP 429 (default `5`), honoring `Retry-After` |
 | `NETBOX_IP_STATUS` | Status set on IP addresses this tool creates (default `active`) |
 | `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order; blank uses the built-in list. `{port}` is the UniFi index, `{port2}` zero-pads it, `{sfp}` is the SFP ordinal |
 | `PORT_MODEL_TEMPLATES` | Per UniFi model, tried first. Example: `USW-Pro-48=Gi1/0/{port};SFP {sfp}`. Separate models with a vertical bar. A model listed here does not get the structural guess |
@@ -476,7 +481,7 @@ full list and defaults. Key ones:
 | `DRY_RUN` | `true` (default). Log every intended create/update/delete and write nothing. `false` or `--apply` writes |
 | `LOG_FORMAT` | `text` (default) or `json` — one JSON object per log line, for log shippers |
 | `METRICS_FILE` | If set, write Prometheus textfile-collector metrics to this path after every run |
-| `MAX_WORKERS` | NetBox sites synced concurrently (default `1`) — see "Scaling" |
+| `MAX_WORKERS` | NetBox sites synced concurrently (default `4`). `1` is strictly sequential — see "Scaling" |
 | `SYNC_INTERVAL_SECONDS` | Docker only — `0`/unset runs once and exits, a positive number loops forever on that interval |
 | `LOCK_FILE` | Docker only, optional — `flock` path to avoid two instances racing on the same NetBox (see "Known limitations") |
 | `HEARTBEAT_FILE` | Docker only — path the healthcheck reads (default `/tmp/last-sync-ok`); override if `/tmp` is constrained in your setup |
@@ -659,6 +664,11 @@ parse that line if you're shipping logs somewhere (Loki, CloudWatch, etc.)
 regardless of `LOG_FORMAT`. Set `LOG_FORMAT=json` to also make every other
 log line a JSON object instead of plain text.
 
+Each run also logs a `Sync timing:` line (total, prefetch, clients per
+second, workers, cache hits, index hits, and the NetBox HTTP count when the
+real client is in use) and a `Slowest sites:` line with the five slowest
+site pairs.
+
 For Prometheus, set `METRICS_FILE` to a path on a volume the container can
 write to; each run overwrites it (atomically) with textfile-collector
 output — point node_exporter's `--collector.textfile.directory` (or
@@ -667,41 +677,61 @@ metrics server, which doesn't fit a periodic batch job.
 
 ## Scaling
 
-Two things dominate runtime: how many NetBox round-trips each client costs,
-and whether sites are synced one at a time.
+A full dry-run spends almost all of its time in NetBox. The expensive call
+is one `cf_unifi_mac` filter per client. On about 1,084 clients that is
+1.5–2.5 seconds each, roughly 28 minutes with sites processed one at a time.
 
-**Per-client round-trips.** A steady-state run — where the network hasn't
-changed and the right answer is "do nothing" — costs about **3 gateway calls
-per client**, down from 11–14 before this work. Three things get it there,
-all on by default:
+`NETBOX_PREFETCH` (default on) replaces those per-client filters with a
+bulk load:
 
-- *Run-scoped caching* of lookups that are constant for a run: the NetBox
-  site, the device type/role, and (the big one) switch devices and their
-  interfaces. Resolving a switch port used to cost up to one lookup per
-  candidate name per client; a switch's interfaces are now fetched once and
-  matched in memory, so 48 clients behind one switch cost 1 interface list
-  instead of up to 192 lookups.
-- *No-op short-circuiting*: if the device already holds its own name the
-  uniqueness query is skipped; if the primary IP already matches, no IP write;
-  if the cable already lands on the right port, no cable write.
-- *Honest change reporting*: `devices_updated` now counts devices actually
-  written, not merely seen. A quiet run reports `clients_unchanged`, and the
-  `sync_summary` line makes churn visible at a glance.
+- one paginated list of every device that has `unifi_mac` set
+- one device list per site, and that site's interfaces in batches of 50 devices
+- switch interfaces still come from that list and are matched in memory, so
+  a port name is not looked up once per client
 
-Measured on a synthetic 20-site × 2-switch × 48-port estate (1,920 clients),
-steady-state re-run: **9,660 → 5,881 gateway calls** (39% fewer) from caching
-alone, on top of the no-op savings, with 1,920/1,920 clients correctly
-detected as unchanged.
+`NETBOX_FAST_PATH` (default on) then skips the write path when the indexed
+client already matches UniFi. Creates, updates, merge decisions, skip
+reasons, and offline marks stay on the original path. A dry-run still plans
+cables from what a device record exposes directly: a prefetched interface is
+not treated as proof that a cable is already in place.
 
-**Concurrency.** `MAX_WORKERS` (default `1`) syncs that many NetBox sites at
+Set `NETBOX_PREFETCH=false` and `NETBOX_FAST_PATH=false` to force the
+per-client lookups.
+
+Measured with `scripts/bench_sync.py` on a synthetic estate of 39 sites and
+1,084 clients (one switch per site, one third of the clients wired). Names,
+MACs, and addresses in that script are synthetic. Every timed case produced
+the same creates, updates, skips, and offline decisions as the prefetch-off
+path.
+
+| Case | Mode | Modeled HTTP | `cf_unifi_mac` filters | Wall at 5 ms/call | Serial estimate |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Populated dry-run | before, 1 worker | 1,240 | 1,084 | 6.54 s | 27.2 min |
+| Populated dry-run | after, 1 worker | 158 | 0 | 0.87 s | 19.9 s |
+| Populated dry-run | after, 4 workers | 158 | 0 | 0.69 s | 19.9 s |
+| Empty dry-run | before, 1 worker | 2,324 | 1,084 | 12.02 s | 28.1 min |
+| Empty dry-run | after, 4 workers | 157 | 0 | 0.68 s | 19.7 s |
+| Populated apply | before, 1 worker | 3,488 | 1,084 | 18.14 s | 29.1 min |
+| Populated apply | after, 4 workers | 241 | 0 | 0.94 s | 24.1 s |
+
+The 5 ms column is measured wall time against an in-memory NetBox with that
+delay injected on each modeled HTTP call. The serial estimate is the same
+call mix priced the way a slow custom-field filter behaves in production:
+1.5 seconds for each `cf_unifi_mac` point lookup, 0.2 seconds for a bulk
+page, and 0.05 seconds for every other call. It is not a clock reading from
+a live NetBox. Prefetch runs once, before the site workers, so extra workers
+shorten the remaining per-site calls and do not multiply the bulk load.
+
+**Concurrency.** `MAX_WORKERS` (default `4`) syncs that many NetBox sites at
 once. Pairs are grouped by *NetBox* site and a group is never split across
 workers, so a single NetBox site is never written by two workers. Two UniFi
 sites that resolve to that same site are skipped as a conflict before
-grouping, rather than consolidated into it.
-Because the work is round-trip-bound, speedup is near-linear until NetBox
-becomes the bottleneck; against a simulated 2 ms/call NetBox, 12 sites went
-1.94 s → 0.17 s at `MAX_WORKERS=12`. Raise it gradually and watch the
-per-site metrics — the ceiling is your NetBox instance, not this tool.
+grouping, rather than consolidated into it. `NETBOX_MAX_INFLIGHT` (default
+`4`, `0` for no extra cap) limits how many NetBox HTTP calls are in flight
+across those workers. HTTP 429 is retried up to `NETBOX_RATE_LIMIT_RETRIES`
+(default 5), honoring `Retry-After`. The wait does not hold an in-flight
+slot. Set `MAX_WORKERS=1` for the original strictly sequential run. Raise
+either knob gradually and read the `Slowest sites:` line.
 
 **Partitioning across processes.** For very large estates, split `SITE_MAP`
 across several containers so each owns a disjoint set of UniFi sites. Two
@@ -709,11 +739,11 @@ instances must never share a NetBox site — there is no distributed lock, so
 they would race (see "Known limitations"). Partition on NetBox site
 boundaries and the instances never touch the same objects.
 
-**Where this still won't go.** Hundreds of sites with tens of thousands of
-clients will remain round-trip-bound: the floor is a device lookup and an
-interface lookup per client, which no amount of caching removes. Getting
-below that needs bulk/`ORM` access — i.e. the NetBox-plugin path — rather
-than more tuning of an API client.
+**Where this still won't go.** A quiet client no longer costs a device
+lookup. What remains is the bulk pages, one switch lookup per switch, and a
+write for each real change. Tens of thousands of clients are then bounded by
+those list calls and by UniFi returning the whole client list in one
+response, not by one filter per MAC.
 
 ## Troubleshooting
 
@@ -786,6 +816,8 @@ for something bigger:
   is never written. A NetBox read (`GET`, `HEAD`, `OPTIONS`) that times out or
   fails to connect is retried twice, with one second and then two seconds of
   backoff. Writes are not retried: a timed-out create may already have landed.
+  HTTP 429 is retried on every verb, up to `NETBOX_RATE_LIMIT_RETRIES`, because
+  NetBox refused the call before applying it.
 - **One site cannot abort the others.** A failure while syncing a site —
   including an unexpected exception — is logged, recorded on that site, and
   the run continues. Stale-offline marking for a NetBox site is skipped when
