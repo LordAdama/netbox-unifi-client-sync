@@ -69,10 +69,12 @@ def test_parallel_reports_per_site_stats_for_every_pair():
     assert all(s.clients_seen == CLIENTS_PER_SITE for s in summary.site_stats)
 
 
-def test_pairs_sharing_a_netbox_site_run_in_the_same_worker():
-    """Two UniFi sites mapped to one NetBox site must not be split across
-    threads — that's what keeps the stale-marking union and per-site writes
-    free of races."""
+def test_pairs_sharing_a_netbox_site_are_skipped_before_any_worker():
+    """Two UniFi sites mapped to one NetBox site are a conflict.
+
+    They must not be handed to workers at all: syncing both into the same
+    site is what collapsed every controller site onto one NetBox site.
+    """
     seen_threads: dict[str, set[str]] = {}
     lock = threading.Lock()
 
@@ -88,14 +90,20 @@ def test_pairs_sharing_a_netbox_site_run_in_the_same_worker():
         "a2": [make_unifi_client(mac="22:22:22:22:22:22", is_wired=False)],
         "b1": [make_unifi_client(mac="33:33:33:33:33:33", is_wired=False)],
     }
+    netbox = FakeNetboxGateway()
     engine = SyncEngine(
         unifi=ThreadRecordingUnifi(by_site=by_site),
-        netbox=CachingNetboxGateway(FakeNetboxGateway()),
+        netbox=CachingNetboxGateway(netbox),
         settings=make_settings(site_map=site_map, max_workers=4),
     )
-    engine.run()
+    summary = engine.run()
 
-    assert seen_threads["a1"] == seen_threads["a2"], "shared-NetBox-site pairs must share a worker"
+    assert "a1" not in seen_threads
+    assert "a2" not in seen_threads
+    assert "b1" in seen_threads
+    assert summary.errors
+    assert "11:11:11:11:11:11" not in netbox.clients_by_mac
+    assert netbox.clients_by_mac["33:33:33:33:33:33"].site_slug == "other"
 
 
 def test_parallel_isolates_a_failing_site():
