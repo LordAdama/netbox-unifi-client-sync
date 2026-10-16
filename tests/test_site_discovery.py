@@ -119,16 +119,20 @@ def test_explicit_entry_overrides_the_derived_slug():
     assert netbox.clients_by_mac["11:22:33:44:55:02"].site_slug == "branch"  # still derived
 
 
-def test_colliding_descriptions_warn_but_still_sync(caplog):
+def test_colliding_descriptions_are_a_conflict_and_are_skipped(caplog):
     sites = [UnifiSite(name="s1", description="Office"), UnifiSite(name="s2", description="Office")]
     engine, netbox = _engine(sites, {"s1": [_client(1)], "s2": [_client(2)]})
 
     with caplog.at_level(logging.WARNING):
         summary = engine.run()
 
-    assert summary.clients_seen == 2
-    assert summary.errors == []
+    assert summary.clients_seen == 0
+    assert summary.devices_created == 0
+    assert netbox.created_sites == set()
+    assert summary.errors
     assert "both map to NetBox site" in "\n".join(r.getMessage() for r in caplog.records)
+    assert "11:22:33:44:55:01" not in netbox.clients_by_mac
+    assert "11:22:33:44:55:02" not in netbox.clients_by_mac
 
 
 def test_a_controller_reporting_no_sites_is_an_explicit_error():

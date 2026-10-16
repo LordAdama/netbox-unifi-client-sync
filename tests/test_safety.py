@@ -22,7 +22,7 @@ from unifi_netbox_sync.netbox_client import (
 from unifi_netbox_sync.sync import SyncEngine
 from unifi_netbox_sync.unifi_client import UnifiClientAPI
 
-from .fakes import FakeInterface, FakeNetboxGateway, FakeUnifiClient, make_unifi_client
+from .fakes import FakeInterface, FakeIP, FakeNetboxGateway, FakeUnifiClient, make_unifi_client
 from .test_sync import make_settings
 
 
@@ -354,6 +354,185 @@ def test_missing_site_id_field_falls_back_to_name_matching(caplog):
 
     assert found is matched
     assert "falling back to name/slug matching" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def _sites_api(sites):
+    """NetBox stand-in whose cf_unifi_site_id filter is ignored.
+
+    That is what the production dry-run hit: the custom field does not exist
+    yet, NetBox drops the unknown parameter, and the unfiltered site list
+    comes back with Site A first.
+    """
+    api = MagicMock()
+
+    def sites_filter(**kwargs):
+        if any(key.startswith("cf_") for key in kwargs):
+            return list(sites)
+        if "name" in kwargs:
+            return [site for site in sites if site.name == kwargs["name"]]
+        return list(sites)
+
+    def sites_get(slug=None, **kwargs):
+        return next((site for site in sites if site.slug == slug), None)
+
+    api.dcim.sites.filter.side_effect = sites_filter
+    api.dcim.sites.get.side_effect = sites_get
+    api.dcim.sites.all.return_value = list(sites)
+    return api
+
+
+def _resolver(api) -> PynetboxGateway:
+    import threading
+
+    gateway = PynetboxGateway.__new__(PynetboxGateway)
+    gateway.api = api
+    gateway._memo_lock = threading.Lock()
+    gateway._site_memo = {}
+    gateway._all_sites = None
+    gateway._unifi_site_id_filter_unusable = False
+    return gateway
+
+
+def test_ignored_site_id_filter_does_not_bind_every_unifi_site_to_site-a(caplog):
+    """A dry-run: 39 UniFi sites all 'matched via unifi_site_id' to Site A.
+
+    UniFi id ``siteaid1`` really is Site A. The others must not be.
+    """
+    sitea = SimpleNamespace(id=1, slug="site-a", name="Site A", custom_fields={})
+    site-b = SimpleNamespace(id=2, slug="site-b", name="Site B", custom_fields={})
+    sitec = SimpleNamespace(id=3, slug="site-c", name="Site C", custom_fields={})
+    gateway = _resolver(_sites_api([sitea, site-b, sitec]))
+
+    with caplog.at_level(logging.INFO):
+        assert gateway.resolve_existing_site("site-c", "Site C", "normalized", "sitecid3") is sitec
+        assert gateway.resolve_existing_site("site-b", "Site B", "normalized", "default") is site-b
+        assert gateway.resolve_existing_site("other-site", "Other Site", "normalized", "siteoid4") is None
+        assert gateway.resolve_existing_site("site-a", "Site A", "normalized", "siteaid1") is sitea
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "via unifi_site_id" not in text
+    assert "filter is being ignored" in text
+    assert sitea.custom_fields == {}
+
+
+class _CollapseTositea(FakeNetboxGateway):
+    """The production failure mode: every lookup returns the first NetBox site."""
+
+    def resolve_existing_site(self, desired_slug, label, mode="normalized", unifi_site_id=""):
+        return self.existing_sites["site-a"]
+
+
+def test_every_unifi_site_resolving_to_site-a_is_a_conflict(caplog):
+    netbox = _CollapseTositea()
+    site = netbox.seed_site("site-a", "Site A")
+    sites = [
+        UnifiSite("sitecid3", "Site C"),
+        UnifiSite("default", "Site B"),
+        UnifiSite("siteaid1", "Site A"),
+    ]
+    by_site = {
+        "sitecid3": [make_unifi_client(mac="11:22:33:44:55:01", name="sitec-laptop", ip="10.1.1.1", is_wired=False)],
+        "default": [make_unifi_client(mac="11:22:33:44:55:02", name="site-b-laptop", ip="10.2.2.2", is_wired=False)],
+        "siteaid1": [make_unifi_client(mac="11:22:33:44:55:03", name="sitea-laptop", ip="10.3.3.3", is_wired=False)],
+    }
+    with caplog.at_level(logging.INFO):
+        summary = SyncEngine(
+            unifi=FakeUnifiClient(sites=sites, by_site=by_site),
+            netbox=netbox,
+            settings=make_settings(sync_all_sites=True, site_policy="create", dry_run=False),
+        ).run()
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert summary.devices_created == 0
+    assert summary.clients_seen == 0
+    assert netbox.clients_by_mac == {}
+    assert site.custom_fields == {}
+    assert "would record unifi_site_id" not in text
+    assert any("sitecid3" in error and "siteaid1" in error and "site-a" in error for error in summary.errors)
+
+
+def test_only_the_real_site-a_site_is_linked_when_the_filter_is_honest():
+    """Same controller listing as the dry-run, with only Site A present in NetBox."""
+    netbox = FakeNetboxGateway()
+    site = netbox.seed_site("site-a", "Site A")
+    sites = [
+        UnifiSite("sitecid3", "Site C"),
+        UnifiSite("default", "Site B"),
+        UnifiSite("siteaid1", "Site A"),
+    ]
+    by_site = {
+        "sitecid3": [make_unifi_client(mac="11:22:33:44:55:01", name="sitec-laptop", is_wired=False)],
+        "default": [make_unifi_client(mac="11:22:33:44:55:02", name="site-b-laptop", is_wired=False)],
+        "siteaid1": [make_unifi_client(mac="11:22:33:44:55:03", name="sitea-laptop", is_wired=False)],
+    }
+    summary = SyncEngine(
+        unifi=FakeUnifiClient(sites=sites, by_site=by_site),
+        netbox=netbox,
+        settings=make_settings(sync_all_sites=True, site_policy="require"),
+    ).run()
+
+    assert site.custom_fields["unifi_site_id"] == "siteaid1"
+    assert netbox.clients_by_mac["11:22:33:44:55:03"].site_slug == "site-a"
+    assert "11:22:33:44:55:01" not in netbox.clients_by_mac
+    assert "11:22:33:44:55:02" not in netbox.clients_by_mac
+    assert summary.devices_created == 1
+    assert any("site-c" in error for error in summary.errors)
+    assert any("site-b" in error for error in summary.errors)
+
+
+def test_stored_unifi_site_id_is_never_overwritten_or_copied():
+    netbox = FakeNetboxGateway()
+    sitea = netbox.seed_site("site-a", "Site A", unifi_site_id="siteaid1")
+    site-b = netbox.seed_site("site-b", "Site B")
+
+    assert netbox.remember_site_link(sitea, "sitecid3") is False
+    assert netbox.remember_site_link(site-b, "siteaid1") is False
+    assert sitea.custom_fields["unifi_site_id"] == "siteaid1"
+    assert site-b.custom_fields == {}
+
+
+def test_create_only_skips_ip_changes_on_existing_untagged_devices(caplog):
+    netbox = FakeNetboxGateway()
+    device, *_ = netbox.upsert_client_device(
+        "11:22:33:44:55:66", "hand-named", "main", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    device.tags.clear()
+    device.primary_ip4 = FakeIP("10.1.1.1")
+    client = make_unifi_client(mac="11:22:33:44:55:66", name="from-unifi", ip="10.9.9.9", is_wired=False)
+
+    with caplog.at_level(logging.INFO):
+        dry = SyncEngine(
+            unifi=FakeUnifiClient(clients=[client]),
+            netbox=netbox,
+            settings=make_settings(dry_run=True, device_update_policy="create-only"),
+        ).run()
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "would assign IP" not in text
+    assert dry.devices_created == 0
+    assert device.primary_ip4.address.startswith("10.1.1.1")
+
+    applied = SyncEngine(
+        unifi=FakeUnifiClient(clients=[client]),
+        netbox=netbox,
+        settings=make_settings(device_update_policy="create-only"),
+    ).run()
+    assert applied.devices_updated == 0
+    assert device.name == "hand-named"
+    assert device.primary_ip4.address.startswith("10.1.1.1")
+
+
+def test_create_only_still_assigns_ip_on_a_tagged_device():
+    netbox = FakeNetboxGateway()
+    netbox.upsert_client_device(
+        "11:22:33:44:55:66", "laptop", "main", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    client = make_unifi_client(mac="11:22:33:44:55:66", name="laptop", ip="10.9.9.9", is_wired=False)
+    SyncEngine(
+        unifi=FakeUnifiClient(clients=[client]),
+        netbox=netbox,
+        settings=make_settings(device_update_policy="create-only"),
+    ).run()
+    assert netbox.clients_by_mac["11:22:33:44:55:66"].primary_ip4.address.startswith("10.9.9.9")
 
 
 def test_primary_conflict_detection_names_the_device():

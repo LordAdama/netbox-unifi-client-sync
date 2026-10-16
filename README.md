@@ -390,10 +390,9 @@ SITE_MAP=*,default:head-office
 ```
 
 An explicit entry always wins over the derived name for the site it names.
-If two UniFi sites have the same description they'd derive the same slug and
-share one NetBox site; that's handled safely (they become one group, and
-stale-marking unions their clients) but is warned about, since it's rarely
-intended — pin one of them to separate them.
+If two UniFi sites have the same description they'd derive the same slug.
+That is a conflict: both are skipped and warned about. Pin one of them with
+an explicit `SITE_MAP` entry so each NetBox site has a single UniFi site.
 
 Each pair is synced independently with its own client list and its own
 `SITE_POLICY`/site-creation check. Device-name-collision checks and
@@ -401,13 +400,9 @@ stale-device marking are scoped by *NetBox site*, not by UniFi site — a
 client in one NetBox site never affects another site's devices, and the
 same device name is fine in two different sites (NetBox's uniqueness
 constraint is per-site, and this tool's collision check respects that).
-If two UniFi sites happen to map to the *same* NetBox site slug (e.g.
-consolidating them), that's handled correctly too: stale-device marking
-uses the union of both pairs' clients for that shared NetBox site, and if
-one of those pairs fails, stale-marking for the shared site is skipped
-entirely for that run rather than acting on incomplete information — a
-site's clients not being known yet is not the same as a device being
-gone. A site-level failure (e.g. a `require`d NetBox site missing, or the
+If two UniFi sites resolve to the *same* NetBox site, that is a conflict:
+both are skipped, `unifi_site_id` is not written, and nothing in that site
+is marked offline. A site-level failure (e.g. a `require`d NetBox site missing, or the
 UniFi controller erroring for one site) is recorded as an error for that
 pair without stopping the other pairs in the same run. The run summary
 reports totals across all sites combined; per-site progress is logged as
@@ -438,13 +433,24 @@ NetBox, in order:
 Every step is an exact comparison after folding — never fuzzy — so two
 genuinely different sites are not bound together. `SITE_MATCH=name` stops
 after the name step, `SITE_MATCH=slug` stops after the slug step. The id
-custom field is always tried first.
+custom field is always tried first, and a hit counts only when the site's
+own `unifi_site_id` equals the UniFi id. NetBox ignores unknown filters, so
+before that custom field exists a `cf_unifi_site_id` query returns *every*
+site; the first of those is not a match. A dry-run does not create the
+field, which is why that check matters on the first preview.
 
-The first time a site is matched by name or slug, the UniFi id is recorded in
-`unifi_site_id` if that field is empty. That is the only write. **Name, slug,
-and status are never changed**, so a rename made in NetBox is not reverted
-and a later run follows the renamed site instead of creating the old name
-again. An id that is already set is not overwritten.
+The first time a site is matched by name or slug, and it is the only UniFi
+site that resolved to it, the UniFi id is recorded in `unifi_site_id` if
+that field is empty. That is the only write. **Name, slug, and status are
+never changed**, so a rename made in NetBox is not reverted and a later run
+follows the renamed site instead of creating the old name again. An id that
+is already set is not overwritten, and the same id is never copied onto a
+second site.
+
+If more than one UniFi site resolves to the same NetBox site, the run skips
+all of them, records an error, and does not stamp `unifi_site_id`. That is
+what stops a bad match from parking every controller site's clients in one
+NetBox site.
 
 **A matched site is only ever linked to, never renamed.** Whatever is already
 in it stays, and the UniFi devices and clients are added alongside. Each link
@@ -456,10 +462,9 @@ Linking UniFi site 'north' to existing NetBox site 'acmes-depot-north-yard'
 Its name and slug are left unchanged.
 ```
 
-Resolution happens before sites are grouped for syncing, so if two UniFi
-sites turn out to be the same NetBox site they end up in one group — keeping
-the stale-marking union correct rather than having each pair mark the other's
-clients offline.
+Resolution happens before sites are grouped for syncing. A NetBox site that
+more than one UniFi site resolved to is dropped from the run instead of
+being synced as a shared group.
 
 ### Site & update policies
 
@@ -477,7 +482,11 @@ Two independent, conservative-by-default policy knobs:
   leaves them alone, so a rename in NetBox sticks. `sync` is opt-in and
   keeps them matched to UniFi, which will revert those renames. Objects
   that do not carry `SYNC_TAG` are never updated, regardless of this
-  setting — not their name, interface, IP, or cables.
+  setting — not their name, interface, IP, or cables. `create-only` still
+  updates the IP of a device that *does* carry the tag (addresses move),
+  and a dry-run logs `would assign IP` only for that case or for a device
+  that does not exist yet. An existing untagged device produces no IP plan
+  and no IP write.
 
 Both apply in dry-run too (as previews, not real writes), and every
 decision — site created vs. reused, an update skipped by policy — is
@@ -535,9 +544,9 @@ detected as unchanged.
 
 **Concurrency.** `MAX_WORKERS` (default `1`) syncs that many NetBox sites at
 once. Pairs are grouped by *NetBox* site and a group is never split across
-workers, so two UniFi sites consolidated into one NetBox site still run
-sequentially together — the stale-marking union and single-writer-per-site
-guarantee are structural, not something you have to configure correctly.
+workers, so a single NetBox site is never written by two workers. Two UniFi
+sites that resolve to that same site are skipped as a conflict before
+grouping, rather than consolidated into it.
 Because the work is round-trip-bound, speedup is near-linear until NetBox
 becomes the bottleneck; against a simulated 2 ms/call NetBox, 12 sites went
 1.94 s → 0.17 s at `MAX_WORKERS=12`. Raise it gradually and watch the

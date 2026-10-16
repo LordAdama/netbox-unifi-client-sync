@@ -13,7 +13,7 @@ from .devicetype_library import DeviceTypeLibrary, spec_from_unifi_device
 from .metrics import log_json_summary, write_prometheus_textfile
 from .models import ClientSyncResult, SitePair, SiteSyncStats, SyncSummary, UnifiClient
 from .naming import mac_suffixed_name, sanitize_device_name, slugify
-from .netbox_client import UNIFI_SITE_ID_FIELD, NetboxGateway, SwitchHints, device_has_tag
+from .netbox_client import UNIFI_SITE_ID_FIELD, NetboxGateway, SwitchHints, device_has_tag, site_unifi_id
 from .oui import OuiLookup, is_locally_administered
 from .unifi_client import UnifiClientAPI
 
@@ -121,6 +121,9 @@ class SyncEngine:
         self._warned_switches: set[str] = set()
         # UniFi site id -> human label, for matching NetBox sites by name.
         self._site_labels: dict[str, str] = {}
+        # Conflicts found while linking sites. Merged into the run summary so
+        # a collapsed mapping cannot look like a successful sync.
+        self._link_errors: list[str] = []
 
     # -- orchestration ---------------------------------------------------
 
@@ -149,12 +152,10 @@ class SyncEngine:
                                site.name, site.label)
                 continue
             if slug in slug_owners:
-                # Two sites collapsing to one NetBox site is handled safely
-                # (they become one group, stale-marking unions their clients),
-                # but it's almost certainly not what was intended.
                 logger.warning(
-                    "UniFi sites %r and %r both map to NetBox site '%s'; their clients will share "
-                    "it. Pin one with an explicit SITE_MAP entry to separate them.",
+                    "UniFi sites %r and %r both map to NetBox site '%s'. That is a conflict: "
+                    "both will be skipped and unifi_site_id will not be recorded. Pin one with "
+                    "an explicit SITE_MAP entry so each NetBox site has a single UniFi site.",
                     slug_owners[slug],
                     site.name,
                     slug,
@@ -222,6 +223,8 @@ class SyncEngine:
                 )
 
         summary = _merge_summaries(group_summaries)
+        if self._link_errors:
+            summary.errors.extend(self._link_errors)
         summary.duration_seconds = time.monotonic() - start
         summary.cache_hits = getattr(self.netbox, "hits", 0)
         summary.cache_misses = getattr(self.netbox, "misses", 0)
@@ -258,13 +261,14 @@ class SyncEngine:
         slugifies to `acme-s-depot`, which does not equal an existing
         `acmes-depot`.
 
-        Resolution happens here, before grouping, so two UniFi sites that turn
-        out to be the same NetBox site end up in one group — keeping the
-        stale-marking union and single-writer guarantees intact.
+        A derived slug that misses is left as-is. Two UniFi sites that resolve
+        to the same NetBox site are a conflict: neither is synced and the
+        site's ``unifi_site_id`` is left untouched, so one site cannot be
+        claimed by every UniFi site that happened to sort first.
 
-        Matched sites are only ever linked to, never modified.
+        Matched sites are only ever linked to, never renamed.
         """
-        resolved: list[SitePair] = []
+        checked: list[tuple[SitePair, object | None]] = []
         for pair in pairs:
             label = self._site_labels.get(pair.unifi_site, "")
             try:
@@ -281,9 +285,30 @@ class SyncEngine:
                     pair.netbox_site_slug,
                     exc,
                 )
-                resolved.append(pair)
+                checked.append((pair, None))
                 continue
+            checked.append((pair, site))
 
+        by_slug: dict[str, list[SitePair]] = {}
+        for pair, site in checked:
+            slug = site.slug if site is not None else pair.netbox_site_slug
+            by_slug.setdefault(slug, []).append(pair)
+        conflicts = {slug for slug, group in by_slug.items() if len(group) > 1}
+        for slug in sorted(conflicts):
+            ids = ", ".join(pair.unifi_site for pair in by_slug[slug])
+            message = (
+                f"UniFi sites {ids} all resolve to NetBox site '{slug}'; skipping them and "
+                f"not recording {UNIFI_SITE_ID_FIELD}. Each NetBox site can belong to only "
+                "one UniFi site."
+            )
+            logger.error(message)
+            self._link_errors.append(message)
+
+        resolved: list[SitePair] = []
+        for pair, site in checked:
+            slug = site.slug if site is not None else pair.netbox_site_slug
+            if slug in conflicts:
+                continue
             if site is None:
                 resolved.append(pair)
                 continue
@@ -301,9 +326,21 @@ class SyncEngine:
         return resolved
 
     def _remember_site_link(self, site: object, unifi_site_id: str) -> None:
-        """Stamp the UniFi id onto a matched site, without renaming it."""
-        bound = ((getattr(site, "custom_fields", None) or {}).get(UNIFI_SITE_ID_FIELD) or "")
+        """Stamp the UniFi id onto a matched site, without renaming it.
+
+        An id that is already set is never replaced. A value that already
+        belongs to a different UniFi site is not written either; that case is
+        also a conflict and is reported on the summary.
+        """
+        bound = site_unifi_id(site)
         if bound:
+            if bound != unifi_site_id:
+                message = (
+                    f"Refusing to overwrite {UNIFI_SITE_ID_FIELD} on NetBox site "
+                    f"{getattr(site, 'slug', '')!r}: already {bound!r}, not {unifi_site_id!r}"
+                )
+                logger.error(message)
+                self._link_errors.append(message)
             return
         if self.settings.dry_run:
             logger.info(
@@ -758,7 +795,7 @@ class SyncEngine:
             iface = self.netbox.ensure_interface(device, iface_name, client.is_wired)
 
             ip_wrote = False
-            if client.ip:
+            if client.ip and self._may_assign_ip(existing):
                 if _primary_ip_matches(device, client.ip):
                     result.ip_unchanged = True
                 else:
@@ -766,6 +803,16 @@ class SyncEngine:
                         device, iface, client.ip, s.netbox_ip_status, s.sync_tag
                     )
                     result.ip_assigned = ip_wrote
+            elif client.ip and existing is not None and not self._may_assign_ip(existing):
+                logger.info(
+                    "Not assigning IP %s to existing device %r (%s): it is not tagged %r "
+                    "(DEVICE_UPDATE_POLICY=%s)",
+                    client.ip,
+                    getattr(existing, "name", result.name),
+                    client.mac,
+                    s.sync_tag,
+                    s.device_update_policy,
+                )
 
             cable_wrote = False
             if client.is_wired and client.switch_mac and client.switch_port:
@@ -776,6 +823,23 @@ class SyncEngine:
             logger.exception("Failed syncing client %s (%s)", client.mac, client.display_name)
             result.error = str(exc)
         return result
+
+    def _may_assign_ip(self, existing: object | None) -> bool:
+        """Whether this client's address may be written onto ``existing``.
+
+        A device that does not exist yet is created with the sync tag, so its
+        first address is part of creation. An existing device without that tag
+        is someone else's object: ``create-only`` (and ``sync``) must not move
+        its IP. Tagged devices still receive address updates under
+        ``create-only``, because that policy freezes name and status, not the
+        address a client is currently using.
+        """
+        if existing is None:
+            return True
+        # create-only freezes name and status on tagged devices but still
+        # tracks the address. A device without the sync tag is not ours under
+        # either policy, so its IP stays where an operator put it.
+        return device_has_tag(existing, self.settings.sync_tag)
 
     def _plan_client(
         self,
@@ -819,12 +883,25 @@ class SyncEngine:
                     result.name,
                     status,
                 )
-        if client.ip:
+        if client.ip and self._may_assign_ip(existing):
+            if existing is not None and _primary_ip_matches(existing, client.ip):
+                result.ip_unchanged = True
+            else:
+                logger.info(
+                    "[dry-run] would assign IP %s to %s %s",
+                    client.ip,
+                    result.name,
+                    iface_name,
+                )
+        elif client.ip and existing is not None and not self._may_assign_ip(existing):
             logger.info(
-                "[dry-run] would assign IP %s to %s %s",
+                "[dry-run] would not assign IP %s to existing device %r (%s): it is not tagged %r "
+                "(DEVICE_UPDATE_POLICY=%s)",
                 client.ip,
-                result.name,
-                iface_name,
+                getattr(existing, "name", result.name),
+                client.mac,
+                s.sync_tag,
+                s.device_update_policy,
             )
         if client.is_wired and client.switch_mac and client.switch_port:
             switch_device = self.netbox.find_switch_device_by_mac(
