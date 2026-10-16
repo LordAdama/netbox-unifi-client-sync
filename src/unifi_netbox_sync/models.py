@@ -59,10 +59,25 @@ class UnifiClient:
     # "Apple, Inc.". Empty for MACs the controller can't attribute (including
     # randomized/private client MACs).
     oui: str | None = None
+    # Unix seconds from the controller, when the record included one.
+    last_seen: float | None = None
 
     @property
     def display_name(self) -> str:
         return self.name or self.mac.replace(":", "")
+
+
+@dataclass(frozen=True)
+class UnifiKnownClient:
+    """A client the controller remembers, including ones not associated now.
+
+    ``last_seen`` is unix seconds, or None when the record has no usable
+    timestamp (missing or zero). None is not the same as "never seen": the
+    controller still knows the MAC.
+    """
+
+    mac: str
+    last_seen: float | None = None
 
 
 @dataclass
@@ -90,6 +105,20 @@ class SitePair:
     netbox_site_slug: str
 
 
+@dataclass(frozen=True)
+class CableSkip:
+    """One cable that was not created, for the per-run report."""
+
+    unifi_site: str
+    netbox_site: str
+    switch: str
+    switch_mac: str
+    unifi_port: str
+    names_tried: str
+    netbox_interfaces: str
+    reason: str
+
+
 @dataclass
 class ClientSyncResult:
     mac: str
@@ -99,6 +128,9 @@ class ClientSyncResult:
     ip_assigned: bool = False
     cable_created: bool = False
     cable_skipped_reason: str | None = None
+    # Structured row for the per-run cable skip report. Set whenever
+    # cable_skipped_reason is set.
+    cable_skip: CableSkip | None = None
     device_update_skipped_reason: str | None = None
     # Set when that specific aspect was inspected and already correct, so no
     # write was issued for it.
@@ -147,6 +179,7 @@ class SyncSummary:
     errors: list[str] | None = None
     client_results: list[ClientSyncResult] | None = None
     site_stats: list[SiteSyncStats] | None = None
+    cable_skips: list[CableSkip] | None = None
 
     def __post_init__(self) -> None:
         if self.errors is None:
@@ -155,3 +188,5 @@ class SyncSummary:
             self.client_results = []
         if self.site_stats is None:
             self.site_stats = []
+        if self.cable_skips is None:
+            self.cable_skips = []

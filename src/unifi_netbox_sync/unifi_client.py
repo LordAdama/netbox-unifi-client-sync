@@ -5,13 +5,39 @@ import logging
 import requests
 import urllib3
 
-from .models import UnifiClient, UnifiPort, UnifiSite, UnifiSwitchDevice
+from .models import UnifiClient, UnifiKnownClient, UnifiPort, UnifiSite, UnifiSwitchDevice
+from .portmatch import coerce_port
 
 logger = logging.getLogger(__name__)
 
 
 class UnifiAuthError(RuntimeError):
     pass
+
+
+def _epoch_seconds(value: object) -> float | None:
+    """Unix seconds from a UniFi timestamp.
+
+    The controller sends seconds. Some firmware sends milliseconds. Zero and
+    missing values are not a real sighting — callers must not treat them as
+    "last seen at the epoch", which would look ancient and mark the client
+    offline on the first run.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    if number >= 1_000_000_000_000:
+        number /= 1000.0
+    return number
 
 
 def _parse_port_table(raw: list[dict]) -> list[UnifiPort]:
@@ -181,10 +207,27 @@ class UnifiClientAPI:
                     ip=entry.get("ip"),
                     is_wired=is_wired,
                     switch_mac=(entry.get("sw_mac") or "").lower() or None if is_wired else None,
-                    switch_port=entry.get("sw_port") if is_wired else None,
+                    switch_port=coerce_port(entry.get("sw_port")) if is_wired else None,
+                    last_seen=_epoch_seconds(entry.get("last_seen")),
                     ap_mac=(entry.get("ap_mac") or "").lower() or None if not is_wired else None,
                     essid=entry.get("essid") if not is_wired else None,
                     oui=(entry.get("oui") or "").strip() or None,
                 )
             )
         return clients
+
+    def get_known_clients(self, site: str) -> list[UnifiKnownClient]:
+        """Every client the controller remembers, active or not.
+
+        ``/stat/sta`` is only who is associated at this moment. Idle phones
+        and laptops disappear from it and reappear later with the same MAC.
+        ``/stat/alluser`` is the historical table and carries ``last_seen``,
+        which is what the offline grace is compared against.
+        """
+        known: list[UnifiKnownClient] = []
+        for entry in self._get(f"/s/{site}/stat/alluser"):
+            mac = (entry.get("mac") or "").lower()
+            if not mac:
+                continue
+            known.append(UnifiKnownClient(mac=mac, last_seen=_epoch_seconds(entry.get("last_seen"))))
+        return known

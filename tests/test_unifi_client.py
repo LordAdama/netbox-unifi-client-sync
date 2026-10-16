@@ -48,6 +48,7 @@ def test_login_and_get_clients_udm():
     assert wired.switch_mac == "11:22:33:44:55:66"
     assert wired.switch_port == 4
     assert wired.ap_mac is None
+    assert wired.last_seen is None
 
     wireless = clients[1]
     assert wireless.mac == "aa:bb:cc:dd:ee:02"
@@ -231,3 +232,51 @@ def test_get_sites_parses_name_and_description():
         ("nodesc", ""),
     ]
     assert sites[2].label == "nodesc"  # falls back to the id
+
+
+@responses.activate
+def test_known_clients_keep_last_seen_and_string_ports_are_ints():
+    """Idle clients live in stat/alluser. sw_port is sometimes a string."""
+    host = "https://udm.example.com"
+    responses.add(
+        responses.GET,
+        f"{host}/proxy/network/api/s/default/stat/sta",
+        json={
+            "data": [
+                {
+                    "mac": "AA:BB:CC:DD:EE:01",
+                    "is_wired": True,
+                    "sw_mac": "11:22:33:44:55:66",
+                    "sw_port": "4",
+                    "last_seen": 1_700_000_000,
+                }
+            ]
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        f"{host}/proxy/network/api/s/default/stat/alluser",
+        json={
+            "data": [
+                {"mac": "AA:BB:CC:DD:EE:01", "last_seen": 1_700_000_000},
+                {"mac": "02:00:00:00:00:02", "last_seen": 1_700_000_000_000},  # milliseconds
+                {"mac": "02:00:00:00:00:03", "last_seen": 0},
+                {"mac": "", "last_seen": 1_700_000_000},
+            ]
+        },
+        status=200,
+    )
+
+    client = UnifiClientAPI(host=host, api_key="k", is_udm=True)
+    with client:
+        active = client.get_clients("default")
+        known = client.get_known_clients("default")
+
+    assert active[0].switch_port == 4
+    assert active[0].last_seen == 1_700_000_000
+    assert [(item.mac, item.last_seen) for item in known] == [
+        ("aa:bb:cc:dd:ee:01", 1_700_000_000),
+        ("02:00:00:00:00:02", 1_700_000_000),
+        ("02:00:00:00:00:03", None),
+    ]

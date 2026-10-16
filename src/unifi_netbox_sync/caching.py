@@ -185,7 +185,17 @@ class CachingNetboxGateway:
         return self._inner.ensure_interface(device, name, wired)
 
     def list_device_interfaces(self, device: Any) -> list[Any]:
-        return self._inner.list_device_interfaces(device)
+        """The switch's interfaces, fetched once per device per run.
+
+        Port matching reads the whole list (exact templates and structural
+        names are both decided in memory). Calling this once per client would
+        put the per-port lookup cost back.
+        """
+        device_id = getattr(device, "id", None)
+        by_name = self._interfaces_for(device, device_id)
+        if by_name is None:
+            return self._inner.list_device_interfaces(device)
+        return list(by_name.values())
 
     def list_sites(self) -> list[Any]:
         return self._inner.list_sites()

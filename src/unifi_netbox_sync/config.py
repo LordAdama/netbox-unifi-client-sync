@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 
 from .models import SitePair
+from .portmatch import parse_model_templates
 
 
 def _bool(value: str) -> bool:
@@ -36,6 +38,29 @@ def _positive_float(raw: str, name: str) -> float:
     if value <= 0:
         raise SystemExit(f"{name} must be > 0, got {value}")
     return value
+
+
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smhd])?$")
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _duration_seconds(raw: str, name: str) -> float:
+    """Parse ``7d``, ``24h``, ``30m``, ``90s``, or a bare number of seconds.
+
+    Zero is allowed and means "no grace": a client missing from the active
+    list is eligible as soon as its last_seen is in the past. Negative values
+    and bare words are rejected.
+    """
+    text = raw.strip().lower()
+    match = _DURATION.fullmatch(text)
+    if not match:
+        raise SystemExit(
+            f"{name} must be a duration like 7d, 24h, 30m, or a number of seconds, got {raw!r}"
+        ) from None
+    seconds = float(match.group(1)) * _DURATION_UNITS[match.group(2) or "s"]
+    if seconds < 0:
+        raise SystemExit(f"{name} must be >= 0, got {raw!r}")
+    return seconds
 
 
 def _positive_int(raw: str, name: str) -> int:
@@ -148,8 +173,20 @@ class Settings:
     port_name_templates: list[str] = field(
         default_factory=lambda: DEFAULT_PORT_NAME_TEMPLATES.copy()
     )
+    # UniFi model (folded) -> templates tried before port_name_templates.
+    # Empty means every switch uses the global list plus structural matching.
+    port_model_templates: dict[str, list[str]] = field(default_factory=dict)
+    # Local CSV of every skipped cable. Unset writes nothing; the run still
+    # logs one line per skip and a count by reason. Dry-run writes this file
+    # too — it is not a NetBox change.
+    cable_skip_report: str | None = None
     cable_conflict_policy: str = "skip"
     mark_stale_offline: bool = True
+    # How long a client may be absent from the active list before it is
+    # marked offline. Compared to UniFi last_seen, not to "missing from
+    # /stat/sta right now". Default 7 days, so a laptop over a weekend or a
+    # phone that slept is left active. 0 disables the grace.
+    stale_offline_grace_seconds: float = 7 * 24 * 3600
     metrics_file: str | None = None
     # "require" (default, safe): fail if a site slug doesn't already exist.
     # "create": create a minimal site if missing; an existing site's
@@ -256,8 +293,13 @@ class Settings:
             client_manufacturer_slug=os.environ.get("CLIENT_MANUFACTURER_SLUG", "generic"),
             client_device_type_slug=os.environ.get("CLIENT_DEVICE_TYPE_SLUG", "generic-network-client"),
             port_name_templates=port_name_templates,
+            port_model_templates=parse_model_templates(os.environ.get("PORT_MODEL_TEMPLATES", "")),
+            cable_skip_report=os.environ.get("CABLE_SKIP_REPORT") or None,
             cable_conflict_policy=os.environ.get("CABLE_CONFLICT_POLICY", "skip"),
             mark_stale_offline=_bool(os.environ.get("MARK_STALE_OFFLINE", "true")),
+            stale_offline_grace_seconds=_duration_seconds(
+                os.environ.get("STALE_OFFLINE_GRACE", "7d"), "STALE_OFFLINE_GRACE"
+            ),
             metrics_file=os.environ.get("METRICS_FILE") or None,
             site_match=os.environ.get("SITE_MATCH", "normalized"),
             site_policy=os.environ.get("SITE_POLICY", "require"),

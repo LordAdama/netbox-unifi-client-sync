@@ -123,6 +123,31 @@ def test_from_env_loads_dotenv_file_without_shell_parsing(tmp_path, monkeypatch)
     assert settings.site_map == {"hq": "headquarters", "branch": "branch-office"}
 
 
+def test_from_env_parses_port_model_templates_grace_and_skip_report(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("PORT_MODEL_TEMPLATES", "USW-Pro-48=Gi1/0/{port};SFP {sfp}")
+    monkeypatch.setenv("STALE_OFFLINE_GRACE", "24h")
+    monkeypatch.setenv("CABLE_SKIP_REPORT", "/tmp/cable-skips.csv")
+
+    settings = Settings.from_env()
+
+    assert settings.port_model_templates["USWPRO48"] == ["Gi1/0/{port}", "SFP {sfp}"]
+    assert settings.stale_offline_grace_seconds == 24 * 3600
+    assert settings.cable_skip_report == "/tmp/cable-skips.csv"
+
+
+def test_from_env_rejects_a_bad_grace_period(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("STALE_OFFLINE_GRACE", "two days")
+
+    with pytest.raises(SystemExit):
+        Settings.from_env()
+
+
 def test_from_env_prefers_real_environment_over_dotenv_file(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("UNIFI_HOST=https://from-dotenv\n")
     monkeypatch.setenv("UNIFI_HOST", "https://from-real-env")

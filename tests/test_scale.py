@@ -48,7 +48,9 @@ def test_switch_lookup_happens_once_per_switch_not_once_per_client():
     assert uncached.calls["find_switch_device_by_mac"] == PORTS
     assert counting.calls["find_switch_device_by_mac"] == 1
     # Per-port lookups collapse into a single interface list for the switch.
-    assert uncached.calls["find_interface_by_name_candidates"] == PORTS
+    # Matching is done against that list, so the per-name lookup is not used.
+    assert uncached.calls["find_interface_by_name_candidates"] == 0
+    assert uncached.calls["list_device_interfaces"] == PORTS
     assert counting.calls["find_interface_by_name_candidates"] == 0
     assert counting.calls["list_device_interfaces"] == 1
 

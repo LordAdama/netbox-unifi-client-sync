@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field
 from itertools import count
 
-from unifi_netbox_sync.models import UnifiClient, UnifiSite, UnifiSwitchDevice
+from unifi_netbox_sync.models import UnifiClient, UnifiKnownClient, UnifiSite, UnifiSwitchDevice
 
 _id_counter = count(1)
 
@@ -481,12 +482,20 @@ class FakeUnifiClient:
         by_site: dict[str, list[UnifiClient]] | None = None,
         devices_by_site: dict[str, list[UnifiSwitchDevice]] | None = None,
         sites: list[UnifiSite] | None = None,
+        known: list[UnifiKnownClient] | None = None,
+        known_by_site: dict[str, list[UnifiKnownClient]] | None = None,
+        known_error: BaseException | None = None,
     ) -> None:
         self._clients = clients or []
         self._devices = devices or []
         self._by_site = by_site
         self._devices_by_site = devices_by_site
         self._sites = sites
+        # None means "derive from the active clients, seen just now". An
+        # explicit list, including [], is what the controller returned.
+        self._known = known
+        self._known_by_site = known_by_site
+        self._known_error = known_error
 
     def get_sites(self) -> list[UnifiSite]:
         if self._sites is not None:
@@ -498,6 +507,16 @@ class FakeUnifiClient:
         if self._by_site is not None:
             return self._by_site.get(site, [])
         return self._clients
+
+    def get_known_clients(self, site: str) -> list[UnifiKnownClient]:
+        if self._known_error is not None:
+            raise self._known_error
+        if self._known_by_site is not None:
+            return list(self._known_by_site.get(site, []))
+        if self._known is not None:
+            return list(self._known)
+        now = time.time()
+        return [UnifiKnownClient(mac=client.mac, last_seen=now) for client in self.get_clients(site)]
 
     def get_devices(self, site: str) -> list[UnifiSwitchDevice]:
         if self._devices_by_site is not None:

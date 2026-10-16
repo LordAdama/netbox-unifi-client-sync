@@ -28,9 +28,12 @@ For every active client the UniFi controller reports:
 - For **wireless** clients, records the connection without creating a
   cable (there isn't one).
 - Optionally marks client devices **this tool created** (tagged `unifi-sync`
-  and using the client role) as `offline` when UniFi stops reporting them.
+  and using the client role) as `offline` when their UniFi `last_seen` is
+  older than `STALE_OFFLINE_GRACE` (default 7 days). Dropping out of the
+  active client list is not enough — that is how an idle phone looks.
   It never deletes them, and it does not offline infrastructure devices or
-  anything that does not carry that tag.
+  anything that does not carry that tag. The status write does not rewrite
+  the rest of the device.
 
 Your UniFi hardware — switches, APs, gateways — can be created too, with
 `SYNC_UNIFI_DEVICES=true` (off by default; see "Syncing UniFi devices"). With
@@ -48,15 +51,22 @@ shares a MAC or a switch port with something UniFi reports.
 | UniFi side | NetBox side |
 | --- | --- |
 | Switch MAC address | Four strategies, first match wins — see "Finding your switches" |
-| Switch port index (`sw_port`) | Looked up on the matched switch device by trying each of `PORT_NAME_TEMPLATES` in order (e.g. `"4"`, `"Port 4"`, `"GE4"`, `"Gi4"`) until one matches an existing interface name |
+| Switch port index (`sw_port`) | Looked up on the matched switch by `PORT_MODEL_TEMPLATES` (if this UniFi model has any), then `PORT_NAME_TEMPLATES` (`"Port 4"`, `"4"`, `"GE4"`, `"Gi4"`, …). Comparison ignores case and leading zeros. If nothing hits and the model has no templates of its own, a unique structural match is used: `Gi1/0/4`, `1/1/4`, `ge-0/0/4`, `Ethernet1/4`, and an SFP ordinal such as `SFP 1` when the controller says that index is an SFP |
 | Client MAC address | Stored in a `unifi_mac` custom field on the NetBox client device, created automatically on first run |
 
 If a switch or matching port can't be found, the client device is still
-synced — only the cable is skipped, and the reason is logged and included
-in the run summary. Every switch/port match (including which of the
-candidate name templates matched) and every ambiguous match (a MAC that
-appears on more than one NetBox interface) is logged at INFO/WARNING for
-troubleshooting.
+synced — only the cable is skipped. Every skip is one log line (site,
+switch, UniFi port, names tried, the NetBox interface names, and a reason)
+and the run ends with a count by reason. Set `CABLE_SKIP_REPORT` to also
+write that table as a CSV; dry-run writes the file too, because it is not
+a NetBox change. A port that more than one wired client shares, and a port
+the controller marks as an uplink, is never cabled: that is an uplink or
+an unmanaged switch, not a drop to one device.
+
+Every switch/port match (including whether a template or a structural name
+matched) and every ambiguous match (a MAC that appears on more than one
+NetBox interface, or two interfaces that parse to the same port) is logged
+at INFO/WARNING for troubleshooting.
 
 ## Syncing UniFi devices (switches, APs, gateways)
 
@@ -134,7 +144,10 @@ NetBox device the same as UniFi does is usually all that's needed.**
 If a switch still can't be found, the run logs a warning naming it and
 listing what was tried. If the switch is found but a port isn't, the warning
 lists the interface names that device actually has next to the ones that were
-looked for — set `PORT_NAME_TEMPLATES` to match.
+looked for — once per switch, with every individual skip in the summary and
+in `CABLE_SKIP_REPORT`. Slot/module and Juniper names match on their own.
+Set `PORT_MODEL_TEMPLATES` when two interfaces would both match (two stack
+members ending in the same port number) and the run reports `port_ambiguous`.
 
 ## Manufacturers
 
@@ -336,14 +349,17 @@ full list and defaults. Key ones:
 | `DEVICE_UPDATE_POLICY` | `create-only` (default) or `sync` — see "Site & update policies" |
 | `NETBOX_TIMEOUT` / `UNIFI_TIMEOUT` | Per-request HTTP timeouts in seconds (default `30`). A NetBox call with no timeout is what hung a run indefinitely |
 | `NETBOX_IP_STATUS` | Status set on IP addresses this tool creates (default `active`) |
-| `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order; blank uses the built-in list |
+| `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order; blank uses the built-in list. `{port}` is the UniFi index, `{port2}` zero-pads it, `{sfp}` is the SFP ordinal |
+| `PORT_MODEL_TEMPLATES` | Per UniFi model, tried first. Example: `USW-Pro-48=Gi1/0/{port};SFP {sfp}`. Separate models with a vertical bar. A model listed here does not get the structural guess |
+| `CABLE_SKIP_REPORT` | Path of a CSV listing every skipped cable (site, switch, UniFi port, names tried, NetBox interfaces, reason). Blank logs the same rows and a count by reason without writing a file |
 | `SYNC_UNIFI_DEVICES` | Create adopted UniFi switches/APs/gateways in NetBox (default `false`) — see "Syncing UniFi devices" |
 | `DEVICETYPE_LIBRARY_PATH` | Local devicetype-library clone, for canonical model names/part numbers |
 | `UNIFI_DEVICE_ROLE_SLUG` | Role for created UniFi devices of unrecognised type (default `network-device`) |
 | `USE_OUI_MANUFACTURER` | Give clients a device type carrying their real vendor (default `true`) — see "Manufacturers" |
 | `OUI_FILE` | Optional IEEE `oui.txt` / Wireshark `manuf` file, used only when the controller reports no vendor |
 | `CABLE_CONFLICT_POLICY` | `skip` (default) or `replace`. `replace` only deletes cables tagged `SYNC_TAG`; manual cables stay |
-| `MARK_STALE_OFFLINE` | Mark **managed** client devices (sync tag + client role) no longer seen by UniFi as `offline`. Infrastructure devices and untagged objects are never changed |
+| `MARK_STALE_OFFLINE` | Mark **managed** client devices (sync tag + client role) offline when UniFi `last_seen` is older than `STALE_OFFLINE_GRACE`. Absence from the active list is not enough. Infrastructure devices and untagged objects are never changed. The write is status only |
+| `STALE_OFFLINE_GRACE` | How long a client may be idle before that offline mark. `7d` (default), `24h`, `30m`, or a number of seconds. `0` disables the grace. Randomized phone MACs use the same window |
 | `DRY_RUN` | `true` (default). Log every intended create/update/delete and write nothing. `false` or `--apply` writes |
 | `LOG_FORMAT` | `text` (default) or `json` — one JSON object per log line, for log shippers |
 | `METRICS_FILE` | If set, write Prometheus textfile-collector metrics to this path after every run |
@@ -578,16 +594,26 @@ level, for each distinct switch:
   nothing to cable to. The run skips the cable and does not create
   interfaces.
 - *"UniFi port N on 'X' matched no NetBox interface. Looked for […]; that
-  device's interfaces are named […]"* — a naming mismatch. Copy a pattern
-  from the reported names into `PORT_NAME_TEMPLATES`, e.g. for Junos-style
-  `ge-0/0/1` ports:
+  device's interfaces are named […]"* — a naming mismatch. The same rows are
+  counted by reason at the end of the run. Set `CABLE_SKIP_REPORT` for the
+  full table. `Gi1/0/4`, `1/1/4`, `ge-0/0/4`, zero-padded names, and SFP
+  ordinals are matched already. When the reason is `port_ambiguous` (two
+  interfaces parse to the same port), pin the model:
 
   ```bash
-  PORT_NAME_TEMPLATES=ge-0/0/{port}
+  PORT_MODEL_TEMPLATES=USW-Pro-48=Gi1/0/{port};SFP {sfp}
   ```
 
+  A model with templates does not also take a structural guess, so a wrong
+  stack member cannot win.
+- *"port N on X is shared by multiple wired clients"* — more than one client
+  is on that switch port (an uplink, or an unmanaged switch behind an AP).
+  None of them is cabled. A port the controller marks `is_uplink` is skipped
+  even when only one client is on it. An existing cable is left in place.
+
 Dry-run emits exactly the same diagnostics a real run would, so you can
-resolve all of this before writing anything.
+resolve all of this before writing anything. The skip CSV is written during
+dry-run when `CABLE_SKIP_REPORT` is set.
 
 **A device or site name looks wrong in the plan.** Device names are
 sanitized and de-duplicated per site (see "What it does"); site slugs under
@@ -626,8 +652,9 @@ for something bigger:
 - **One site cannot abort the others.** A failure while syncing a site —
   including an unexpected exception — is logged, recorded on that site, and
   the run continues. Stale-offline marking for a NetBox site is skipped when
-  any of the UniFi sites mapped to it failed, because a partial client list
-  is not evidence that a device is gone. Per-client handling is still narrow:
+  any of the UniFi sites mapped to it failed, or when client history
+  (`last_seen`) could not be read, because a partial client list is not
+  evidence that a device is gone. Per-client handling is still narrow:
   expected network/API failures (`requests`, `pynetbox.RequestError`,
   `LookupError`) are recorded and the next client runs. Anything else fails
   the rest of that site only.
@@ -651,10 +678,16 @@ sites, rename devices, or replace cables:
 3. For a NetBox site you renamed, either let the dry-run's name match record
    `unifi_site_id` on the next real run, or set that custom field yourself to
    the UniFi site id before applying. Do not rely on the old slug.
-4. Apply with `DRY_RUN=false` or `--apply` only after that plan is what you
+4. Set `CABLE_SKIP_REPORT` and read the counts. `port_not_found` rows still
+   need a `PORT_MODEL_TEMPLATES` entry. `shared_port` and `uplink_port` rows
+   are intentional. `port_ambiguous` rows need a model template that names
+   one of the two interfaces. Offline marks follow `last_seen` and
+   `STALE_OFFLINE_GRACE` (default 7 days), not "missing from the active list".
+5. Apply with `DRY_RUN=false` or `--apply` only after that plan is what you
    want. `DEVICE_UPDATE_POLICY=sync` and `CABLE_CONFLICT_POLICY=replace`
    overwrite manual edits of tagged objects; leave them at the defaults
-   unless that is deliberate.
+   unless that is deliberate. This run does not delete a cable it previously
+   created on a shared port; it only stops adding new ones.
 
 The long-running container writes `/tmp/last-sync-ok` only when a run exits 0,
 which means it finished and recorded no site or client errors. A timed-out
@@ -681,7 +714,10 @@ every push/PR.
 ## Design notes
 
 - `unifi_client.py` — thin REST client for the UniFi controller (login,
-  active clients, infrastructure devices).
+  active clients, client history with `last_seen`, infrastructure devices).
+- `portmatch.py` — UniFi port index to NetBox interface name: templates,
+  per-model templates, and structural names (slot/module, Juniper, SFP).
+- `staleness.py` — offline decision from `last_seen` and the grace window.
 - `netbox_client.py` — `NetboxGateway` defines the interface the sync
   engine depends on; `PynetboxGateway` is the real implementation backed by
   [pynetbox](https://github.com/netbox-community/pynetbox). Tests substitute
@@ -695,12 +731,15 @@ every push/PR.
   caught and recorded as an error for that site without stopping the others.
   Per-client network/API errors are caught inside the site (see "Known
   limitations"). Stale-device marking is deliberately *not* done inside
-  `_run_site()`: `run()` first groups every pair's `seen_macs` by NetBox
-  site slug (so two pairs sharing a slug get the union, not each other's
-  false positives), then marks stale **client** devices once per distinct
-  slug — skipping any slug whose pair(s) included a failure, since acting
-  on an incomplete client list risks false offlines. Only devices tagged
-  `SYNC_TAG` with the client role are eligible.
+  `_run_site()`: `run()` first groups every pair's `seen_macs` and
+  `last_seen` history by NetBox site slug (so two pairs sharing a slug get
+  the union, not each other's false positives), then marks stale **client**
+  devices once per distinct slug — skipping any slug whose pair(s) included
+  a failure or whose client history could not be read, since acting on an
+  incomplete client list risks false offlines. A device still inside
+  `STALE_OFFLINE_GRACE` of its UniFi `last_seen` stays active, including a
+  randomized phone MAC. Only devices tagged `SYNC_TAG` with the client role
+  are eligible, and the status write patches status alone.
 - `caching.py` — `CachingNetboxGateway`, a run-scoped read cache wrapping
   any gateway. Caches only what's stable for a run (sites, switches, switch
   interfaces); deliberately does *not* cache client-device or name-collision

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import csv
 import logging
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pynetbox
 import requests
@@ -11,10 +16,19 @@ import requests
 from .config import Settings
 from .devicetype_library import DeviceTypeLibrary, spec_from_unifi_device
 from .metrics import log_json_summary, write_prometheus_textfile
-from .models import ClientSyncResult, SitePair, SiteSyncStats, SyncSummary, UnifiClient
+from .models import CableSkip, ClientSyncResult, SitePair, SiteSyncStats, SyncSummary, UnifiClient
 from .naming import mac_suffixed_name, sanitize_device_name, slugify
 from .netbox_client import UNIFI_SITE_ID_FIELD, NetboxGateway, SwitchHints, device_has_tag, site_unifi_id
 from .oui import OuiLookup, is_locally_administered
+from .portmatch import (
+    candidate_names,
+    coerce_port,
+    is_uplink_port,
+    match_port,
+    sfp_ordinal,
+    templates_for_model,
+)
+from .staleness import format_grace, offline_decision
 from .unifi_client import UnifiClientAPI
 
 logger = logging.getLogger(__name__)
@@ -43,6 +57,105 @@ def _primary_ip_matches(device: object, ip: str) -> bool:
         return False
     address = getattr(primary, "address", primary)
     return str(address).split("/")[0] == ip.split("/")[0]
+
+
+@dataclass
+class _CableContext:
+    unifi_site: str
+    netbox_site: str
+    shared_ports: set[tuple[str, int]]
+
+
+@dataclass
+class _ResolvedCable:
+    switch_device: object
+    switch_iface: object
+    names_tried: list[str]
+    netbox_names: list[str]
+
+
+def _shared_switch_ports(clients: list[UnifiClient]) -> set[tuple[str, int]]:
+    """Switch ports that have more than one wired client this run.
+
+    A single physical port cannot be a dedicated cable to several devices.
+    That pattern is an uplink, or an unmanaged switch (often behind an AP),
+    and cabling any of the clients to it invents a connection.
+    """
+    counts: dict[tuple[str, int], int] = {}
+    for client in clients:
+        if not client.is_wired or not client.switch_mac or client.switch_port is None:
+            continue
+        port = coerce_port(client.switch_port)
+        if port is None:
+            continue
+        key = (client.switch_mac.lower(), port)
+        counts[key] = counts.get(key, 0) + 1
+    return {key for key, count in counts.items() if count > 1}
+
+
+def _merge_last_seen(dest: dict[str, float | None], src: dict[str, float | None]) -> None:
+    for mac, seen in src.items():
+        if mac not in dest:
+            dest[mac] = seen
+            continue
+        current = dest[mac]
+        if seen is None:
+            continue
+        if current is None or seen > current:
+            dest[mac] = seen
+
+
+def _classify_cable_reason(detail: str) -> str:
+    text = detail.lower()
+    if "not tagged" in text:
+        return "unmanaged_cable"
+    if "already cabled" in text:
+        return "already_cabled"
+    if "no interface" in text:
+        return "no_interfaces"
+    return "cable_conflict"
+
+
+def _format_last_seen(epoch: float | None) -> str:
+    if epoch is None:
+        return "unknown"
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+_CABLE_SKIP_FIELDS = (
+    "site",
+    "netbox_site",
+    "switch",
+    "switch_mac",
+    "unifi_port",
+    "names_tried",
+    "netbox_interfaces",
+    "reason",
+)
+
+
+def _write_cable_skip_report(path: str, skips: list[CableSkip]) -> None:
+    dest = Path(path)
+    if dest.parent and str(dest.parent) not in ("", "."):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CABLE_SKIP_FIELDS)
+        writer.writeheader()
+        for skip in skips:
+            writer.writerow(
+                {
+                    "site": skip.unifi_site,
+                    "netbox_site": skip.netbox_site,
+                    "switch": skip.switch,
+                    "switch_mac": skip.switch_mac,
+                    "unifi_port": skip.unifi_port,
+                    "names_tried": skip.names_tried,
+                    "netbox_interfaces": skip.netbox_interfaces,
+                    "reason": skip.reason,
+                }
+            )
+    tmp.replace(dest)
 
 
 def _already_cabled_to(interface: object, peer_interface: object) -> bool:
@@ -74,6 +187,7 @@ def _merge_summaries(summaries: list[SyncSummary]) -> SyncSummary:
         merged.errors.extend(s.errors or [])
         merged.client_results.extend(s.client_results or [])
         merged.site_stats.extend(s.site_stats or [])
+        merged.cable_skips.extend(s.cable_skips or [])
     return merged
 
 
@@ -102,8 +216,11 @@ class SyncEngine:
     client's sites that way.
 
     Also assumes the UniFi controller returns its full active-client list in
-    one `/stat/sta` call per site (true for the classic controller API this
-    client uses); there is no pagination handling.
+    one `/stat/sta` call per site, and client history in one `/stat/alluser`
+    call (true for the classic controller API this client uses); there is no
+    pagination handling. Offline marking compares `last_seen` from that
+    history to `STALE_OFFLINE_GRACE` and does nothing when the history read
+    fails.
     """
 
     def __init__(self, unifi: UnifiClientAPI, netbox: NetboxGateway, settings: Settings) -> None:
@@ -119,6 +236,9 @@ class SyncEngine:
         self._hints_lock = threading.Lock()
         # One warning per switch, not one per client behind it.
         self._warned_switches: set[str] = set()
+        # Port-name warnings are also once per switch. Every skipped cable is
+        # still recorded on the run summary and, when configured, the CSV.
+        self._warned_ports: set[str] = set()
         # UniFi site id -> human label, for matching NetBox sites by name.
         self._site_labels: dict[str, str] = {}
         # Conflicts found while linking sites. Merged into the run summary so
@@ -247,10 +367,25 @@ class SyncEngine:
             summary.duration_seconds,
             len(pairs),
         )
+        self._log_cable_skips(summary)
         log_json_summary(summary)
         if self.settings.metrics_file:
             write_prometheus_textfile(summary, self.settings.metrics_file)
         return summary
+
+    def _log_cable_skips(self, summary: SyncSummary) -> None:
+        skips = summary.cable_skips or []
+        if skips:
+            counts = Counter(skip.reason for skip in skips)
+            logger.warning(
+                "Cable skips by reason: %s",
+                ", ".join(f"{reason}={count}" for reason, count in sorted(counts.items())),
+            )
+        path = self.settings.cable_skip_report
+        if not path:
+            return
+        _write_cable_skip_report(path, skips)
+        logger.info("Wrote cable skip report to %s (%d row(s))", path, len(skips))
 
     def _link_existing_sites(self, pairs: list[SitePair]) -> list[SitePair]:
         """Bind each pair to the NetBox site that already represents it.
@@ -365,12 +500,14 @@ class SyncEngine:
         """Sync every UniFi site mapped to one NetBox site, then stale-mark once."""
         summaries: list[SyncSummary] = []
         seen_macs: set[str] = set()
+        known_last_seen: dict[str, float | None] = {}
+        history_ok = True
         any_pair_failed = False
 
         for pair in pairs:
             pair_start = time.monotonic()
             try:
-                pair_summary, pair_macs = self._run_site(pair)
+                pair_summary, pair_macs, pair_known, pair_history_ok = self._run_site(pair)
                 pair_summary.site_stats = [
                     SiteSyncStats(
                         unifi_site=pair.unifi_site,
@@ -385,6 +522,8 @@ class SyncEngine:
                 ]
                 summaries.append(pair_summary)
                 seen_macs.update(pair_macs)
+                _merge_last_seen(known_last_seen, pair_known)
+                history_ok = history_ok and pair_history_ok
             except Exception as exc:
                 # Isolate the site. A missing site, a timed-out HTTP call, or
                 # a programming error in one site must not abort the others or
@@ -413,21 +552,28 @@ class SyncEngine:
         group = _merge_summaries(summaries)
 
         if self.settings.mark_stale_offline:
-            if any_pair_failed:
-                # seen_macs is incomplete for this NetBox site, so marking now
-                # could offline devices a failed pair would have reported as
-                # active. Not knowing a client is not the same as it being gone.
+            if any_pair_failed or not history_ok:
+                # seen_macs or last_seen is incomplete for this NetBox site, so
+                # marking now could offline a client that is only idle, or one
+                # a failed pair would have reported. Not knowing is not the
+                # same as the device being gone.
                 logger.warning(
-                    "Skipping stale-device marking for NetBox site '%s': a mapped UniFi site "
-                    "failed to sync this run",
+                    "Skipping stale-device marking for NetBox site '%s': %s",
                     netbox_site_slug,
+                    "a mapped UniFi site failed to sync this run"
+                    if any_pair_failed
+                    else "UniFi client history (last_seen) was not available",
                 )
             else:
-                group.stale_marked_offline = self._mark_stale(netbox_site_slug, seen_macs)
+                group.stale_marked_offline = self._mark_stale(
+                    netbox_site_slug, seen_macs, known_last_seen
+                )
 
         return group
 
-    def _run_site(self, pair: SitePair) -> tuple[SyncSummary, set[str]]:
+    def _run_site(
+        self, pair: SitePair
+    ) -> tuple[SyncSummary, set[str], dict[str, float | None], bool]:
         """Syncs one pair's clients. Stale marking is the group's job, not this."""
         summary = SyncSummary()
         s = self.settings
@@ -472,6 +618,25 @@ class SyncEngine:
         clients = self.unifi.get_clients(pair.unifi_site)
         summary.clients_seen = len(clients)
         seen_macs: set[str] = set()
+        known_last_seen, history_ok = self._load_known_clients(pair.unifi_site)
+        if history_ok and not known_last_seen and clients:
+            # An empty history next to a non-empty active list means the
+            # history endpoint returned nothing useful. Treating every client
+            # that is merely idle as gone is the failure this grace exists
+            # to stop.
+            logger.warning(
+                "UniFi site '%s' has %d active client(s) but no last_seen history; "
+                "skipping offline marking so idle clients are not marked offline",
+                pair.unifi_site,
+                len(clients),
+            )
+            history_ok = False
+        shared_ports = _shared_switch_ports(clients)
+        cable_ctx = _CableContext(
+            unifi_site=pair.unifi_site,
+            netbox_site=slug,
+            shared_ports=shared_ports,
+        )
         logger.info(
             "Syncing %d client(s) for UniFi site '%s' -> NetBox '%s'",
             len(clients),
@@ -485,7 +650,7 @@ class SyncEngine:
                 logger.info(
                     "Site '%s': processed %d/%d clients", pair.unifi_site, index, len(clients)
                 )
-            result = self._sync_client(client, slug)
+            result = self._sync_client(client, slug, cable_ctx)
             summary.client_results.append(result)
             if result.error:
                 summary.errors.append(f"{pair.unifi_site}/{client.mac}: {result.error}")
@@ -506,6 +671,8 @@ class SyncEngine:
                 summary.cables_created += 1
             elif result.cable_skipped_reason:
                 summary.cables_skipped += 1
+                if result.cable_skip is not None:
+                    summary.cable_skips.append(result.cable_skip)
 
         logger.info(
             "Site '%s' -> NetBox '%s': %d clients, %d created, %d updated, %d unchanged, "
@@ -519,7 +686,7 @@ class SyncEngine:
             summary.cables_created,
             summary.cables_skipped,
         )
-        return summary, seen_macs
+        return summary, seen_macs, known_last_seen, history_ok
 
     def _load_switch_hints(self, unifi_site: str) -> None:
         """Record each UniFi device's name/serial, keyed by MAC.
@@ -543,7 +710,10 @@ class SyncEngine:
             for device in devices:
                 if device.mac:
                     self._switch_hints[device.mac] = SwitchHints(
-                        name=device.name, serial=device.serial, model=device.model
+                        name=device.name,
+                        serial=device.serial,
+                        model=device.model,
+                        ports=tuple(device.ports),
                     )
         logger.info("Loaded %d UniFi device(s) for site '%s' to match switches by name/serial",
                     len(devices), unifi_site)
@@ -656,21 +826,27 @@ class SyncEngine:
             f" (named {hints.name!r} in UniFi)" if hints and hints.name else "",
         )
 
-    def _log_port_mismatch(self, switch_device: object, port: object, candidates: list[str]) -> None:
-        """Say what the switch's ports are actually called.
+    def _log_port_mismatch(
+        self,
+        switch_device: object,
+        port: object,
+        candidates: list[str],
+        names: list[str],
+        *,
+        ambiguous: list[str] | None = None,
+    ) -> None:
+        """Say what the switch's ports are actually called, once per switch.
 
-        A port-name mismatch is otherwise near-impossible to diagnose from the
-        outside: the run just reports skipped cables. Printing the real names
-        next to what we looked for turns it into an obvious PORT_NAME_TEMPLATES fix.
+        Every skipped cable is recorded on the run summary (and the CSV when
+        configured). Repeating this warning per client buried the one fact an
+        operator needs: the names that switch actually uses.
         """
-        lister = getattr(self.netbox, "list_device_interfaces", None)
-        if lister is None:
-            return
-        try:
-            names = sorted(iface.name for iface in lister(switch_device))
-        except EXPECTED_CLIENT_ERRORS:
-            return
         device_name = getattr(switch_device, "name", "?")
+        key = str(getattr(switch_device, "id", None) or device_name)
+        with self._hints_lock:
+            if key in self._warned_ports:
+                return
+            self._warned_ports.add(key)
         if not names:
             logger.warning(
                 "NetBox device %r has no interfaces, so cables for UniFi port %s are skipped. "
@@ -680,10 +856,23 @@ class SyncEngine:
                 port,
             )
             return
+        if ambiguous:
+            logger.warning(
+                "UniFi port %s on %r matched more than one NetBox interface (%s). "
+                "Looked for %s; that device's interfaces are named %s%s. "
+                "Pin the scheme with PORT_MODEL_TEMPLATES. No cable will be created.",
+                port,
+                device_name,
+                ambiguous,
+                candidates,
+                names[:12],
+                f" (+{len(names) - 12} more)" if len(names) > 12 else "",
+            )
+            return
         logger.warning(
             "UniFi port %s on %r matched no NetBox interface. Looked for %s; that device's "
-            "interfaces are named %s%s. Set PORT_NAME_TEMPLATES to match. No interface will "
-            "be created.",
+            "interfaces are named %s%s. Set PORT_NAME_TEMPLATES or PORT_MODEL_TEMPLATES to match. "
+            "No interface will be created. Every skipped cable is listed in the run summary.",
             port,
             device_name,
             candidates,
@@ -738,7 +927,9 @@ class SyncEngine:
             return disambiguated
         return base_name
 
-    def _sync_client(self, client: UnifiClient, netbox_site_slug: str) -> ClientSyncResult:
+    def _sync_client(
+        self, client: UnifiClient, netbox_site_slug: str, cable_ctx: _CableContext
+    ) -> ClientSyncResult:
         result = ClientSyncResult(mac=client.mac, name=client.display_name)
         s = self.settings
         iface_name = _interface_name(client)
@@ -763,7 +954,7 @@ class SyncEngine:
             result.name = device_name
 
             if s.dry_run:
-                self._plan_client(client, existing, result, netbox_site_slug)
+                self._plan_client(client, existing, result, netbox_site_slug, cable_ctx)
                 return result
 
             device, created, update_skipped, updated = self.netbox.upsert_client_device(
@@ -816,7 +1007,7 @@ class SyncEngine:
 
             cable_wrote = False
             if client.is_wired and client.switch_mac and client.switch_port:
-                cable_wrote = self._wire_cable(client, iface, result)
+                cable_wrote = self._wire_cable(client, iface, result, cable_ctx)
 
             result.unchanged = not (created or updated or ip_wrote or cable_wrote)
         except EXPECTED_CLIENT_ERRORS as exc:
@@ -847,6 +1038,7 @@ class SyncEngine:
         existing: object | None,
         result: ClientSyncResult,
         netbox_site_slug: str,
+        cable_ctx: _CableContext,
     ) -> None:
         """Log every write this client would cause. Performs no NetBox writes."""
         iface_name = _interface_name(client)
@@ -904,61 +1096,55 @@ class SyncEngine:
                 s.device_update_policy,
             )
         if client.is_wired and client.switch_mac and client.switch_port:
-            switch_device = self.netbox.find_switch_device_by_mac(
-                client.switch_mac, self._hints_for(client.switch_mac)
-            )
-            if switch_device is None:
-                result.cable_skipped_reason = (
-                    f"switch {client.switch_mac} not found in NetBox (port {client.switch_port})"
-                )
-                # Same diagnostics as a real run: a preview reporting "N cables
-                # skipped" without saying why is the one thing an operator
-                # cannot act on.
-                self._log_switch_not_found(client.switch_mac)
-                return
-            candidates = [t.format(port=client.switch_port) for t in self.settings.port_name_templates]
-            switch_iface = self.netbox.find_interface_by_name_candidates(switch_device, candidates)
-            if switch_iface is None:
-                result.cable_skipped_reason = (
-                    f"no interface on {switch_device.name} matched {candidates}"
-                )
-                self._log_port_mismatch(switch_device, client.switch_port, candidates)
+            resolved = self._resolve_cable(client, result, cable_ctx)
+            if resolved is None:
                 return
             existing_iface = None
             if existing is not None:
                 interfaces = getattr(existing, "interfaces", None) or {}
                 existing_iface = interfaces.get(iface_name) if isinstance(interfaces, dict) else None
-            if existing_iface is not None and _already_cabled_to(existing_iface, switch_iface):
+            if existing_iface is not None and _already_cabled_to(existing_iface, resolved.switch_iface):
                 result.cable_unchanged = True
                 logger.info(
                     "[dry-run] cable %s:%s -- %s:%s already in place",
                     result.name,
                     iface_name,
-                    switch_device.name,
-                    switch_iface.name,
+                    resolved.switch_device.name,
+                    resolved.switch_iface.name,
                 )
                 return
-            if getattr(switch_iface, "cable", None) and s.cable_conflict_policy != "replace":
-                result.cable_skipped_reason = (
-                    f"interface {switch_device.name}:{switch_iface.name} is already cabled "
-                    "to something else"
+            if getattr(resolved.switch_iface, "cable", None) and s.cable_conflict_policy != "replace":
+                detail = (
+                    f"interface {resolved.switch_device.name}:{resolved.switch_iface.name} is already "
+                    "cabled to something else"
+                )
+                self._record_cable_skip(
+                    result,
+                    cable_ctx,
+                    reason="already_cabled",
+                    detail=detail,
+                    switch_mac=client.switch_mac,
+                    switch_name=resolved.switch_device.name,
+                    port=client.switch_port,
+                    names_tried=resolved.names_tried,
+                    netbox_names=resolved.netbox_names,
                 )
                 logger.info(
                     "[dry-run] would skip cable %s:%s -- %s:%s; target is already cabled "
                     "(CABLE_CONFLICT_POLICY=%s)",
                     result.name,
                     iface_name,
-                    switch_device.name,
-                    switch_iface.name,
+                    resolved.switch_device.name,
+                    resolved.switch_iface.name,
                     s.cable_conflict_policy,
                 )
                 return
-            if getattr(switch_iface, "cable", None) and s.cable_conflict_policy == "replace":
+            if getattr(resolved.switch_iface, "cable", None) and s.cable_conflict_policy == "replace":
                 logger.info(
                     "[dry-run] would delete and replace the cable on %s:%s for %s:%s "
                     "(only if that cable is tagged %r)",
-                    switch_device.name,
-                    switch_iface.name,
+                    resolved.switch_device.name,
+                    resolved.switch_iface.name,
                     result.name,
                     iface_name,
                     s.sync_tag,
@@ -968,53 +1154,69 @@ class SyncEngine:
                     "[dry-run] would create cable %s:%s -- %s:%s",
                     result.name,
                     iface_name,
-                    switch_device.name,
-                    switch_iface.name,
+                    resolved.switch_device.name,
+                    resolved.switch_iface.name,
                 )
             result.cable_created = True
 
-    def _wire_cable(self, client: UnifiClient, iface: object, result: ClientSyncResult) -> bool:
+    def _wire_cable(
+        self,
+        client: UnifiClient,
+        iface: object,
+        result: ClientSyncResult,
+        cable_ctx: _CableContext,
+    ) -> bool:
         """Returns True if a cable was actually written."""
-        switch_device = self.netbox.find_switch_device_by_mac(
-            client.switch_mac, self._hints_for(client.switch_mac)
-        )
-        if switch_device is None:
-            result.cable_skipped_reason = (
-                f"switch {client.switch_mac} not found in NetBox (port {client.switch_port})"
-            )
-            self._log_switch_not_found(client.switch_mac)
-            return False
-        candidates = [t.format(port=client.switch_port) for t in self.settings.port_name_templates]
-        switch_iface = self.netbox.find_interface_by_name_candidates(switch_device, candidates)
-        if switch_iface is None:
-            result.cable_skipped_reason = (
-                f"no interface on {switch_device.name} matched {candidates}"
-            )
-            self._log_port_mismatch(switch_device, client.switch_port, candidates)
+        resolved = self._resolve_cable(client, result, cable_ctx)
+        if resolved is None:
             return False
         # The interface came straight from ensure_interface, so its cable state
         # is current for this run — if it already points at the right port
         # there is nothing to write and nothing to re-read.
-        if _already_cabled_to(iface, switch_iface):
+        if _already_cabled_to(iface, resolved.switch_iface):
             result.cable_unchanged = True
             return False
         created, reason = self.netbox.ensure_cable(
-            iface, switch_iface, self.settings.cable_conflict_policy, self.settings.sync_tag
+            iface,
+            resolved.switch_iface,
+            self.settings.cable_conflict_policy,
+            self.settings.sync_tag,
         )
         result.cable_created = created
-        result.cable_skipped_reason = reason
+        if reason:
+            self._record_cable_skip(
+                result,
+                cable_ctx,
+                reason=_classify_cable_reason(reason),
+                detail=reason,
+                switch_mac=client.switch_mac or "",
+                switch_name=getattr(resolved.switch_device, "name", ""),
+                port=client.switch_port,
+                names_tried=resolved.names_tried,
+                netbox_names=resolved.netbox_names,
+            )
         return created
 
-    def _mark_stale(self, netbox_site_slug: str, seen_macs: set[str]) -> int:
-        """Mark managed client devices UniFi no longer reports.
+    def _mark_stale(
+        self,
+        netbox_site_slug: str,
+        seen_macs: set[str],
+        known_last_seen: dict[str, float | None],
+    ) -> int:
+        """Mark managed client devices whose UniFi last_seen is past the grace.
 
         Limited to devices that carry the sync tag and the client role, so a
         manually tagged switch, an infrastructure device this tool created,
-        or an untagged object is never taken offline.
+        or an untagged object is never taken offline. A client still in the
+        active list is never marked, and neither is one whose last_seen falls
+        inside the grace — that is an idle phone or laptop, not a removal.
         """
         marked = 0
         tag = self.settings.sync_tag
         role = self.settings.client_device_role_slug
+        now = time.time()
+        grace = self.settings.stale_offline_grace_seconds
+        grace_label = format_grace(grace)
         for device in self.netbox.list_synced_client_devices(tag, netbox_site_slug, role):
             if not device_has_tag(device, tag):
                 continue
@@ -1022,12 +1224,297 @@ class SyncEngine:
             status = getattr(getattr(device, "status", None), "value", None)
             if not mac or mac in seen_macs or status != "active":
                 continue
+            decision = offline_decision(mac, known_last_seen, now, grace)
+            randomized = is_locally_administered(mac)
+            if not decision.mark:
+                if decision.reason == "within_grace":
+                    logger.info(
+                        "%s device %r (%s) active; UniFi last_seen %s is within the %s grace%s",
+                        "[dry-run] would leave" if self.settings.dry_run else "Leaving",
+                        device.name,
+                        mac,
+                        _format_last_seen(known_last_seen.get(mac.lower())),
+                        grace_label,
+                        " (randomized MAC)" if randomized else "",
+                    )
+                else:
+                    logger.info(
+                        "Leaving device %r (%s) active; UniFi lists it but has no usable last_seen%s",
+                        device.name,
+                        mac,
+                        " (randomized MAC)" if randomized else "",
+                    )
+                continue
+            if decision.reason == "not_known":
+                why = "the controller has no record of it"
+            else:
+                why = (
+                    f"UniFi last_seen {_format_last_seen(known_last_seen.get(mac.lower()))} "
+                    f"is outside the {grace_label} grace"
+                )
+            rotation = (
+                " Randomized MAC; phones rotate these and the old address does not return."
+                if randomized
+                else ""
+            )
             if self.settings.dry_run:
-                logger.info("[dry-run] would mark device %r (%s) offline", device.name, mac)
+                logger.info(
+                    "[dry-run] would mark device %r (%s) offline; %s.%s",
+                    device.name,
+                    mac,
+                    why,
+                    rotation,
+                )
             else:
                 self.netbox.mark_offline(device)
                 logger.info(
-                    "Marked device %r (%s) offline; UniFi no longer reports it", device.name, mac
+                    "Marked device %r (%s) offline; %s.%s", device.name, mac, why, rotation
                 )
             marked += 1
         return marked
+
+    def _load_known_clients(self, unifi_site: str) -> tuple[dict[str, float | None], bool]:
+        """MAC -> last_seen, and whether that map is safe to offline against.
+
+        A failed read is not an empty network. Callers skip offline marking
+        rather than treat every managed device as gone.
+        """
+        getter = getattr(self.unifi, "get_known_clients", None)
+        if getter is None:
+            logger.warning(
+                "UniFi client cannot report last_seen for site '%s'; skipping offline marking",
+                unifi_site,
+            )
+            return {}, False
+        try:
+            records = getter(unifi_site)
+        except EXPECTED_CLIENT_ERRORS as exc:
+            logger.warning(
+                "Could not read UniFi client history for site '%s' (%s); skipping offline marking",
+                unifi_site,
+                exc,
+            )
+            return {}, False
+        found: dict[str, float | None] = {}
+        for record in records:
+            mac = (getattr(record, "mac", "") or "").lower()
+            if not mac:
+                continue
+            last = getattr(record, "last_seen", None)
+            if mac not in found:
+                found[mac] = last
+                continue
+            current = found[mac]
+            if last is None:
+                continue
+            if current is None or last > current:
+                found[mac] = last
+        return found, True
+
+    def _resolve_cable(
+        self, client: UnifiClient, result: ClientSyncResult, cable_ctx: _CableContext
+    ) -> _ResolvedCable | None:
+        """The switch interface to cable, or None when the cable must be skipped."""
+        switch_mac = (client.switch_mac or "").lower()
+        hints = self._hints_for(switch_mac)
+        port_no = coerce_port(client.switch_port)
+        ports = list(hints.ports) if hints is not None else []
+        sfp_index = sfp_ordinal(ports, port_no) if port_no is not None else None
+        model = hints.model if hints is not None else None
+        model_templates = templates_for_model(self.settings.port_model_templates, model)
+        extra: list[str] = []
+        if port_no is not None:
+            for port in ports:
+                if port.index == port_no and port.name:
+                    extra.append(port.name)
+        candidates = (
+            candidate_names(
+                model_templates,
+                self.settings.port_name_templates,
+                port_no,
+                sfp_index,
+                extra,
+            )
+            if port_no is not None
+            else []
+        )
+        switch_name = hints.name if hints is not None and hints.name else switch_mac
+
+        if port_no is not None and (switch_mac, port_no) in cable_ctx.shared_ports:
+            switch_device = self.netbox.find_switch_device_by_mac(switch_mac, hints)
+            netbox_names = self._interface_names(switch_device) if switch_device is not None else []
+            if switch_device is not None:
+                switch_name = getattr(switch_device, "name", switch_name)
+            self._record_cable_skip(
+                result,
+                cable_ctx,
+                reason="shared_port",
+                detail=(
+                    f"port {client.switch_port} on {switch_name} is shared by multiple wired "
+                    "clients; not cabling an uplink or downstream switch"
+                ),
+                switch_mac=switch_mac,
+                switch_name=switch_name,
+                port=client.switch_port,
+                names_tried=candidates,
+                netbox_names=netbox_names,
+            )
+            return None
+
+        if port_no is not None and is_uplink_port(ports, port_no):
+            switch_device = self.netbox.find_switch_device_by_mac(switch_mac, hints)
+            netbox_names = self._interface_names(switch_device) if switch_device is not None else []
+            if switch_device is not None:
+                switch_name = getattr(switch_device, "name", switch_name)
+            self._record_cable_skip(
+                result,
+                cable_ctx,
+                reason="uplink_port",
+                detail=(
+                    f"port {client.switch_port} on {switch_name} is a UniFi uplink; "
+                    "not cabling a client to it"
+                ),
+                switch_mac=switch_mac,
+                switch_name=switch_name,
+                port=client.switch_port,
+                names_tried=candidates,
+                netbox_names=netbox_names,
+            )
+            return None
+
+        switch_device = self.netbox.find_switch_device_by_mac(switch_mac, hints)
+        if switch_device is None:
+            self._log_switch_not_found(switch_mac)
+            self._record_cable_skip(
+                result,
+                cable_ctx,
+                reason="switch_not_found",
+                detail=f"switch {switch_mac} not found in NetBox (port {client.switch_port})",
+                switch_mac=switch_mac,
+                switch_name=switch_name,
+                port=client.switch_port,
+                names_tried=candidates,
+                netbox_names=[],
+            )
+            return None
+
+        switch_name = getattr(switch_device, "name", switch_name)
+        interfaces = self._interfaces(switch_device)
+        netbox_names = [iface.name for iface in interfaces]
+        if not netbox_names:
+            self._log_port_mismatch(switch_device, client.switch_port, candidates, [])
+            self._record_cable_skip(
+                result,
+                cable_ctx,
+                reason="no_interfaces",
+                detail=(
+                    f"NetBox device {switch_name!r} has no interfaces, so UniFi port "
+                    f"{client.switch_port} was not cabled"
+                ),
+                switch_mac=switch_mac,
+                switch_name=switch_name,
+                port=client.switch_port,
+                names_tried=candidates,
+                netbox_names=[],
+            )
+            return None
+
+        outcome = match_port(
+            netbox_names,
+            candidates,
+            port_no,
+            sfp_index,
+            allow_structural=not model_templates,
+        )
+        if outcome.via == "ambiguous" or outcome.name is None:
+            self._log_port_mismatch(
+                switch_device,
+                client.switch_port,
+                list(outcome.names_tried),
+                netbox_names,
+                ambiguous=list(outcome.ambiguous_names) if outcome.via == "ambiguous" else None,
+            )
+            if outcome.via == "ambiguous":
+                detail = (
+                    f"port {client.switch_port} on {switch_name} matched multiple interfaces "
+                    f"{list(outcome.ambiguous_names)}"
+                )
+                reason = "port_ambiguous"
+            else:
+                detail = (
+                    f"no interface on {switch_name} matched {list(outcome.names_tried)}"
+                )
+                reason = "port_not_found"
+            self._record_cable_skip(
+                result,
+                cable_ctx,
+                reason=reason,
+                detail=detail,
+                switch_mac=switch_mac,
+                switch_name=switch_name,
+                port=client.switch_port,
+                names_tried=list(outcome.names_tried),
+                netbox_names=netbox_names,
+            )
+            return None
+
+        switch_iface = next(iface for iface in interfaces if iface.name == outcome.name)
+        logger.info(
+            "Matched switch port %s on %s using %s -> interface %s",
+            client.switch_port,
+            switch_name,
+            outcome.via,
+            switch_iface.name,
+        )
+        return _ResolvedCable(
+            switch_device=switch_device,
+            switch_iface=switch_iface,
+            names_tried=list(outcome.names_tried),
+            netbox_names=netbox_names,
+        )
+
+    def _interfaces(self, switch_device: object) -> list[object]:
+        lister = getattr(self.netbox, "list_device_interfaces", None)
+        if lister is None:
+            return []
+        # A failed list is a client error, not "this switch has no ports".
+        return list(lister(switch_device))
+
+    def _interface_names(self, switch_device: object) -> list[str]:
+        return [iface.name for iface in self._interfaces(switch_device)]
+
+    def _record_cable_skip(
+        self,
+        result: ClientSyncResult,
+        cable_ctx: _CableContext,
+        *,
+        reason: str,
+        detail: str,
+        switch_mac: str,
+        switch_name: str,
+        port: object,
+        names_tried: list[str],
+        netbox_names: list[str],
+    ) -> None:
+        result.cable_skipped_reason = detail
+        result.cable_skip = CableSkip(
+            unifi_site=cable_ctx.unifi_site,
+            netbox_site=cable_ctx.netbox_site,
+            switch=switch_name or switch_mac,
+            switch_mac=switch_mac,
+            unifi_port="" if port is None else str(port),
+            names_tried=" | ".join(names_tried),
+            netbox_interfaces=" | ".join(netbox_names),
+            reason=reason,
+        )
+        prefix = "[dry-run] " if self.settings.dry_run else ""
+        logger.info(
+            "%scable skip site=%s switch=%s port=%s reason=%s tried=[%s] interfaces=[%s]",
+            prefix,
+            cable_ctx.unifi_site,
+            switch_name or switch_mac,
+            port,
+            reason,
+            ", ".join(names_tried),
+            ", ".join(netbox_names),
+        )
