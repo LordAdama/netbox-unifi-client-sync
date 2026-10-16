@@ -176,7 +176,7 @@ def test_dry_run_explains_why_a_cable_would_be_skipped(caplog):
     """A reported run showed '45 cables skipped' with no warning at all — the one
     number an operator needs explained."""
     netbox = FakeNetboxGateway()
-    netbox.seed_switch("aa:bb:cc:dd:ee:01", "core-switch", ["xe-0/0/1", "xe-0/0/2"])
+    netbox.seed_switch("aa:bb:cc:dd:ee:01", "core-switch", ["mgmt0", "irb"])
     client = make_unifi_client(
         mac="11:22:33:44:55:66",
         is_wired=True,
@@ -201,7 +201,7 @@ def test_dry_run_explains_why_a_cable_would_be_skipped(caplog):
 
     assert summary.cables_skipped == 1
     messages = "\n".join(r.getMessage() for r in caplog.records)
-    assert "xe-0/0/1" in messages, "dry-run must name the real interfaces too"
+    assert "mgmt0" in messages, "dry-run must name the real interfaces too"
     assert "PORT_NAME_TEMPLATES" in messages
 
 

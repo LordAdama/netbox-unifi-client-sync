@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import Counter
 from pathlib import Path
 
 from .models import SyncSummary
@@ -102,6 +103,15 @@ def write_prometheus_textfile(summary: SyncSummary, path: str) -> None:
                     "site_errors": st.errors,
                 }[metric]
                 lines.append(f"{prefix}_{metric}{{{labels}}} {value}")
+
+    if summary.cable_skips:
+        counts = Counter(skip.reason for skip in summary.cable_skips)
+        lines.append(f"# HELP {prefix}_cable_skips_by_reason Cables skipped in the last sync run, by reason")
+        lines.append(f"# TYPE {prefix}_cable_skips_by_reason gauge")
+        for reason, count in sorted(counts.items()):
+            lines.append(
+                f'{prefix}_cable_skips_by_reason{{reason="{_escape(reason)}"}} {count}'
+            )
 
     lines += [
         f"# HELP {prefix}_last_run_timestamp_seconds Unix time the last sync run finished",

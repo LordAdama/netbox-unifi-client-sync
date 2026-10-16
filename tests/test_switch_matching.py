@@ -90,7 +90,7 @@ def test_unmatched_switch_warns_with_actionable_guidance(caplog):
 def test_port_name_mismatch_reports_the_real_interface_names(caplog):
     """A skipped cable caused by naming should say what the ports are called."""
     netbox = FakeNetboxGateway()
-    netbox.seed_switch(SWITCH_MAC, "core-switch", ["xe-0/0/1", "xe-0/0/2", "xe-0/0/3"])
+    netbox.seed_switch(SWITCH_MAC, "core-switch", ["mgmt0", "irb", "ae0"])
     unifi = _unifi(
         [_wired_client()],
         [UnifiSwitchDevice(mac=SWITCH_MAC, name="core-switch", model="USW", device_type="usw")],
@@ -101,7 +101,7 @@ def test_port_name_mismatch_reports_the_real_interface_names(caplog):
 
     assert summary.cables_skipped == 1
     warning = "\n".join(r.getMessage() for r in caplog.records)
-    assert "xe-0/0/1" in warning, "operator needs to see the actual interface names"
+    assert "mgmt0" in warning, "operator needs to see the actual interface names"
     assert "PORT_NAME_TEMPLATES" in warning
 
 

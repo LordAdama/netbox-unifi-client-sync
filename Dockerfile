@@ -17,7 +17,7 @@ RUN chmod +x /entrypoint.sh /healthcheck.sh \
 # dependency layer. `docker inspect` shows the label; /app/REVISION is the
 # same value for `docker exec`.
 ARG GIT_COMMIT=unknown
-ARG APP_VERSION=0.10.1
+ARG APP_VERSION=0.11.0
 LABEL org.opencontainers.image.title="netbox-unifi-client-sync" \
       org.opencontainers.image.description="Sync UniFi clients and switch-port cables into NetBox" \
       org.opencontainers.image.source="https://github.com/LordAdama/netbox-unifi-client-sync" \

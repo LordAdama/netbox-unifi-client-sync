@@ -9,8 +9,10 @@ from typing import Any, Protocol
 
 import pynetbox
 import requests
+from pynetbox.core.query import Request
 
 from .devicetype_library import normalize_model
+from .models import UnifiPort
 from .naming import normalize_key, slugify
 
 logger = logging.getLogger(__name__)
@@ -96,6 +98,9 @@ class SwitchHints:
     name: str | None = None
     serial: str | None = None
     model: str | None = None
+    # Physical ports from the controller's port_table. Used to tell an SFP
+    # cage from a copper port and to refuse cables onto an uplink.
+    ports: tuple[UnifiPort, ...] = ()
 
 
 class NetboxGateway(Protocol):
@@ -915,22 +920,25 @@ class PynetboxGateway:
         if update_policy == "create-only":
             return device, False, would_change, False
 
-        updated = False
+        changes: dict[str, Any] = {}
         if device.name != name:
-            device.name = name
-            updated = True
+            changes["name"] = name
         if device.status.value != "active":
-            device.status = "active"
-            updated = True
+            changes["status"] = "active"
         if type_differs:
-            device.device_type = self._get_device_type(device_type_slug).id
+            changes["device_type"] = self._get_device_type(device_type_slug).id
             logger.info(
                 "Updating %s device type %s -> %s", device.name, current_type, device_type_slug
             )
-            updated = True
-        if updated:
-            device.save()
-        return device, False, False, updated
+        if not changes:
+            return device, False, False, False
+        # PATCH the fields that actually changed. device.save() diffs against
+        # the fetched record and usually does the same, but a nested field
+        # that serializes differently (tags, custom fields, a choice object)
+        # gets swept into that diff and overwrites operator data. The dict
+        # below is the whole request body.
+        self._patch_device(device, changes)
+        return device, False, False, True
 
     def ensure_interface(self, device: Any, name: str, wired: bool) -> Any:
         iface = self.api.dcim.interfaces.get(device_id=device.id, name=name)
@@ -1114,6 +1122,24 @@ class PynetboxGateway:
         )
         return True, None
 
+    def _patch_device(self, device: Any, changes: dict[str, Any]) -> None:
+        """PATCH exactly ``changes`` onto ``device``.
+
+        Nothing else on the record is sent. Status transitions in particular
+        must not rewrite name, comments, tenant, tags, or custom fields that
+        were loaded alongside it.
+        """
+        if not changes:
+            return
+        req = Request(
+            key=device.id,
+            base=self.api.dcim.devices.url,
+            token=self.api.token,
+            http_session=self.api.http_session,
+        )
+        result = req.patch(dict(changes))
+        if result and hasattr(device, "_parse_values"):
+            device._parse_values(result)
+
     def mark_offline(self, device: Any) -> None:
-        device.status = "offline"
-        device.save()
+        self._patch_device(device, {"status": "offline"})
