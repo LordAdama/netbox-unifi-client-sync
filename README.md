@@ -27,8 +27,10 @@ For every active client the UniFi controller reports:
   physical connection UniFi already knows about.
 - For **wireless** clients, records the connection without creating a
   cable (there isn't one).
-- Optionally marks previously-synced client devices as `offline` (never
-  deletes them) when UniFi stops reporting them.
+- Optionally marks client devices **this tool created** (tagged `unifi-sync`
+  and using the client role) as `offline` when UniFi stops reporting them.
+  It never deletes them, and it does not offline infrastructure devices or
+  anything that does not carry that tag.
 
 Your UniFi hardware — switches, APs, gateways — can be created too, with
 `SYNC_UNIFI_DEVICES=true` (off by default; see "Syncing UniFi devices"). With
@@ -36,8 +38,10 @@ it on, an empty NetBox is populated end to end in a single run: the switches
 with their real ports, the clients, and the cables between them. With it off,
 switches must already be inventoried in NetBox and only clients are created.
 
-Everything this tool creates is tagged `unifi-sync`, so it's easy to find and
-safe to distinguish from manually-entered NetBox data.
+Everything this tool creates is tagged `unifi-sync`. Updates, cable
+replacement, and stale-offline marking are limited to objects with that tag,
+so a device or cable entered by hand in NetBox is left alone even when it
+shares a MAC or a switch port with something UniFi reports.
 
 ## How matching works
 
@@ -152,8 +156,9 @@ whose vendor can't be determined, fall back to
 
 Existing devices created before this feature are corrected on the next sync
 (under `DEVICE_UPDATE_POLICY=sync`), so an established install picks up real
-manufacturers without being rebuilt. Set `USE_OUI_MANUFACTURER=false` to keep
-everything on the single generic type.
+manufacturers without being rebuilt. The default `create-only` does not
+rewrite device types on objects that already exist. Set
+`USE_OUI_MANUFACTURER=false` to keep everything on the single generic type.
 
 ## Authentication
 
@@ -231,14 +236,26 @@ cd netbox-unifi-client-sync
 cp .env.example .env
 # edit .env with your controller/NetBox details
 
-docker build -t netbox-unifi-client-sync .
+docker build \
+  --build-arg GIT_COMMIT="$(git rev-parse HEAD)" \
+  --build-arg APP_VERSION="$(awk -F'"' '/^version = / { print $2; exit }' pyproject.toml)" \
+  -t netbox-unifi-client-sync .
 ```
 
-**One-off run** (e.g. to dry-run before trusting it with real changes):
+The image records that commit in the OCI label `org.opencontainers.image.revision`
+(and in `/app/REVISION`). Trace a running container with:
 
 ```bash
-docker run --rm --env-file .env netbox-unifi-client-sync --dry-run
-docker run --rm --env-file .env netbox-unifi-client-sync
+docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' unifi-netbox-sync
+```
+
+**One-off run.** `DRY_RUN` defaults to `true`, so a plain run logs every
+intended create, update, and delete and writes nothing. Pass `--apply` (or
+set `DRY_RUN=false`) only after that plan looks right:
+
+```bash
+docker run --rm --env-file .env netbox-unifi-client-sync            # dry-run
+docker run --rm --env-file .env netbox-unifi-client-sync --apply    # write
 ```
 
 **Run continuously**, syncing on an interval — set `SYNC_INTERVAL_SECONDS`
@@ -288,8 +305,8 @@ pip install -e .
 cp .env.example .env
 # edit .env with your controller/NetBox details
 
-unifi-netbox-sync --dry-run   # see what would change, without writing anything
-unifi-netbox-sync             # perform the sync
+unifi-netbox-sync             # dry-run (the default): log the plan, write nothing
+unifi-netbox-sync --apply     # perform the sync
 ```
 
 `unifi-netbox-sync` loads `.env` from the current directory itself (a
@@ -314,9 +331,10 @@ full list and defaults. Key ones:
 | `NETBOX_URL` / `NETBOX_TOKEN` | NetBox API endpoint and token |
 | `NETBOX_SITE_SLUG` | NetBox site clients should be placed in; ignored if `SITE_MAP` is set |
 | `SITE_MAP` | Multi-site: `*` for every site on the controller, and/or `unifi_site:netbox_site_slug` pairs — see "Multi-site sync" |
-| `SITE_MATCH` | `normalized` (default), `name`, or `slug` — how an existing NetBox site is found; see "Linking to sites you already have" |
-| `SITE_POLICY` | `require` (default) or `create` — see "Site & update policies" |
-| `DEVICE_UPDATE_POLICY` | `sync` (default) or `create-only` — see "Site & update policies" |
+| `SITE_MATCH` | `normalized` (default), `name`, or `slug` — fallback after the `unifi_site_id` custom field; see "Linking to sites you already have" |
+| `SITE_POLICY` | `require` (default) or `create` — creating sites is opt-in; see "Site & update policies" |
+| `DEVICE_UPDATE_POLICY` | `create-only` (default) or `sync` — see "Site & update policies" |
+| `NETBOX_TIMEOUT` / `UNIFI_TIMEOUT` | Per-request HTTP timeouts in seconds (default `30`). A NetBox call with no timeout is what hung a run indefinitely |
 | `NETBOX_IP_STATUS` | Status set on IP addresses this tool creates (default `active`) |
 | `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order; blank uses the built-in list |
 | `SYNC_UNIFI_DEVICES` | Create adopted UniFi switches/APs/gateways in NetBox (default `false`) — see "Syncing UniFi devices" |
@@ -324,9 +342,9 @@ full list and defaults. Key ones:
 | `UNIFI_DEVICE_ROLE_SLUG` | Role for created UniFi devices of unrecognised type (default `network-device`) |
 | `USE_OUI_MANUFACTURER` | Give clients a device type carrying their real vendor (default `true`) — see "Manufacturers" |
 | `OUI_FILE` | Optional IEEE `oui.txt` / Wireshark `manuf` file, used only when the controller reports no vendor |
-| `CABLE_CONFLICT_POLICY` | `skip` (default, non-destructive) or `replace` when a target port is already cabled to something else |
-| `MARK_STALE_OFFLINE` | Mark client devices no longer seen by UniFi as `offline` instead of leaving them `active` |
-| `DRY_RUN` | Plan only, make no changes (same as `--dry-run`) |
+| `CABLE_CONFLICT_POLICY` | `skip` (default) or `replace`. `replace` only deletes cables tagged `SYNC_TAG`; manual cables stay |
+| `MARK_STALE_OFFLINE` | Mark **managed** client devices (sync tag + client role) no longer seen by UniFi as `offline`. Infrastructure devices and untagged objects are never changed |
+| `DRY_RUN` | `true` (default). Log every intended create/update/delete and write nothing. `false` or `--apply` writes |
 | `LOG_FORMAT` | `text` (default) or `json` — one JSON object per log line, for log shippers |
 | `METRICS_FILE` | If set, write Prometheus textfile-collector metrics to this path after every run |
 | `MAX_WORKERS` | NetBox sites synced concurrently (default `1`) — see "Scaling" |
@@ -344,19 +362,19 @@ instead, which then completely replaces `UNIFI_SITE`/`NETBOX_SITE_SLUG`.
 
 ```bash
 SITE_MAP=*
-SITE_POLICY=create
 ```
 
-The controller is asked which sites exist and each is synced into its own
-NetBox site, named from the site's description as shown in the UniFi UI
-("Head Office" → `head-office`) — not its API id, which is an opaque string
-like `7xk2p9qr`. Sites added in UniFi later are picked up automatically on
-the next run.
+The controller is asked which sites exist and each is matched to a NetBox
+site. The durable key is a `unifi_site_id` custom field on the NetBox site
+(the UniFi site's API id, e.g. `7xk2p9qr`). When that field is empty the tool
+falls back to the slug, the site name, then both folded to alphanumerics.
+The slug guess comes from the site's description as shown in the UniFi UI
+("Head Office" → `head-office`), not from the API id.
 
-`SITE_POLICY=create` is effectively required here: discovering sites you
-haven't already hand-created in NetBox is the normal case, and the default
-`require` would report each missing one as an error. The run logs a reminder
-if you leave it on `require`.
+**Missing sites are not created** unless `SITE_POLICY=create`. Leave the
+default `require` in place until a dry-run shows every UniFi site landing on
+the NetBox site you expect. `create` is how a previous configuration produced
+duplicate sites for UniFi sites whose NetBox names had been edited.
 
 **Explicit pairs**, when you want to control exactly which sites sync and
 where they land:
@@ -410,24 +428,32 @@ slugifies to `acme-s-depot-north-yard`, which does not equal an existing
 So before syncing, each UniFi site is resolved against the sites already in
 NetBox, in order:
 
-1. exact slug
-2. exact **name** (the UniFi site description vs the NetBox site name)
-3. both folded to alphanumerics, making apostrophes, dashes, spacing and case
+1. custom field **`unifi_site_id`** equal to the UniFi site id. This still
+   matches after someone renames the NetBox site or changes its slug.
+2. exact slug
+3. exact **name** (the UniFi site description vs the NetBox site name)
+4. both folded to alphanumerics, making apostrophes, dashes, spacing and case
    irrelevant
 
 Every step is an exact comparison after folding — never fuzzy — so two
-genuinely different sites are not bound together. `SITE_MATCH=name` stops at
-step 2, `SITE_MATCH=slug` restores the original exact-slug-only behavior.
+genuinely different sites are not bound together. `SITE_MATCH=name` stops
+after the name step, `SITE_MATCH=slug` stops after the slug step. The id
+custom field is always tried first.
 
-**A matched site is only ever linked to, never modified.** Its name, slug,
-region, tenant and everything else are left alone, whatever is already in it
-stays, and the UniFi devices and clients are added alongside. Each link is
-logged:
+The first time a site is matched by name or slug, the UniFi id is recorded in
+`unifi_site_id` if that field is empty. That is the only write. **Name, slug,
+and status are never changed**, so a rename made in NetBox is not reverted
+and a later run follows the renamed site instead of creating the old name
+again. An id that is already set is not overwritten.
+
+**A matched site is only ever linked to, never renamed.** Whatever is already
+in it stays, and the UniFi devices and clients are added alongside. Each link
+is logged:
 
 ```
 Linking UniFi site 'north' to existing NetBox site 'acmes-depot-north-yard'
-("Acme's Depot - North Yard") instead of creating 'acme-s-depot-north-yard';
-its inventory is added to, never overwritten
+("Acme's Depot - North Yard") instead of creating 'acme-s-depot-north-yard'.
+Its name and slug are left unchanged.
 ```
 
 Resolution happens before sites are grouped for syncing, so if two UniFi
@@ -439,23 +465,19 @@ clients offline.
 
 Two independent, conservative-by-default policy knobs:
 
-- **`SITE_POLICY`** governs what happens if a site slug doesn't exist
+- **`SITE_POLICY`** governs what happens if no existing site matches
   (checked separately for each pair under `SITE_MAP`). `require` (default)
-  fails the run with a clear error — the safest choice, since a typo'd slug
-  shouldn't silently spawn a new site. `create` creates a minimal site
-  (name/slug/status only) if it's missing. Neither setting ever modifies an
-  *existing* site's attributes — this tool only ever creates a site, never
-  updates one.
-- **`DEVICE_UPDATE_POLICY`** governs what happens to a client device's
-  `name`/`status` on every run *after* it was first created. `sync`
-  (default) keeps them matched to what UniFi currently reports — the same
-  behavior as before this setting existed. `create-only` sets them once at
-  creation and leaves them alone from then on, so if you (or another admin)
-  rename a device or change its status by hand in NetBox, this tool won't
-  overwrite that on the next run. This only covers the device's name and
-  status; interfaces, IP addresses, and cables are still kept in sync
-  either way — that's the tool's actual purpose and isn't gated by this
-  setting.
+  records an error for that site and creates nothing — a typo, or a site
+  you renamed in NetBox and have not linked yet, must not spawn a duplicate.
+  `create` is opt-in: it creates a minimal site (name, slug, status, and
+  `unifi_site_id`) when nothing matches. Neither setting modifies an
+  existing site's name or slug.
+- **`DEVICE_UPDATE_POLICY`** governs a **tagged** client device's `name` and
+  `status` after it was created. `create-only` (default) sets them once and
+  leaves them alone, so a rename in NetBox sticks. `sync` is opt-in and
+  keeps them matched to UniFi, which will revert those renames. Objects
+  that do not carry `SYNC_TAG` are never updated, regardless of this
+  setting — not their name, interface, IP, or cables.
 
 Both apply in dry-run too (as previews, not real writes), and every
 decision — site created vs. reused, an update skipped by policy — is
@@ -539,8 +561,13 @@ than more tuning of an API client.
 level, for each distinct switch:
 
 - *"No NetBox device found for UniFi switch …"* — the switch isn't in NetBox
-  under any of the four joins. See "Finding your switches", or turn on
-  `SYNC_UNIFI_DEVICES=true` and let the tool create it.
+  under any of the four joins, and **no device is created** to stand in for
+  it. See "Finding your switches". `SYNC_UNIFI_DEVICES=true` is a separate,
+  explicit opt-in for creating adopted UniFi hardware; a skipped cable never
+  turns it on.
+- *"NetBox device 'X' has no interfaces"* — the device is there but has
+  nothing to cable to. The run skips the cable and does not create
+  interfaces.
 - *"UniFi port N on 'X' matched no NetBox interface. Looked for […]; that
   device's interfaces are named […]"* — a naming mismatch. Copy a pattern
   from the reported names into `PORT_NAME_TEMPLATES`, e.g. for Junos-style
@@ -583,12 +610,47 @@ for something bigger:
 - **IP addresses are plain /32s.** No VRF, tenant, or prefix awareness —
   addresses land in the global table. If your environment needs any of
   those, extend `PynetboxGateway.assign_ip`.
-- **Per-client errors are narrowly caught.** The sync loop only catches
-  expected network/API failures (`requests` exceptions, `pynetbox.RequestError`,
-  `LookupError`) per client, logs them, and moves on to the next client. A
-  genuine bug (e.g. an `AttributeError` from bad code) is *not* caught —
-  it propagates and stops the run, on purpose, rather than being silently
-  swallowed alongside real operational failures.
+- **HTTP calls time out.** UniFi and NetBox requests use `UNIFI_TIMEOUT` and
+  `NETBOX_TIMEOUT` (default 30s). pynetbox itself does not set a timeout; without
+  one, a stalled NetBox connection hangs the process and the healthcheck file
+  is never written.
+- **One site cannot abort the others.** A failure while syncing a site —
+  including an unexpected exception — is logged, recorded on that site, and
+  the run continues. Stale-offline marking for a NetBox site is skipped when
+  any of the UniFi sites mapped to it failed, because a partial client list
+  is not evidence that a device is gone. Per-client handling is still narrow:
+  expected network/API failures (`requests`, `pynetbox.RequestError`,
+  `LookupError`) are recorded and the next client runs. Anything else fails
+  the rest of that site only.
+- **Primary IP moves.** NetBox refuses to reassign an address that is still
+  some device's primary IP. If that device is tagged `SYNC_TAG`, its primary
+  is cleared and the move is retried. If it is not, the address is left where
+  it is and that client continues; the refusal is a warning, not a crashed run.
+
+## Safe rollout
+
+The defaults are chosen so the first run against a live NetBox cannot create
+sites, rename devices, or replace cables:
+
+1. Deploy with `DRY_RUN=true` (the default) and `SITE_POLICY=require` (the
+   default). Let one scheduled run finish and read the log.
+2. Check three things in that log: which UniFi sites linked to which existing
+   NetBox sites (`unifi_site_id` or a name match), which sites were **not**
+   matched (those would be created only if you later set `SITE_POLICY=create`),
+   and which cables were skipped because a switch or a port was missing.
+   Skipped cables do not create switches.
+3. For a NetBox site you renamed, either let the dry-run's name match record
+   `unifi_site_id` on the next real run, or set that custom field yourself to
+   the UniFi site id before applying. Do not rely on the old slug.
+4. Apply with `DRY_RUN=false` or `--apply` only after that plan is what you
+   want. `DEVICE_UPDATE_POLICY=sync` and `CABLE_CONFLICT_POLICY=replace`
+   overwrite manual edits of tagged objects; leave them at the defaults
+   unless that is deliberate.
+
+The long-running container writes `/tmp/last-sync-ok` only when a run exits 0,
+which means it finished and recorded no site or client errors. A timed-out
+call or a per-site failure leaves the file untouched, so the `HEALTHCHECK`
+stays unhealthy instead of reporting a hung or partial run as success.
 
 ## Development
 
@@ -617,19 +679,19 @@ every push/PR.
   a fake implementing the same interface, so sync logic is tested without
   touching a real NetBox instance.
 - `sync.py` — orchestrates the sync; all mutating NetBox calls are skipped
-  in dry-run mode, with planned actions logged instead. Loops over
-  `Settings.site_pairs()` (one pair for the default single-site case),
-  calling `_run_site()` for each; a site-level failure (e.g. a `require`d
-  missing NetBox site, an API error during `ensure_site()`/
-  `ensure_prerequisites()`) is caught and recorded as an error for that
-  site without stopping the others. Per-client errors within a site are
-  caught the same way (see "Known limitations") — narrowly, so a real bug
-  isn't masked as a routine sync failure. Stale-device marking is
-  deliberately *not* done inside `_run_site()`: `run()` first groups every
-  pair's `seen_macs` by NetBox site slug (so two pairs sharing a slug get
-  the union, not each other's false positives), then marks stale devices
-  once per distinct slug — skipping any slug whose pair(s) included a
-  failure, since acting on an incomplete client list risks false offlines.
+  in dry-run mode, and every intended create, update, and delete is logged.
+  Loops over `Settings.site_pairs()` (one pair for the default single-site
+  case), calling `_run_site()` for each; a site-level failure (a `require`d
+  missing NetBox site, an HTTP timeout, or an unexpected exception) is
+  caught and recorded as an error for that site without stopping the others.
+  Per-client network/API errors are caught inside the site (see "Known
+  limitations"). Stale-device marking is deliberately *not* done inside
+  `_run_site()`: `run()` first groups every pair's `seen_macs` by NetBox
+  site slug (so two pairs sharing a slug get the union, not each other's
+  false positives), then marks stale **client** devices once per distinct
+  slug — skipping any slug whose pair(s) included a failure, since acting
+  on an incomplete client list risks false offlines. Only devices tagged
+  `SYNC_TAG` with the client role are eligible.
 - `caching.py` — `CachingNetboxGateway`, a run-scoped read cache wrapping
   any gateway. Caches only what's stable for a run (sites, switches, switch
   interfaces); deliberately does *not* cache client-device or name-collision

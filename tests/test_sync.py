@@ -16,6 +16,9 @@ def make_settings(**overrides) -> Settings:
         netbox_url="https://netbox.example.com",
         netbox_token="token",
         netbox_site_slug="main",
+        # Production defaults to dry-run. These tests exercise the write path
+        # unless a case opts back into dry_run=True.
+        dry_run=False,
     )
     defaults.update(overrides)
     return Settings(**defaults)
@@ -171,14 +174,23 @@ def test_expected_error_is_captured_per_client():
     assert summary.client_results[0].error is not None
 
 
-def test_unexpected_error_propagates_instead_of_being_swallowed():
+def test_unexpected_error_is_isolated_to_its_site():
+    """A programming error in one site is recorded and does not abort the run.
+
+    Per-client handling stays narrow (only network/API failures). The site
+    boundary is what keeps one bad site from taking the rest of the run, and
+    the success marker, down with it.
+    """
     netbox = RaisingNetboxGateway(TypeError("programming error, not a network/API failure"))
     client = make_unifi_client(mac="11:22:33:44:55:66", is_wired=False)
     unifi = FakeUnifiClient(clients=[client])
     engine = SyncEngine(unifi=unifi, netbox=netbox, settings=make_settings())
 
-    with pytest.raises(TypeError):
-        engine.run()
+    summary = engine.run()
+
+    assert summary.errors
+    assert "programming error" in summary.errors[0]
+    assert summary.devices_created == 0
 
 
 def test_metrics_file_written_when_configured(tmp_path):
