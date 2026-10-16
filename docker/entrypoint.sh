@@ -15,7 +15,27 @@ set -eu
 # run for healthcheck.sh to read. Defaults under /tmp; override if /tmp is a
 # size-constrained tmpfs shared with other processes in your setup.
 interval="${SYNC_INTERVAL_SECONDS:-0}"
-heartbeat="${HEARTBEAT_FILE:-/tmp/last-sync-ok}"
+# Exported so the Python process can write the marker itself when a run
+# finishes with no errors. The shell writes it too, on exit 0, which is the
+# same condition: per-site and per-client errors exit non-zero and must not
+# look like a healthy sync. A hung HTTP call never reaches either write.
+export HEARTBEAT_FILE="${HEARTBEAT_FILE:-/tmp/last-sync-ok}"
+heartbeat="$HEARTBEAT_FILE"
+
+record_success() {
+    if date -u > "$heartbeat"; then
+        echo "unifi-netbox-sync: run succeeded; wrote $heartbeat"
+    else
+        echo "unifi-netbox-sync: run succeeded but could not write $heartbeat" >&2
+        return 1
+    fi
+}
+
+record_failure() {
+    # $1 is the sync process's exit status. Capture it before any other
+    # command: under `set -e` a bare `$?` later in the loop is easy to lose.
+    echo "unifi-netbox-sync: run finished with errors (exit $1); not updating $heartbeat" >&2
+}
 
 if [ -n "${LOCK_FILE:-}" ] && ! command -v flock >/dev/null 2>&1; then
     echo "unifi-netbox-sync: LOCK_FILE is set but 'flock' is not available in this image" >&2
@@ -45,15 +65,15 @@ if [ "$interval" -gt 0 ] 2>/dev/null; then
     while [ "$stop_requested" -eq 0 ]; do
         if [ -n "${LOCK_FILE:-}" ]; then
             if flock -n "$LOCK_FILE" unifi-netbox-sync "$@"; then
-                date > "$heartbeat"
+                record_success
             else
-                echo "unifi-netbox-sync: run failed or lock busy (exit $?)" >&2
+                record_failure "$?"
             fi
         else
             if unifi-netbox-sync "$@"; then
-                date > "$heartbeat"
+                record_success
             else
-                echo "unifi-netbox-sync: run failed (exit $?)" >&2
+                record_failure "$?"
             fi
         fi
         [ "$stop_requested" -eq 0 ] && interruptible_sleep "$interval"

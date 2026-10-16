@@ -137,11 +137,19 @@ class CachingNetboxGateway:
 
     # -- pass-through ----------------------------------------------------
 
-    def ensure_site(self, site_slug: str, policy: str) -> tuple[Any, bool]:
-        site, created = self._inner.ensure_site(site_slug, policy)
+    def ensure_site(
+        self, site_slug: str, policy: str, name: str = "", unifi_site_id: str = ""
+    ) -> tuple[Any, bool]:
+        site, created = self._inner.ensure_site(site_slug, policy, name, unifi_site_id)
         with self._lock:
             self._sites[site_slug] = site
         return site, created
+
+    def ensure_site_identity_field(self) -> None:
+        self._inner.ensure_site_identity_field()
+
+    def remember_site_link(self, site: Any, unifi_site_id: str) -> bool:
+        return self._inner.remember_site_link(site, unifi_site_id)
 
     def find_client_device_by_mac(self, mac: str) -> Any | None:
         return self._inner.find_client_device_by_mac(mac)
@@ -182,8 +190,10 @@ class CachingNetboxGateway:
     def list_sites(self) -> list[Any]:
         return self._inner.list_sites()
 
-    def resolve_existing_site(self, desired_slug: str, label: str, mode: str = "normalized") -> Any | None:
-        site = self._inner.resolve_existing_site(desired_slug, label, mode)
+    def resolve_existing_site(
+        self, desired_slug: str, label: str, mode: str = "normalized", unifi_site_id: str = ""
+    ) -> Any | None:
+        site = self._inner.resolve_existing_site(desired_slug, label, mode, unifi_site_id)
         if site is not None:
             with self._lock:
                 # Cache under the resolved slug, which is what every later
@@ -214,14 +224,25 @@ class CachingNetboxGateway:
         # create-if-missing has to be atomic anyway.
         return self._inner.ensure_client_device_type(manufacturer_name)
 
-    def assign_ip(self, device: Any, interface: Any, ip: str, status: str = "active") -> bool:
-        return self._inner.assign_ip(device, interface, ip, status)
+    def assign_ip(
+        self,
+        device: Any,
+        interface: Any,
+        ip: str,
+        status: str = "active",
+        managed_tag: str | None = None,
+    ) -> bool:
+        return self._inner.assign_ip(device, interface, ip, status, managed_tag)
 
-    def ensure_cable(self, interface_a: Any, interface_b: Any, conflict_policy: str) -> tuple[bool, str | None]:
-        return self._inner.ensure_cable(interface_a, interface_b, conflict_policy)
+    def ensure_cable(
+        self, interface_a: Any, interface_b: Any, conflict_policy: str, tag_slug: str = "unifi-sync"
+    ) -> tuple[bool, str | None]:
+        return self._inner.ensure_cable(interface_a, interface_b, conflict_policy, tag_slug)
 
-    def list_synced_client_devices(self, tag_slug: str, site_slug: str) -> list[Any]:
-        return self._inner.list_synced_client_devices(tag_slug, site_slug)
+    def list_synced_client_devices(
+        self, tag_slug: str, site_slug: str, role_slug: str | None = None
+    ) -> list[Any]:
+        return self._inner.list_synced_client_devices(tag_slug, site_slug, role_slug)
 
     def mark_offline(self, device: Any) -> None:
         self._inner.mark_offline(device)

@@ -13,7 +13,10 @@ heartbeat="${HEARTBEAT_FILE:-/tmp/last-sync-ok}"
 [ -f "$heartbeat" ] || exit 1
 
 now=$(date +%s)
-last=$(date -r "$heartbeat" +%s)
+# mtime, not the file's contents. stat is used rather than `date -r`, which
+# means something else on non-GNU date and would make a successful run look
+# unhealthy.
+last=$(stat -c %Y "$heartbeat")
 age=$((now - last))
 max_age=$((interval * 2 + 60))
 
