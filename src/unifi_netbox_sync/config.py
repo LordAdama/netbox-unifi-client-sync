@@ -28,6 +28,16 @@ DEFAULT_PORT_NAME_TEMPLATES = [
 ]
 
 
+def _positive_float(raw: str, name: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a number of seconds, got {raw!r}") from None
+    if value <= 0:
+        raise SystemExit(f"{name} must be > 0, got {value}")
+    return value
+
+
 def _positive_int(raw: str, name: str) -> int:
     try:
         value = int(raw)
@@ -121,8 +131,14 @@ class Settings:
     netbox_token: str = ""
     netbox_verify_ssl: bool = True
     netbox_ip_status: str = "active"
+    # Seconds for each NetBox HTTP call. pynetbox does not set a timeout of
+    # its own; without this a stalled connection hangs the run indefinitely.
+    netbox_timeout: float = 30.0
+    unifi_timeout: float = 30.0
 
-    dry_run: bool = False
+    # Default on, so a container started from an unedited environment cannot
+    # write to NetBox. Set DRY_RUN=false or pass --apply to write.
+    dry_run: bool = True
     log_level: str = "INFO"
     log_format: str = "text"
     sync_tag: str = "unifi-sync"
@@ -149,12 +165,12 @@ class Settings:
     # A matched site is linked to and never modified.
     site_match: str = "normalized"
     site_policy: str = "require"
-    # "sync" (default): keep an existing client device's name/status in
-    # sync with UniFi. "create-only": set them once at creation and never
-    # touch them again, so a NetBox admin's manual edits stick. Interfaces,
-    # IPs, and cables are unaffected by this — it only governs the device's
-    # name/status fields. Any other value behaves as "sync".
-    device_update_policy: str = "sync"
+    # "create-only" (default): set a managed device's name/status once, at
+    # creation, and never overwrite them. "sync" keeps them matched to UniFi
+    # and is opt-in because it reverts renames made in NetBox. Either value
+    # only applies to devices carrying sync_tag; untagged objects are never
+    # modified. Any value other than "create-only" behaves as "sync".
+    device_update_policy: str = "create-only"
     # Site groups synced concurrently. 1 (default) keeps the original strictly
     # sequential behavior. Raise it for many sites; the ceiling is whatever
     # your NetBox and UniFi controller tolerate, not this tool.
@@ -230,7 +246,9 @@ class Settings:
             netbox_token=netbox_token,
             netbox_verify_ssl=_bool(os.environ.get("NETBOX_VERIFY_SSL", "true")),
             netbox_ip_status=os.environ.get("NETBOX_IP_STATUS", "active"),
-            dry_run=_bool(os.environ.get("DRY_RUN", "false")),
+            netbox_timeout=_positive_float(os.environ.get("NETBOX_TIMEOUT", "30"), "NETBOX_TIMEOUT"),
+            unifi_timeout=_positive_float(os.environ.get("UNIFI_TIMEOUT", "30"), "UNIFI_TIMEOUT"),
+            dry_run=_bool(os.environ.get("DRY_RUN", "true")),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
             log_format=os.environ.get("LOG_FORMAT", "text"),
             sync_tag=os.environ.get("SYNC_TAG", "unifi-sync"),
@@ -243,7 +261,7 @@ class Settings:
             metrics_file=os.environ.get("METRICS_FILE") or None,
             site_match=os.environ.get("SITE_MATCH", "normalized"),
             site_policy=os.environ.get("SITE_POLICY", "require"),
-            device_update_policy=os.environ.get("DEVICE_UPDATE_POLICY", "sync"),
+            device_update_policy=os.environ.get("DEVICE_UPDATE_POLICY", "create-only"),
             max_workers=_positive_int(os.environ.get("MAX_WORKERS", "1"), "MAX_WORKERS"),
             use_oui_manufacturer=_bool(os.environ.get("USE_OUI_MANUFACTURER", "true")),
             oui_file=os.environ.get("OUI_FILE") or None,

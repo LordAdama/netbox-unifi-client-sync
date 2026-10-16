@@ -101,25 +101,45 @@ def test_create_only_policy_leaves_existing_device_name_unchanged():
     assert summary.client_results[0].device_update_skipped_reason is not None
 
 
-def test_sync_policy_still_updates_name_by_default():
+def test_sync_policy_updates_name_when_explicitly_enabled():
     netbox = FakeNetboxGateway()
     engine = SyncEngine(
         unifi=FakeUnifiClient(clients=[make_unifi_client(mac="11:22:33:44:55:66", name="old-name", is_wired=False)]),
         netbox=netbox,
-        settings=make_settings(),  # default device_update_policy="sync"
+        settings=make_settings(device_update_policy="sync"),
     )
     engine.run()
 
     engine2 = SyncEngine(
         unifi=FakeUnifiClient(clients=[make_unifi_client(mac="11:22:33:44:55:66", name="new-name", is_wired=False)]),
         netbox=netbox,
-        settings=make_settings(),
+        settings=make_settings(device_update_policy="sync"),
     )
     summary = engine2.run()
 
     assert netbox.clients_by_mac["11:22:33:44:55:66"].name == "new-name"
     assert summary.devices_updated == 1
     assert summary.devices_update_skipped == 0
+
+
+def test_default_device_policy_does_not_revert_a_rename():
+    netbox = FakeNetboxGateway()
+    engine = SyncEngine(
+        unifi=FakeUnifiClient(clients=[make_unifi_client(mac="11:22:33:44:55:66", name="old-name", is_wired=False)]),
+        netbox=netbox,
+        settings=make_settings(),
+    )
+    engine.run()
+
+    summary = SyncEngine(
+        unifi=FakeUnifiClient(clients=[make_unifi_client(mac="11:22:33:44:55:66", name="new-name", is_wired=False)]),
+        netbox=netbox,
+        settings=make_settings(),
+    ).run()
+
+    assert netbox.clients_by_mac["11:22:33:44:55:66"].name == "old-name"
+    assert summary.devices_updated == 0
+    assert summary.devices_update_skipped == 1
 
 
 def test_dry_run_previews_create_only_skip():

@@ -13,8 +13,8 @@
 #
 # Non-interactive / automation use (CI, IaC, config management): pass
 # --non-interactive with the required values as environment variables —
-# no prompts, and the container is started immediately after a successful
-# dry-run instead of asking for confirmation:
+# no prompts, and the container is started after a dry-run. The generated
+# .env keeps DRY_RUN=true unless you also pass DRY_RUN=false:
 #
 #   UNIFI_HOST=https://192.168.1.1 UNIFI_API_KEY=... \
 #   NETBOX_URL=https://netbox.example.com NETBOX_TOKEN=... NETBOX_SITE_SLUG=main \
@@ -36,6 +36,7 @@ IMAGE="netbox-unifi-client-sync:latest"
 CONTAINER="unifi-netbox-sync"
 
 NONINTERACTIVE=false
+WROTE_ENV=false
 for arg in "$@"; do
     case "$arg" in
         --non-interactive) NONINTERACTIVE=true ;;
@@ -78,7 +79,9 @@ write_env() {
     printf '%s\n' "SITE_MATCH=normalized" >> .env
     printf '%s\n' "SITE_POLICY=require" >> .env
     printf '%s\n' "NETBOX_IP_STATUS=active" >> .env
-    printf '%s\n' "DRY_RUN=false" >> .env
+    printf '%s\n' "DRY_RUN=true" >> .env
+    printf '%s\n' "NETBOX_TIMEOUT=30" >> .env
+    printf '%s\n' "UNIFI_TIMEOUT=30" >> .env
     printf '%s\n' "LOG_LEVEL=INFO" >> .env
     printf '%s\n' "LOG_FORMAT=text" >> .env
     printf '%s\n' "SYNC_TAG=unifi-sync" >> .env
@@ -93,7 +96,7 @@ write_env() {
     printf '%s\n' "UNIFI_DEVICE_ROLE_SLUG=network-device" >> .env
     printf '%s\n' "CABLE_CONFLICT_POLICY=skip" >> .env
     printf '%s\n' "MARK_STALE_OFFLINE=true" >> .env
-    printf '%s\n' "DEVICE_UPDATE_POLICY=sync" >> .env
+    printf '%s\n' "DEVICE_UPDATE_POLICY=create-only" >> .env
     printf '%s\n' "METRICS_FILE=" >> .env
     printf '%s\n' "MAX_WORKERS=1" >> .env
     printf '%s\n' "SYNC_INTERVAL_SECONDS=${10}" >> .env
@@ -131,6 +134,7 @@ elif [ "$NONINTERACTIVE" = true ]; then
         "${UNIFI_IS_UDM:-true}" "${UNIFI_SITE:-default}" \
         "$NETBOX_URL" "$NETBOX_TOKEN" "${NETBOX_SITE_SLUG:-}" \
         "${SYNC_INTERVAL_SECONDS:-3600}" "${SITE_MAP:-}"
+    WROTE_ENV=true
     echo "==> Wrote .env (chmod 600)"
 else
     echo "==> First-time setup — answer a few questions (nothing is sent anywhere but your own .env file)"
@@ -163,12 +167,18 @@ else
         "$is_udm_bool" "$unifi_site" \
         "$netbox_url" "$netbox_token" "$netbox_site_slug" \
         "$interval" ""
+    WROTE_ENV=true
     echo "==> Wrote .env (chmod 600)"
     echo "==> (This sets up a single site. For more than one, edit SITE_MAP in .env — see .env.example.)"
 fi
 
 echo "==> Building Docker image"
-docker build -t "$IMAGE" .
+commit="$(git rev-parse HEAD)"
+app_version="$(awk -F'"' '/^version = / { print $2; exit }' pyproject.toml)"
+docker build -t "$IMAGE" \
+    --build-arg GIT_COMMIT="$commit" \
+    --build-arg APP_VERSION="${app_version:-unknown}" \
+    .
 
 echo "==> Running a dry-run so you can check what it would do before anything is written to NetBox"
 docker run --rm --env-file .env "$IMAGE" --dry-run
@@ -180,6 +190,23 @@ else
 fi
 case "$confirm" in
     [Yy]*)
+        # A .env this run just wrote defaults to DRY_RUN=true. Interactive
+        # confirmation is the opt-in to writing. Non-interactive mode writes
+        # only when DRY_RUN=false was passed in. An existing .env is never
+        # rewritten, so a later re-run cannot flip a deliberate dry-run off.
+        if [ "$WROTE_ENV" = true ]; then
+            if [ "$NONINTERACTIVE" = true ] && [ "${DRY_RUN:-true}" != "false" ]; then
+                echo "==> DRY_RUN is true. The container will plan changes and write nothing."
+                echo "==> Re-run with DRY_RUN=false to apply, after reviewing a dry-run."
+            else
+                if grep -q '^DRY_RUN=' .env; then
+                    sed -i 's/^DRY_RUN=.*/DRY_RUN=false/' .env
+                else
+                    printf '%s\n' "DRY_RUN=false" >> .env
+                fi
+                echo "==> DRY_RUN=false written; the container will update NetBox."
+            fi
+        fi
         docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
         docker run -d --name "$CONTAINER" --restart unless-stopped --env-file .env "$IMAGE"
         echo "==> Started. Follow logs with: docker logs -f $CONTAINER"

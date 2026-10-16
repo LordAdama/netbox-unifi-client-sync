@@ -22,6 +22,8 @@ def _isolated_cwd(tmp_path, monkeypatch):
 def test_from_env_accepts_username_and_password(monkeypatch):
     monkeypatch.setenv("UNIFI_USERNAME", "admin")
     monkeypatch.setenv("UNIFI_PASSWORD", "secret")
+    for key in ("DRY_RUN", "DEVICE_UPDATE_POLICY", "SITE_POLICY"):
+        monkeypatch.delenv(key, raising=False)
     for key, value in REQUIRED_ENV.items():
         monkeypatch.setenv(key, value)
 
@@ -29,6 +31,9 @@ def test_from_env_accepts_username_and_password(monkeypatch):
 
     assert settings.unifi_api_key is None
     assert settings.unifi_username == "admin"
+    assert settings.dry_run is True
+    assert settings.device_update_policy == "create-only"
+    assert settings.site_policy == "require"
 
 
 def test_from_env_accepts_api_key_without_password(monkeypatch):
