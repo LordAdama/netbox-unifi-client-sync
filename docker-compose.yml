@@ -5,7 +5,13 @@
 # hardcoded one below, regardless of what you put in .env.
 services:
   unifi-netbox-sync:
-    build: .
+    build:
+      context: .
+      args:
+        # Set GIT_COMMIT from the host (`git rev-parse HEAD`) so the image
+        # label records the commit this container was built from.
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        APP_VERSION: ${APP_VERSION:-0.10.0}
     image: netbox-unifi-client-sync:latest
     container_name: unifi-netbox-sync
     restart: unless-stopped

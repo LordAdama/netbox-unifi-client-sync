@@ -1,0 +1,496 @@
+"""Production-safety behavior: site identity, dry-run, managed objects, IP conflicts."""
+
+from __future__ import annotations
+
+import logging
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pynetbox
+import pytest
+
+from unifi_netbox_sync.cli import parse_args
+from unifi_netbox_sync.config import Settings
+from unifi_netbox_sync.health import write_success_marker
+from unifi_netbox_sync.models import UnifiSite, UnifiSwitchDevice
+from unifi_netbox_sync.netbox_client import (
+    PynetboxGateway,
+    TimeoutSession,
+    device_name_from_primary_error,
+    is_primary_ip_conflict,
+)
+from unifi_netbox_sync.sync import SyncEngine
+from unifi_netbox_sync.unifi_client import UnifiClientAPI
+
+from .fakes import FakeInterface, FakeNetboxGateway, FakeUnifiClient, make_unifi_client
+from .test_sync import make_settings
+
+
+def test_from_env_defaults_are_non_destructive(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UNIFI_HOST", "https://unifi.example.com")
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    monkeypatch.setenv("NETBOX_URL", "https://netbox.example.com")
+    monkeypatch.setenv("NETBOX_TOKEN", "token")
+    monkeypatch.setenv("NETBOX_SITE_SLUG", "main")
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.delenv("DEVICE_UPDATE_POLICY", raising=False)
+    monkeypatch.delenv("SITE_POLICY", raising=False)
+    monkeypatch.delenv("CABLE_CONFLICT_POLICY", raising=False)
+
+    settings = Settings.from_env()
+
+    assert settings.dry_run is True
+    assert settings.device_update_policy == "create-only"
+    assert settings.site_policy == "require"
+    assert settings.cable_conflict_policy == "skip"
+    assert settings.netbox_timeout == 30.0
+    assert settings.unifi_timeout == 30.0
+
+
+def test_apply_flag_overrides_dry_run_default():
+    args = parse_args(["--apply"])
+    assert args.apply is True
+    assert args.dry_run is False
+    with pytest.raises(SystemExit):
+        parse_args(["--apply", "--dry-run"])
+
+
+def test_success_marker_is_written_atomically(tmp_path):
+    path = tmp_path / "nested" / "last-sync-ok"
+    write_success_marker(str(path))
+    assert path.is_file()
+    assert not path.with_name(path.name + ".tmp").exists()
+    text = path.read_text()
+    assert "T" in text  # ISO-8601 timestamp
+
+
+def test_renamed_site_is_found_by_unifi_id_and_not_renamed_back():
+    netbox = FakeNetboxGateway()
+    site = netbox.seed_site("ops-renamed-it", "Operations", unifi_site_id="7xk2p9qr")
+    before = (site.slug, site.name, site.id)
+
+    summary = SyncEngine(
+        unifi=FakeUnifiClient(
+            sites=[UnifiSite("7xk2p9qr", "North Warehouse")],
+            by_site={"7xk2p9qr": [make_unifi_client(mac="11:22:33:44:55:01", name="laptop", is_wired=False)]},
+        ),
+        netbox=netbox,
+        settings=make_settings(sync_all_sites=True, site_policy="create"),
+    ).run()
+
+    assert summary.sites_created == 0
+    assert summary.errors == []
+    assert (site.slug, site.name, site.id) == before
+    assert netbox.clients_by_mac["11:22:33:44:55:01"].site_slug == "ops-renamed-it"
+    assert "north-warehouse" not in netbox.created_sites
+
+
+def test_name_match_records_unifi_id_without_touching_the_name():
+    netbox = FakeNetboxGateway()
+    site = netbox.seed_site("acmes-depot-north-yard", "Acme's Depot - North Yard")
+
+    SyncEngine(
+        unifi=FakeUnifiClient(
+            sites=[UnifiSite("north", "Acme's Depot - North Yard")],
+            by_site={"north": [make_unifi_client(mac="11:22:33:44:55:01", name="c1", is_wired=False)]},
+        ),
+        netbox=netbox,
+        settings=make_settings(sync_all_sites=True, site_policy="create"),
+    ).run()
+
+    assert site.custom_fields["unifi_site_id"] == "north"
+    assert site.name == "Acme's Depot - North Yard"
+    assert site.slug == "acmes-depot-north-yard"
+    assert netbox.created_sites == set()
+
+
+def test_dry_run_logs_intended_changes_and_writes_nothing(caplog):
+    netbox = FakeNetboxGateway()
+    netbox.seed_switch("aa:bb:cc:dd:ee:01", "switch-1", ["Port 1"])
+    stale, *_ = netbox.upsert_client_device(
+        "99:88:77:66:55:44", "old-laptop", "main", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    client = make_unifi_client(
+        mac="11:22:33:44:55:66",
+        name="laptop",
+        ip="10.9.9.9",
+        is_wired=True,
+        switch_mac="aa:bb:cc:dd:ee:01",
+        switch_port=1,
+    )
+    with caplog.at_level(logging.INFO):
+        summary = SyncEngine(
+            unifi=FakeUnifiClient(clients=[client]),
+            netbox=netbox,
+            settings=make_settings(dry_run=True),
+        ).run()
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[dry-run] would create device 'laptop'" in text
+    assert "[dry-run] would assign IP 10.9.9.9" in text
+    assert "[dry-run] would create cable" in text
+    assert "[dry-run] would mark device 'old-laptop'" in text
+    assert summary.devices_created == 1
+    assert summary.cables_created == 1
+    assert summary.stale_marked_offline == 1
+    assert "11:22:33:44:55:66" not in netbox.clients_by_mac
+    assert stale.status.value == "active"
+
+
+def test_untagged_device_is_not_modified_even_when_sync_is_on():
+    netbox = FakeNetboxGateway()
+    device, *_ = netbox.upsert_client_device(
+        "11:22:33:44:55:66", "hand-renamed", "main", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    device.tags.clear()
+
+    summary = SyncEngine(
+        unifi=FakeUnifiClient(
+            clients=[make_unifi_client(mac="11:22:33:44:55:66", name="from-unifi", ip="10.1.1.9", is_wired=False)]
+        ),
+        netbox=netbox,
+        settings=make_settings(device_update_policy="sync"),
+    ).run()
+
+    assert device.name == "hand-renamed"
+    assert device.primary_ip4 is None
+    assert summary.devices_updated == 0
+    assert summary.devices_update_skipped == 1
+    assert summary.errors == []
+
+
+def test_stale_marking_ignores_infrastructure_and_untagged_devices():
+    netbox = FakeNetboxGateway()
+    client, *_ = netbox.upsert_client_device(
+        "11:22:33:44:55:66", "old-laptop", "main", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    manual, *_ = netbox.upsert_client_device(
+        "22:22:22:22:22:22", "manual-laptop", "main", "unifi-client", "generic-network-client", "unifi-sync"
+    )
+    manual.tags.clear()
+    switch, _, _ = netbox.upsert_infrastructure_device(
+        "aa:bb:cc:dd:ee:01", "core-switch", "main", "switch", "usw", "unifi-sync", serial="ABC"
+    )
+
+    summary = SyncEngine(
+        unifi=FakeUnifiClient(clients=[]),
+        netbox=netbox,
+        settings=make_settings(),
+    ).run()
+
+    assert summary.stale_marked_offline == 1
+    assert client.status.value == "offline"
+    assert manual.status.value == "active"
+    assert switch.status.value == "active"
+
+
+def test_replace_does_not_delete_an_untagged_cable():
+    netbox = FakeNetboxGateway()
+    switch = netbox.seed_switch("aa:bb:cc:dd:ee:01", "switch-1", ["Port 1"])
+    port = switch.interfaces["Port 1"]
+    other = FakeInterface(switch, "somewhere-else")
+    pair = tuple(sorted((port.id, other.id)))
+    port.cable = pair
+    other.cable = pair
+    port.link_peers = [other]
+    netbox.cables.add(pair)
+    netbox.cable_tags[pair] = []
+
+    summary = SyncEngine(
+        unifi=FakeUnifiClient(
+            clients=[
+                make_unifi_client(
+                    mac="11:22:33:44:55:66",
+                    is_wired=True,
+                    switch_mac="aa:bb:cc:dd:ee:01",
+                    switch_port=1,
+                )
+            ]
+        ),
+        netbox=netbox,
+        settings=make_settings(cable_conflict_policy="replace"),
+    ).run()
+
+    assert summary.cables_created == 0
+    assert pair in netbox.cables
+    assert "not tagged" in (summary.client_results[0].cable_skipped_reason or "")
+
+
+def test_missing_switch_warns_and_does_not_create_a_device(caplog):
+    netbox = FakeNetboxGateway()
+    with caplog.at_level(logging.WARNING):
+        summary = SyncEngine(
+            unifi=FakeUnifiClient(
+                clients=[
+                    make_unifi_client(
+                        mac="11:22:33:44:55:66",
+                        is_wired=True,
+                        switch_mac="aa:bb:cc:dd:ee:99",
+                        switch_port=1,
+                    )
+                ]
+            ),
+            netbox=netbox,
+            settings=make_settings(),
+        ).run()
+
+    assert summary.cables_skipped == 1
+    assert summary.devices_created == 1  # the client, not a switch
+    assert netbox.infra_by_mac == {}
+    assert "No infrastructure device will be created" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_switch_with_no_interfaces_warns_and_creates_nothing(caplog):
+    netbox = FakeNetboxGateway()
+    netbox.seed_switch("aa:bb:cc:dd:ee:01", "bare-switch", [])
+    with caplog.at_level(logging.WARNING):
+        summary = SyncEngine(
+            unifi=FakeUnifiClient(
+                clients=[
+                    make_unifi_client(
+                        mac="11:22:33:44:55:66",
+                        is_wired=True,
+                        switch_mac="aa:bb:cc:dd:ee:01",
+                        switch_port=3,
+                    )
+                ],
+                devices=[
+                    UnifiSwitchDevice(mac="aa:bb:cc:dd:ee:01", name="bare-switch", model="USW", device_type="usw")
+                ],
+            ),
+            netbox=netbox,
+            settings=make_settings(),
+        ).run()
+
+    assert summary.cables_skipped == 1
+    assert netbox.infra_by_mac == {}
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "has no interfaces" in text
+    assert "No device or interface will be created" in text
+
+
+def test_one_site_error_does_not_stop_another_site():
+    class RaiseForSite(FakeNetboxGateway):
+        def upsert_client_device(self, mac, name, site_slug, *args, **kwargs):
+            if site_slug == "bad":
+                raise TypeError("boom in bad")
+            return super().upsert_client_device(mac, name, site_slug, *args, **kwargs)
+
+    netbox = RaiseForSite()
+    summary = SyncEngine(
+        unifi=FakeUnifiClient(
+            by_site={
+                "good-unifi": [make_unifi_client(mac="11:22:33:44:55:01", name="ok", is_wired=False)],
+                "bad-unifi": [make_unifi_client(mac="11:22:33:44:55:02", name="nope", is_wired=False)],
+            }
+        ),
+        netbox=netbox,
+        settings=make_settings(site_map={"good-unifi": "good", "bad-unifi": "bad"}),
+    ).run()
+
+    assert any("boom in bad" in error for error in summary.errors)
+    assert netbox.clients_by_mac["11:22:33:44:55:01"].site_slug == "good"
+    assert "11:22:33:44:55:02" not in netbox.clients_by_mac
+
+
+def test_unifi_requests_use_the_configured_timeout():
+    captured: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"data": []}
+
+    client = UnifiClientAPI(host="https://unifi.example.com", api_key="k", timeout=7)
+    client._authenticated = True
+
+    def fake_get(url, timeout=None):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        return Response()
+
+    client.session.get = fake_get
+    assert client.get_sites() == []
+    assert captured["timeout"] == 7
+
+
+def test_netbox_session_has_a_timeout():
+    gateway = PynetboxGateway("https://netbox.example.com", "token", timeout=12)
+    assert isinstance(gateway.api.http_session, TimeoutSession)
+    assert gateway.api.http_session.timeout == 12
+    assert gateway.api.http_session.verify is True
+
+
+def test_missing_site_id_field_falls_back_to_name_matching(caplog):
+    """A dry-run before the custom field exists must still link by name."""
+    import threading
+
+    response = MagicMock()
+    response.status_code = 400
+    response.reason = "Bad Request"
+    response.url = "https://netbox.example.com/api/dcim/sites/"
+    response.request = MagicMock(body=b"")
+    response.text = "unknown custom field"
+    response.json.return_value = {"cf_unifi_site_id": ["unknown"]}
+
+    matched = SimpleNamespace(slug="hq-01", name="Head Office", custom_fields={})
+    api = MagicMock()
+    api.dcim.sites.get.return_value = None
+    api.dcim.sites.filter.side_effect = [pynetbox.RequestError(response), [matched]]
+
+    gateway = PynetboxGateway.__new__(PynetboxGateway)
+    gateway.api = api
+    gateway._memo_lock = threading.Lock()
+    gateway._site_memo = {}
+    gateway._all_sites = None
+
+    with caplog.at_level(logging.WARNING):
+        found = gateway.resolve_existing_site("head-office", "Head Office", "name", "7xk2p9qr")
+
+    assert found is matched
+    assert "falling back to name/slug matching" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_primary_conflict_detection_names_the_device():
+    message = (
+        "The request failed with code 400 Bad Request: "
+        "{'__all__': ['IP address 10.1.1.1/32 is configured as the primary IP for device "
+        "Pixel-10a and cannot be reassigned']}"
+    )
+    exc = Exception(message)
+    assert is_primary_ip_conflict(exc)
+    assert device_name_from_primary_error(exc) == "Pixel-10a"
+    assert is_primary_ip_conflict(Exception("name: this field is required")) is False
+
+
+def _request_error(body: str, status: int = 400) -> pynetbox.RequestError:
+    response = MagicMock()
+    response.status_code = status
+    response.reason = "Bad Request"
+    response.url = "https://netbox.example.com/api/ipam/ip-addresses/5/"
+    response.request = MagicMock(body=b"")
+    response.text = body
+    response.json.return_value = {"__all__": [body]}
+    return pynetbox.RequestError(response)
+
+
+def _gateway(api) -> PynetboxGateway:
+    gateway = PynetboxGateway.__new__(PynetboxGateway)
+    gateway.api = api
+    return gateway
+
+
+def test_primary_ip_on_a_managed_device_is_cleared_then_reassigned():
+    api = MagicMock()
+    ip = MagicMock()
+    ip.id = 5
+    ip.address = "10.1.1.1/32"
+    ip.assigned_object = SimpleNamespace(id=99)
+    ip.save.side_effect = [
+        _request_error(
+            "IP address 10.1.1.1/32 is configured as the primary IP for device Pixel-10a "
+            "and cannot be reassigned"
+        ),
+        None,
+    ]
+    api.ipam.ip_addresses.filter.return_value = [ip]
+
+    holder = MagicMock()
+    holder.name = "Pixel-10a"
+    holder.tags = [SimpleNamespace(slug="unifi-sync")]
+    holder.primary_ip4 = ip
+    api.dcim.devices.filter.return_value = [holder]
+
+    target = SimpleNamespace(name="new-phone", primary_ip4=None, save=MagicMock())
+    changed = _gateway(api).assign_ip(target, SimpleNamespace(id=7), "10.1.1.1", managed_tag="unifi-sync")
+
+    assert changed is True
+    assert holder.primary_ip4 is None
+    holder.save.assert_called_once()
+    assert ip.assigned_object_id == 7
+    assert ip.save.call_count == 2
+    assert target.primary_ip4 == 5
+    target.save.assert_called_once()
+
+
+def test_primary_ip_on_an_unmanaged_device_is_left_alone():
+    api = MagicMock()
+    ip = MagicMock()
+    ip.id = 5
+    ip.address = "10.1.1.1/32"
+    ip.assigned_object = SimpleNamespace(id=99)
+    ip.save.side_effect = _request_error(
+        "IP address 10.1.1.1/32 is configured as the primary IP for device Pixel-10a "
+        "and cannot be reassigned"
+    )
+    api.ipam.ip_addresses.filter.return_value = [ip]
+
+    holder = MagicMock()
+    holder.name = "Pixel-10a"
+    holder.tags = [SimpleNamespace(slug="hand-edited")]
+    api.dcim.devices.filter.return_value = [holder]
+
+    target = SimpleNamespace(name="new-phone", primary_ip4=None, save=MagicMock())
+    changed = _gateway(api).assign_ip(target, SimpleNamespace(id=7), "10.1.1.1", managed_tag="unifi-sync")
+
+    assert changed is False
+    holder.save.assert_not_called()
+    target.save.assert_not_called()
+
+
+def test_non_primary_ip_error_still_raises():
+    api = MagicMock()
+    ip = MagicMock()
+    ip.id = 5
+    ip.address = "10.1.1.1/32"
+    ip.assigned_object = None
+    ip.save.side_effect = _request_error("name: this field is required")
+    api.ipam.ip_addresses.filter.return_value = [ip]
+
+    with pytest.raises(pynetbox.RequestError):
+        _gateway(api).assign_ip(SimpleNamespace(name="phone", primary_ip4=None, save=MagicMock()), SimpleNamespace(id=7), "10.1.1.1")
+
+
+def test_primary_holder_can_be_found_by_the_name_in_the_error():
+    api = MagicMock()
+    ip = MagicMock()
+    ip.id = 5
+    ip.address = "10.1.1.1/32"
+    ip.assigned_object = SimpleNamespace(id=99)
+    ip.save.side_effect = [
+        _request_error(
+            "IP address 10.1.1.1/32 is configured as the primary IP for device Pixel-10a "
+            "and cannot be reassigned"
+        ),
+        None,
+    ]
+    api.ipam.ip_addresses.filter.return_value = [ip]
+
+    holder = MagicMock()
+    holder.name = "Pixel-10a"
+    holder.tags = [SimpleNamespace(slug="unifi-sync")]
+
+    def devices_filter(**kwargs):
+        if "primary_ip4_id" in kwargs:
+            return []
+        if kwargs.get("name") == "Pixel-10a":
+            return [holder]
+        return []
+
+    api.dcim.devices.filter.side_effect = devices_filter
+
+    changed = _gateway(api).assign_ip(
+        SimpleNamespace(name="new-phone", primary_ip4=None, save=MagicMock()),
+        SimpleNamespace(id=7),
+        "10.1.1.1",
+        managed_tag="unifi-sync",
+    )
+
+    assert changed is True
+    assert holder.primary_ip4 is None
+    holder.save.assert_called_once()

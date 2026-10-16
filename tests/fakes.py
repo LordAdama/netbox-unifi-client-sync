@@ -51,6 +51,10 @@ class FakeSite:
         self.id = next(_id_counter)
         self.slug = slug
         self.name = name or slug
+        self.custom_fields: dict[str, str] = {}
+
+    def save(self) -> None:
+        return None
 
 
 class FakeIP:
@@ -91,6 +95,8 @@ class FakeNetboxGateway:
         # Sites that genuinely exist, with real names. Tests that don't
         # seed any keep the permissive default below.
         self.existing_sites: dict[str, FakeSite] = {}
+        self.cable_tags: dict[tuple[int, int], list[str]] = {}
+        self.site_identity_field_ready = False
 
     def seed_switch(self, mac: str, name: str, ports: list[str]) -> FakeDevice:
         device = FakeDevice(name=name)
@@ -153,6 +159,13 @@ class FakeNetboxGateway:
                                      tag_slug, serial="", update_policy="sync"):
         with self._lock:
             existing = self.infra_by_mac.get(mac)
+            if existing is None and name:
+                for candidate in list(self.infra_by_mac.values()) + self.switches_without_mac:
+                    if candidate.name == name and candidate.site_slug in (site_slug, None):
+                        existing = candidate
+                        break
+            if existing is not None and tag_slug not in existing.tags:
+                return existing, False, False
             if existing is not None:
                 if update_policy == "create-only":
                     return existing, False, False
@@ -202,8 +215,10 @@ class FakeNetboxGateway:
             if other_mac != mac
         )
 
-    def seed_site(self, slug: str, name: str | None = None) -> FakeSite:
+    def seed_site(self, slug: str, name: str | None = None, unifi_site_id: str = "") -> FakeSite:
         site = FakeSite(slug, name)
+        if unifi_site_id:
+            site.custom_fields["unifi_site_id"] = unifi_site_id
         self.existing_sites[slug] = site
         return site
 
@@ -220,9 +235,13 @@ class FakeNetboxGateway:
     def list_sites(self):
         return list(self.existing_sites.values())
 
-    def resolve_existing_site(self, desired_slug: str, label: str, mode: str = "normalized"):
+    def resolve_existing_site(self, desired_slug: str, label: str, mode: str = "normalized", unifi_site_id: str = ""):
         from unifi_netbox_sync.naming import normalize_key
 
+        if unifi_site_id:
+            for site in self.list_sites():
+                if (site.custom_fields or {}).get("unifi_site_id") == unifi_site_id:
+                    return site
         exact = self.find_site(desired_slug)
         if exact is not None:
             return exact
@@ -239,15 +258,31 @@ class FakeNetboxGateway:
                 return site
         return None
 
-    def ensure_site(self, site_slug: str, policy: str):
+    def ensure_site_identity_field(self) -> None:
+        self.site_identity_field_ready = True
+
+    def remember_site_link(self, site, unifi_site_id: str) -> bool:
+        if not unifi_site_id:
+            return False
+        current = (site.custom_fields or {}).get("unifi_site_id") or ""
+        if current:
+            return False
+        site.custom_fields["unifi_site_id"] = unifi_site_id
+        return True
+
+    def ensure_site(self, site_slug: str, policy: str, name: str = "", unifi_site_id: str = ""):
         with self._lock:
             site = self.find_site(site_slug)
             if site is not None:
                 return site, False
             if policy != "create":
                 raise LookupError(f"NetBox site '{site_slug}' does not exist (SITE_POLICY={policy!r})")
+            created = FakeSite(site_slug, name or site_slug.replace("-", " ").title())
+            if unifi_site_id:
+                created.custom_fields["unifi_site_id"] = unifi_site_id
+            self.existing_sites[site_slug] = created
             self.created_sites.add(site_slug)
-            return self.find_site(site_slug), True
+            return created, True
 
     def upsert_client_device(
         self,
@@ -264,6 +299,8 @@ class FakeNetboxGateway:
         with self._lock:
             existing = existing if existing_looked_up else self.clients_by_mac.get(mac)
             if existing:
+                if tag_slug not in existing.tags:
+                    return existing, False, True, False
                 would_change = existing.name != name or existing.status.value != "active"
                 if update_policy == "create-only":
                     return existing, False, would_change, False
@@ -276,6 +313,7 @@ class FakeNetboxGateway:
                     updated = True
                 return existing, False, False, updated
             device = FakeDevice(name=name, mac=mac, site_slug=site_slug)
+            device.role_slug = role_slug
             device.tags.append(tag_slug)
             self.clients_by_mac[mac] = device
             return device, True, False, False
@@ -288,34 +326,66 @@ class FakeNetboxGateway:
                 device.interfaces[name] = iface
             return iface
 
-    def assign_ip(self, device: FakeDevice, interface: FakeInterface, ip: str, status: str = "active") -> bool:
+    def assign_ip(
+        self,
+        device: FakeDevice,
+        interface: FakeInterface,
+        ip: str,
+        status: str = "active",
+        managed_tag: str | None = None,
+    ) -> bool:
         current = getattr(device.primary_ip4, "address", None)
         if current and current.split("/")[0] == ip.split("/")[0]:
             return False
         device.primary_ip4 = FakeIP(ip)
         return True
 
-    def ensure_cable(self, interface_a: FakeInterface, interface_b: FakeInterface, conflict_policy: str):
+    def ensure_cable(
+        self,
+        interface_a: FakeInterface,
+        interface_b: FakeInterface,
+        conflict_policy: str,
+        tag_slug: str = "unifi-sync",
+    ):
         with self._lock:
             pair = tuple(sorted((interface_a.id, interface_b.id)))
-            if interface_a.cable or interface_b.cable:
-                if pair in self.cables:
-                    return False, None
+            if interface_a.cable == pair or interface_b.cable == pair:
+                return False, None
+
+            doomed: list[tuple[int, int]] = []
+            for iface in (interface_a, interface_b):
+                existing = iface.cable
+                if not existing or existing == pair:
+                    continue
                 if conflict_policy != "replace":
                     return False, "interface already cabled elsewhere"
+                if tag_slug not in self.cable_tags.get(existing, []):
+                    return False, f"cable is not tagged {tag_slug}"
+                doomed.append(existing)
+            for existing in doomed:
+                self.cables.discard(existing)
+                self.cable_tags.pop(existing, None)
             interface_a.cable = pair
             interface_b.cable = pair
             interface_a.link_peers = [interface_b]
             interface_b.link_peers = [interface_a]
             self.cables.add(pair)
+            self.cable_tags[pair] = [tag_slug]
         return True, None
 
-    def list_synced_client_devices(self, tag_slug: str, site_slug: str):
+    def list_synced_client_devices(self, tag_slug: str, site_slug: str, role_slug: str | None = None):
         if self.find_site(site_slug) is None:
             return []
         with self._lock:
-            devices = list(self.clients_by_mac.values())
-        return [d for d in devices if tag_slug in d.tags and d.site_slug == site_slug]
+            devices = list(self.clients_by_mac.values()) + list(self.infra_by_mac.values())
+        selected = []
+        for device in devices:
+            if tag_slug not in device.tags or device.site_slug != site_slug:
+                continue
+            if role_slug is not None and device.role_slug != role_slug:
+                continue
+            selected.append(device)
+        return selected
 
     def mark_offline(self, device: FakeDevice) -> None:
         device.status = Choice("offline")
