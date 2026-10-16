@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pynetbox
 import pytest
+import requests
 
 from unifi_netbox_sync.cli import parse_args
 from unifi_netbox_sync.config import Settings
@@ -324,6 +325,81 @@ def test_netbox_session_has_a_timeout():
     assert isinstance(gateway.api.http_session, TimeoutSession)
     assert gateway.api.http_session.timeout == 12
     assert gateway.api.http_session.verify is True
+
+
+def _session_that_records(monkeypatch, outcomes: list, delays: list):
+    """Parent ``Session.request`` stand-in. ``outcomes`` are raised or returned."""
+    session = TimeoutSession(30, sleep=delays.append)
+    seen: list[tuple[str, float | None]] = []
+
+    def wrapped(self, method, url, **kwargs):
+        seen.append((method, kwargs.get("timeout")))
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(requests.Session, "request", wrapped)
+    return session, seen
+
+
+def test_netbox_read_retries_a_timeout_then_succeeds(monkeypatch):
+    delays: list[float] = []
+    response = MagicMock(status_code=200)
+    session, seen = _session_that_records(
+        monkeypatch,
+        [requests.exceptions.ReadTimeout("timed out"), requests.exceptions.ConnectionError("reset"), response],
+        delays,
+    )
+
+    got = session.get("https://netbox.example.com/api/dcim/devices/")
+
+    assert got is response
+    assert [method for method, _ in seen] == ["GET", "GET", "GET"]
+    assert all(timeout == 30 for _, timeout in seen)
+    assert delays == [1.0, 2.0]
+
+
+def test_netbox_read_gives_up_after_three_attempts(monkeypatch):
+    delays: list[float] = []
+    session, seen = _session_that_records(
+        monkeypatch,
+        [requests.exceptions.ReadTimeout("timed out")] * 3,
+        delays,
+    )
+
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        session.get("https://netbox.example.com/api/dcim/devices/")
+
+    assert len(seen) == 3
+    assert delays == [1.0, 2.0]
+
+
+def test_netbox_write_is_not_retried_on_timeout(monkeypatch):
+    delays: list[float] = []
+    session, seen = _session_that_records(
+        monkeypatch,
+        [requests.exceptions.ReadTimeout("timed out")],
+        delays,
+    )
+
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        session.post("https://netbox.example.com/api/dcim/devices/", json={"name": "sw"})
+
+    assert len(seen) == 1
+    assert delays == []
+
+
+def test_netbox_read_does_not_retry_an_http_error(monkeypatch):
+    delays: list[float] = []
+    response = MagicMock(status_code=500)
+    session, seen = _session_that_records(monkeypatch, [response], delays)
+
+    got = session.get("https://netbox.example.com/api/dcim/devices/")
+
+    assert got.status_code == 500
+    assert len(seen) == 1
+    assert delays == []
 
 
 def test_missing_site_id_field_falls_back_to_name_matching(caplog):

@@ -973,7 +973,11 @@ class SyncEngine:
             )
             return
 
-        if inventory and existing is not None and cross_site:
+        # Inventory must not relocate a device that already lives elsewhere,
+        # and must not create a second one. A tagged legacy client is the
+        # exception: MERGE_CLIENT_INFRA converts it in place (same NetBox id
+        # and site) instead of skipping the match.
+        if inventory and existing is not None and cross_site and not legacy:
             summary.infra_duplicates_avoided += 1
             logger.info(
                 "%sinventory site %r: %s %r (%s) matches NetBox device id=%s %r at site %r by %s; "
@@ -1040,6 +1044,13 @@ class SyncEngine:
                 summary.infra_type_generated += 1
             if legacy:
                 summary.infra_merged += 1
+                # move_site is false for an inventory observation, so a
+                # cross-site legacy client keeps the site it already has.
+                kept_site = (
+                    current_site
+                    if cross_site and not move_site and current_site
+                    else pair.netbox_site_slug
+                )
                 logger.info(
                     "[dry-run] would merge legacy client device id=%s name=%r (MAC %s) into %s %r "
                     "role=%r type=%r source=%s status=%s site=%r; eth0 %s",
@@ -1052,7 +1063,7 @@ class SyncEngine:
                     spec.slug,
                     source,
                     status,
-                    pair.netbox_site_slug,
+                    kept_site,
                     eth0_plan,
                 )
             elif move_site:
@@ -1146,7 +1157,7 @@ class SyncEngine:
             self._forget_switch(mac)
         elif legacy:
             summary.infra_merged += 1
-            if cross_site:
+            if move_site:
                 summary.infra_moved += 1
             logger.info(
                 "Merged legacy client device id=%s into %s %r role=%r type=%r source=%s; eth0 %s",

@@ -235,6 +235,22 @@ def test_no_library_configured_returns_nothing():
 # -- legacy client merge ------------------------------------------------
 
 
+def test_legacy_client_on_another_real_site_is_merged_and_moved():
+    """A real site still pulls a legacy client onto itself. Inventory does not."""
+    netbox = FakeNetboxGateway()
+    legacy = netbox.seed_legacy_client(SWITCH_MAC, site_slug="branch")
+    legacy_id = legacy.id
+
+    summary, _ = _run([_switch()], netbox=netbox, device_update_policy="create-only")
+
+    assert summary.infra_merged == 1
+    assert summary.infra_moved == 1
+    assert summary.infra_created == 0
+    assert legacy.id == legacy_id
+    assert legacy.site_slug == "main"
+    assert legacy.role_slug == "switch"
+
+
 def test_legacy_client_is_merged_in_place_under_create_only():
     """Older releases stored switches as client devices named by MAC."""
     netbox = FakeNetboxGateway()
@@ -395,7 +411,7 @@ def _device(mac, name, serial, model="USW24POE", device_type="usw", **kw):
 
 
 def _two_sites(devices_by_site, site_map, **overrides):
-    netbox = FakeNetboxGateway()
+    netbox = overrides.pop("netbox", None) or FakeNetboxGateway()
     engine = SyncEngine(
         unifi=FakeUnifiClient(devices_by_site=devices_by_site, sites=overrides.pop("sites", None)),
         netbox=CachingNetboxGateway(netbox),
@@ -407,6 +423,111 @@ def _two_sites(devices_by_site, site_map, **overrides):
         ),
     )
     return engine.run(), netbox
+
+
+def test_inventory_site_merges_a_legacy_client_in_place_without_moving_it():
+    """A tagged client on another site is converted, not skipped and not moved."""
+    netbox = FakeNetboxGateway()
+    legacy = netbox.seed_legacy_client(OTHER_MAC, site_slug="hq")
+    legacy_id = legacy.id
+    switch = _device(OTHER_MAC, "spare-switch", "SER-INV-9")
+
+    summary, _ = _two_sites(
+        {"staging": [switch]},
+        {"staging": "warehouse"},
+        inventory_site_ids=("staging",),
+        device_update_policy="create-only",
+        merge_client_infra=True,
+        netbox=netbox,
+    )
+
+    assert summary.infra_merged == 1
+    assert summary.infra_created == 0
+    assert summary.infra_moved == 0
+    assert summary.infra_duplicates_avoided == 0
+    assert legacy.id == legacy_id
+    assert legacy.site_slug == "hq"
+    assert legacy.name == "spare-switch"
+    assert legacy.role_slug == "switch"
+    assert legacy.device_type_slug == "ubiquiti-usw24poe"
+    assert legacy.status.value == "inventory"
+    assert "eth0" not in legacy.interfaces
+    assert netbox.infra_by_mac[OTHER_MAC].id == legacy_id
+
+
+def test_inventory_legacy_merge_is_planned_and_not_written_on_dry_run(caplog):
+    netbox = FakeNetboxGateway()
+    legacy = netbox.seed_legacy_client(OTHER_MAC, site_slug="hq")
+    switch = _device(OTHER_MAC, "spare-switch", "SER-INV-9")
+
+    with caplog.at_level(logging.INFO):
+        summary, _ = _two_sites(
+            {"staging": [switch]},
+            {"staging": "warehouse"},
+            inventory_site_ids=("staging",),
+            device_update_policy="create-only",
+            dry_run=True,
+            netbox=netbox,
+        )
+
+    assert summary.infra_merged == 0
+    assert summary.infra_created == 0
+    assert legacy.role_slug == "unifi-client"
+    assert legacy.site_slug == "hq"
+    assert netbox.infra_by_mac == {}
+    merge_lines = [r.getMessage() for r in caplog.records if "would merge" in r.getMessage()]
+    assert len(merge_lines) == 1
+    assert "site='hq'" in merge_lines[0]
+    assert "not creating a duplicate and not moving it" not in caplog.text
+
+
+def test_inventory_site_still_skips_a_non_legacy_device_on_another_site(caplog):
+    netbox = FakeNetboxGateway()
+    parked = netbox.seed_legacy_client(OTHER_MAC, site_slug="hq", role_slug="switch")
+    parked.name = "floor-switch"
+    parked.device_type_slug = "already-there"
+    switch = _device(OTHER_MAC, "spare-switch", "SER-INV-9")
+
+    with caplog.at_level(logging.INFO):
+        summary, _ = _two_sites(
+            {"staging": [switch]},
+            {"staging": "warehouse"},
+            inventory_site_ids=("staging",),
+            device_update_policy="create-only",
+            netbox=netbox,
+        )
+
+    assert summary.infra_duplicates_avoided == 1
+    assert summary.infra_merged == 0
+    assert summary.infra_created == 0
+    assert summary.infra_moved == 0
+    assert parked.site_slug == "hq"
+    assert parked.role_slug == "switch"
+    assert parked.device_type_slug == "already-there"
+    assert parked.name == "floor-switch"
+    assert parked.status.value == "active"
+    assert "not creating a duplicate and not moving it" in caplog.text
+
+
+def test_inventory_legacy_client_is_left_alone_when_merge_is_disabled():
+    netbox = FakeNetboxGateway()
+    legacy = netbox.seed_legacy_client(OTHER_MAC, site_slug="hq")
+    switch = _device(OTHER_MAC, "spare-switch", "SER-INV-9")
+
+    summary, _ = _two_sites(
+        {"staging": [switch]},
+        {"staging": "warehouse"},
+        inventory_site_ids=("staging",),
+        merge_client_infra=False,
+        netbox=netbox,
+    )
+
+    assert summary.infra_created == 0
+    assert summary.infra_merged == 0
+    assert summary.infra_duplicates_avoided == 1
+    assert legacy.role_slug == "unifi-client"
+    assert legacy.site_slug == "hq"
+    assert netbox.infra_by_mac == {}
 
 
 def test_inventory_site_does_not_duplicate_a_device_on_a_real_site():
@@ -692,3 +813,103 @@ def test_library_power_templates_are_copied_onto_the_device(tmp_path):
     assert set(device.interfaces) == {"Port 21"}
     assert device.power_outlets["Outlet 1"] == "nema-5-15r"
     assert device.power_ports["Input"] == "nema-5-15p"
+
+
+def test_uxg_pro_with_one_outlet_is_a_gateway_not_a_pdu():
+    gateway = UnifiSwitchDevice(
+        mac="aa:bb:cc:dd:ee:40",
+        name="edge-gw",
+        model="UXGPRO",
+        device_type="uxg",
+        ports=[UnifiPort(index=1, media="GE", max_speed=1000)],
+        outlets=[UnifiOutlet(index=1, name="Outlet 1")],
+    )
+
+    spec = spec_from_unifi_device(gateway)
+    assert spec.power_outlets == []
+    assert [name for name, _ in spec.interfaces] == ["Port 1"]
+
+    summary, netbox = _run([gateway])
+
+    device = netbox.infra_by_mac["aa:bb:cc:dd:ee:40"]
+    assert device.role_slug == "router"
+    assert device.power_outlets == {}
+    assert "Port 1" in device.interfaces
+    assert summary.infra_created == 1
+
+
+def test_up6_strip_gets_six_outlets_when_the_controller_sends_one():
+    strip = UnifiSwitchDevice(
+        mac="aa:bb:cc:dd:ee:61",
+        name="bench-strip",
+        model="UP6",
+        device_type="uap",
+        shortname="USP-Strip",
+        outlets=[UnifiOutlet(index=1, name="Bench 1")],
+    )
+
+    spec = spec_from_unifi_device(strip)
+    assert [outlet.name for outlet in spec.power_outlets] == ["Bench 1"] + [
+        f"Outlet {i}" for i in range(2, 7)
+    ]
+
+    summary, netbox = _run([strip])
+
+    device = netbox.infra_by_mac["aa:bb:cc:dd:ee:61"]
+    assert device.role_slug == "pdu"
+    assert list(device.power_outlets) == ["Bench 1"] + [f"Outlet {i}" for i in range(2, 7)]
+    assert summary.infra_type_generated == 1
+
+
+def test_up6_with_an_empty_outlet_table_still_has_six_outlets():
+    strip = UnifiSwitchDevice(
+        mac="aa:bb:cc:dd:ee:62",
+        name="empty-strip",
+        model="UP6",
+        device_type="uap",
+        outlets=[],
+    )
+
+    spec = spec_from_unifi_device(strip)
+
+    assert [outlet.name for outlet in spec.power_outlets] == [f"Outlet {i}" for i in range(1, 7)]
+
+
+def test_up6_keeps_a_complete_outlet_table():
+    strip = UnifiSwitchDevice(
+        mac="aa:bb:cc:dd:ee:63",
+        name="full-strip",
+        model="UP6",
+        device_type="uap",
+        outlets=[UnifiOutlet(index=i, name=f"Bench {i}") for i in range(1, 7)],
+    )
+
+    spec = spec_from_unifi_device(strip)
+
+    assert [outlet.name for outlet in spec.power_outlets] == [f"Bench {i}" for i in range(1, 7)]
+
+
+def test_library_outlet_list_wins_over_the_up6_count(tmp_path):
+    vendor = tmp_path / "device-types" / "Ubiquiti"
+    vendor.mkdir(parents=True)
+    (vendor / "USP-Strip.yaml").write_text(
+        "manufacturer: Ubiquiti\nmodel: UniFi SmartPower Strip\nslug: usp-strip\n"
+        "part_number: USP-Strip\n"
+        "power-ports:\n  - name: Input\n    type: nema-5-15p\n"
+        "power-outlets:\n"
+        "  - name: Outlet A\n    type: nema-5-15r\n    power_port: Input\n"
+        "  - name: Outlet B\n    type: nema-5-15r\n    power_port: Input\n"
+    )
+    strip = UnifiSwitchDevice(
+        mac="aa:bb:cc:dd:ee:64",
+        name="library-strip",
+        model="UP6",
+        device_type="uap",
+        outlets=[UnifiOutlet(index=1, name="ignored")],
+    )
+
+    _, netbox = _run([strip], devicetype_library_path=str(tmp_path))
+
+    device = netbox.infra_by_mac["aa:bb:cc:dd:ee:64"]
+    assert device.device_type_slug == "usp-strip"
+    assert set(device.power_outlets) == {"Outlet A", "Outlet B"}

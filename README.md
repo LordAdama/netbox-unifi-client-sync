@@ -158,7 +158,12 @@ devices on those sites are created with `INVENTORY_DEVICE_STATUS` (default
 Matching is by MAC, then by serial, across every NetBox site, before a
 device is created. An inventory observation never creates a duplicate of a
 device that already exists somewhere else, and it never moves a device off a
-real site. When that same device later shows up adopted at a real site, it
+real site. A tagged legacy client (`unifi-client`, `unifi_mac` set) is the
+exception to that skip: with `MERGE_CLIENT_INFRA` on, the device is merged
+in place. It keeps its NetBox id and site, and its role and device type are
+converted to the adopted hardware. It is not moved onto the inventory site.
+With `MERGE_CLIENT_INFRA` off it is left unchanged and is not duplicated.
+When that same device later shows up adopted at a real site, it
 moves there — including under `create-only`, when its recorded UniFi site
 (`unifi_site_name` / `unifi_site_internal_id`) or its current NetBox site is
 one of the inventory sites. A move between two real sites happens only when
@@ -206,11 +211,15 @@ non-empty `outlet_table`, `type` of `usp` / `ups` / `pdu`, a known model
 code (`USPPDUP`, `USPRPS`, `UPS2U`, …), a model or shortname starting with
 `USWDA`, `PDU` in the code, or a shortname starting with `UPS`. A Pro XG
 switch (`USPXG…`) is not treated as power just because the code starts with
-`USP`.
+`USP`. A gateway is not treated as power because `outlet_table` has a row:
+type `uxg`, `ugw`, or `udm`, and UXG/UGW/UDM model codes (UXG-Pro, USG,
+UDM-Pro, UDR), stay gateways. UXG-Pro reports a single outlet.
 
 Outlets become NetBox power outlets fed by an `Input` power port. Network
-ports stay interfaces. When the library has the model (USP-PDU-Pro, USP-RPS,
-UPS-2U), its templates are used instead of a generated outlet list.
+ports stay interfaces. USP-Strip (`UP6`) has six AC outlets; a shorter
+`outlet_table` still generates six, and a complete table is kept as reported.
+When the library has the model (USP-PDU-Pro, USP-RPS, UPS-2U), its templates
+are used instead of a generated outlet list.
 
 ## Finding your switches
 
@@ -774,7 +783,9 @@ for something bigger:
 - **HTTP calls time out.** UniFi and NetBox requests use `UNIFI_TIMEOUT` and
   `NETBOX_TIMEOUT` (default 30s). pynetbox itself does not set a timeout; without
   one, a stalled NetBox connection hangs the process and the healthcheck file
-  is never written.
+  is never written. A NetBox read (`GET`, `HEAD`, `OPTIONS`) that times out or
+  fails to connect is retried twice, with one second and then two seconds of
+  backoff. Writes are not retried: a timed-out create may already have landed.
 - **One site cannot abort the others.** A failure while syncing a site —
   including an unexpected exception — is logged, recorded on that site, and
   the run continues. Stale-offline marking for a NetBox site is skipped when
