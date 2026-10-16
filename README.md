@@ -68,7 +68,7 @@ matched) and every ambiguous match (a MAC that appears on more than one
 NetBox interface, or two interfaces that parse to the same port) is logged
 at INFO/WARNING for troubleshooting.
 
-## Syncing UniFi devices (switches, APs, gateways)
+## Syncing UniFi devices (switches, APs, gateways, PDUs)
 
 By default this tool only creates *clients*, and expects your UniFi hardware
 to already be in NetBox. Set `SYNC_UNIFI_DEVICES=true` and it will create the
@@ -81,44 +81,136 @@ SITE_POLICY=create      # if the NetBox sites don't exist yet either
 
 Each adopted device becomes a NetBox device with:
 
-- **Its real ports**, built from the controller's own `port_table` — so a
-  24-port switch gets 24 interfaces, typed from the reported media and speed
-  (`1000base-t`, `10gbase-x-sfpp`, …). This is more accurate than any static
-  library, because it reflects the hardware actually in front of you.
-- **A per-type role**: `switch`, `wireless-ap` or `router`, so you can filter
-  them apart in NetBox. Anything unrecognised gets `UNIFI_DEVICE_ROLE_SLUG`.
-- **Its serial and a `unifi_mac` custom field**, which is the exact-match key
-  the cable code uses — devices created this way always wire up.
+- **Interfaces, and power components for PDUs.** When
+  `DEVICETYPE_LIBRARY_PATH` matches the model, the device type's interface,
+  power-port, and power-outlet templates come from that YAML. Otherwise they
+  are built from the controller: `port_table` becomes interfaces (typed from
+  the reported media and speed, `1000base-t`, `10gbase-x-sfpp`, …) and
+  `outlet_table` becomes power outlets. A portless AP still gets `Port 1`
+  so an uplink cable has somewhere to land.
+- **A per-kind role.** Defaults stay `switch`, `wireless-ap`, `router`, and
+  `pdu`. Anything unrecognised gets `UNIFI_DEVICE_ROLE_SLUG` (`network-device`).
+  Point the per-kind settings at roles you already have and those roles are
+  reused; the log line is `Reusing existing NetBox device role`. A missing
+  slug is still created, so a first run needs no extra setup.
+- **Its serial, a `unifi_mac` custom field, and the UniFi site it came from**
+  (`unifi_site_name` and `unifi_site_internal_id` on the device). `unifi_mac`
+  is the exact-match key the cable code uses.
 
 Devices are created **before** clients in each run, so a switch created now
 terminates this same run's cables. Starting from an empty NetBox, one run
 gives you the switch, its ports, the clients, and the cables between them.
 
-Ports are named `Port 1`, `Port 2`, … — which the default
+Generated ports are named `Port 1`, `Port 2`, … — which the default
 `PORT_NAME_TEMPLATES` already resolve, so cabling needs no extra setup.
+Library templates keep the names from the YAML (`eth0` on a UAP-AC-Pro, for
+example).
 
 Only *adopted* devices are synced; pending-adoption ones are ignored.
 
-### Nicer model names via devicetype-library
+A dry-run logs the plan and writes nothing. The site line lists creates by
+kind (`switch`, `ap`, `gateway`, `power`), merges, moves, cross-site matches
+that were not duplicated, and whether each type came from the library or was
+generated.
+
+### Roles
+
+| Setting | Default | Recommended when the role already exists |
+| --- | --- | --- |
+| `UNIFI_SWITCH_ROLE_SLUG` | `switch` | `access-switch` |
+| `UNIFI_AP_ROLE_SLUG` | `wireless-ap` | `wireless-access-point` |
+| `UNIFI_GATEWAY_ROLE_SLUG` | `router` | `gateway` |
+| `UNIFI_POWER_ROLE_SLUG` | `pdu` | `pdu` |
+| `UNIFI_DEVICE_ROLE_SLUG` | `network-device` | leave as-is |
+
+Defaults match what earlier releases created. Changing them does not rename
+roles that already exist; it only chooses which slug new and merged devices
+use.
+
+### Legacy client devices
+
+Earlier releases stored adopted switches, APs, and gateways as client
+devices: role `unifi-client`, name equal to the MAC, a single `eth0`, and
+`unifi_mac` set. `MERGE_CLIENT_INFRA` (default `true`, and the recommended
+value) converts that device in place when an adopted UniFi device has the
+same MAC. The NetBox id, journal, and addresses stay. The name, role, device
+type, and components are updated from UniFi. This happens even when
+`DEVICE_UPDATE_POLICY=create-only`.
+
+`eth0` is removed only when it has no IP and no cable. If it does, those
+are moved onto the first interface of the new type. `eth0` is kept when the
+new type already has an interface of that name (the UAP-AC-Pro library entry
+does) or when the target interface is already cabled.
+
+`MERGE_CLIENT_INFRA=false` leaves the client device untouched and does not
+create a second device for that MAC. Only devices that carry the sync tag
+and the client role are merged. An untagged device with the same MAC is left
+alone and is not duplicated.
+
+### Inventory and staging sites
+
+`UNIFI_INVENTORY_SITES` is a comma-separated list of UniFi site ids. Each
+token may be the short API name (`staging`) or the controller `_id`. Adopted
+devices on those sites are created with `INVENTORY_DEVICE_STATUS` (default
+`inventory`; also `offline`, `active`, `planned`, `staged`, `failed`,
+`decommissioning`).
+
+Matching is by MAC, then by serial, across every NetBox site, before a
+device is created. An inventory observation never creates a duplicate of a
+device that already exists somewhere else, and it never moves a device off a
+real site. When that same device later shows up adopted at a real site, it
+moves there — including under `create-only`, when its recorded UniFi site
+(`unifi_site_name` / `unifi_site_internal_id`) or its current NetBox site is
+one of the inventory sites. A move between two real sites happens only when
+`DEVICE_UPDATE_POLICY=sync`. Under `create-only` the device stays where it
+is and the run logs that the duplicate was avoided.
+
+Name matching stays inside one NetBox site. The same name at another site
+is a different device.
+
+### devicetype-library
 
 Left alone, a device type is named after the UniFi model code (`USW24POE`).
 Point `DEVICETYPE_LIBRARY_PATH` at a clone of
 [netbox-community/devicetype-library](https://github.com/netbox-community/devicetype-library)
-and it will instead use that project's canonical model name, part number and
-rack height:
+and a match uses that project's model name, part number, rack height, and
+component templates:
 
 ```bash
 git clone --depth 1 https://github.com/netbox-community/devicetype-library
 DEVICETYPE_LIBRARY_PATH=/path/to/devicetype-library
 ```
 
-Matching is on the model code against each YAML's `part_number`/`model`/`slug`,
-normalized so `USW24POE` finds `USW-24-POE`. If you have **already imported**
-those device types into NetBox, they're reused rather than duplicated.
+Controller model codes (`US24`, `U7PG2`, `US24PRO2`, `USPPDUP`) are mapped
+onto the library SKU (`US-24`, `UAP-AC-Pro`, `USW-Pro-24`, `USP-PDU-Pro`).
+`U7PG2` is the AC Pro, not a Wi-Fi 7 AP. Matching also folds punctuation, so
+`USW24POE` finds `USW-24-POE`. A device type already in NetBox with the same
+slug, part number, or model is reused rather than duplicated.
 
-This is metadata polish, not a requirement: **ports always come from the
-controller**, never from the library, and an unmatched model still syncs with
-its full real port list. The library is only read when the path is set.
+An unmatched model still syncs. Its interfaces come from `port_table`. The
+library is only read when the path is set. The image does not clone it
+unless you build with `--build-arg FETCH_DEVICETYPE_LIBRARY=true`, which
+puts the tree at `/opt/devicetype-library` and the entrypoint uses that path
+when `DEVICETYPE_LIBRARY_PATH` is empty. Compose can mount a clone instead:
+
+```yaml
+volumes:
+  - /path/to/devicetype-library:/opt/devicetype-library:ro
+```
+
+### Power devices
+
+USP PDUs, USP-RPS, smart plugs, and USW-DA / UPS towers sync with the power
+role. UniFi often reports them as `type: usw`. They are recognised by a
+non-empty `outlet_table`, `type` of `usp` / `ups` / `pdu`, a known model
+code (`USPPDUP`, `USPRPS`, `UPS2U`, …), a model or shortname starting with
+`USWDA`, `PDU` in the code, or a shortname starting with `UPS`. A Pro XG
+switch (`USPXG…`) is not treated as power just because the code starts with
+`USP`.
+
+Outlets become NetBox power outlets fed by an `Input` power port. Network
+ports stay interfaces. When the library has the model (USP-PDU-Pro, USP-RPS,
+UPS-2U), its templates are used instead of a generated outlet list.
 
 ## Finding your switches
 
@@ -255,6 +347,11 @@ docker build \
   -t netbox-unifi-client-sync .
 ```
 
+Add `--build-arg FETCH_DEVICETYPE_LIBRARY=true` only if the image should
+carry a clone of devicetype-library. Otherwise mount one at
+`/opt/devicetype-library` or set `DEVICETYPE_LIBRARY_PATH`. The default
+build does not clone it.
+
 The image records that commit in the OCI label `org.opencontainers.image.revision`
 (and in `/app/REVISION`). Trace a running container with:
 
@@ -344,7 +441,7 @@ full list and defaults. Key ones:
 | `NETBOX_URL` / `NETBOX_TOKEN` | NetBox API endpoint and token |
 | `NETBOX_SITE_SLUG` | NetBox site clients should be placed in; ignored if `SITE_MAP` is set |
 | `SITE_MAP` | Multi-site: `*` for every site on the controller, and/or `unifi_site:netbox_site_slug` pairs — see "Multi-site sync" |
-| `SITE_MATCH` | `normalized` (default), `name`, or `slug` — fallback after the `unifi_site_id` custom field; see "Linking to sites you already have" |
+| `SITE_MATCH` | `normalized` (default), `name`, or `slug` — fallback after the UniFi site id fields; see "Linking to sites you already have" |
 | `SITE_POLICY` | `require` (default) or `create` — creating sites is opt-in; see "Site & update policies" |
 | `DEVICE_UPDATE_POLICY` | `create-only` (default) or `sync` — see "Site & update policies" |
 | `NETBOX_TIMEOUT` / `UNIFI_TIMEOUT` | Per-request HTTP timeouts in seconds (default `30`). A NetBox call with no timeout is what hung a run indefinitely |
@@ -352,9 +449,16 @@ full list and defaults. Key ones:
 | `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order; blank uses the built-in list. `{port}` is the UniFi index, `{port2}` zero-pads it, `{sfp}` is the SFP ordinal |
 | `PORT_MODEL_TEMPLATES` | Per UniFi model, tried first. Example: `USW-Pro-48=Gi1/0/{port};SFP {sfp}`. Separate models with a vertical bar. A model listed here does not get the structural guess |
 | `CABLE_SKIP_REPORT` | Path of a CSV listing every skipped cable (site, switch, UniFi port, names tried, NetBox interfaces, reason). Blank logs the same rows and a count by reason without writing a file |
-| `SYNC_UNIFI_DEVICES` | Create adopted UniFi switches/APs/gateways in NetBox (default `false`) — see "Syncing UniFi devices" |
-| `DEVICETYPE_LIBRARY_PATH` | Local devicetype-library clone, for canonical model names/part numbers |
-| `UNIFI_DEVICE_ROLE_SLUG` | Role for created UniFi devices of unrecognised type (default `network-device`) |
+| `SYNC_UNIFI_DEVICES` | Create adopted UniFi switches/APs/gateways/PDUs in NetBox (default `false`) — see "Syncing UniFi devices" |
+| `DEVICETYPE_LIBRARY_PATH` | Local devicetype-library clone. A match supplies the device type and its interface/power templates; otherwise they are generated. Recommended mount: `/opt/devicetype-library` |
+| `UNIFI_DEVICE_ROLE_SLUG` | Role for created UniFi devices of unrecognised kind (default `network-device`) |
+| `UNIFI_SWITCH_ROLE_SLUG` | Role for switches (default `switch`; recommended `access-switch` when that role exists) |
+| `UNIFI_AP_ROLE_SLUG` | Role for access points (default `wireless-ap`; recommended `wireless-access-point`) |
+| `UNIFI_GATEWAY_ROLE_SLUG` | Role for gateways (default `router`; recommended `gateway`) |
+| `UNIFI_POWER_ROLE_SLUG` | Role for PDUs, RPS, and UPS hardware (default `pdu`) |
+| `MERGE_CLIENT_INFRA` | Convert a tagged client device into the adopted UniFi device with the same MAC (default `true`). `false` leaves it and does not create a duplicate |
+| `UNIFI_INVENTORY_SITES` | Comma-separated UniFi API names and/or `_id`s whose devices are staging stock (default empty) |
+| `INVENTORY_DEVICE_STATUS` | NetBox status for devices synced from an inventory site (default `inventory`) |
 | `USE_OUI_MANUFACTURER` | Give clients a device type carrying their real vendor (default `true`) — see "Manufacturers" |
 | `OUI_FILE` | Optional IEEE `oui.txt` / Wireshark `manuf` file, used only when the controller reports no vendor |
 | `CABLE_CONFLICT_POLICY` | `skip` (default) or `replace`. `replace` only deletes cables tagged `SYNC_TAG`; manual cables stay |
@@ -381,11 +485,16 @@ SITE_MAP=*
 ```
 
 The controller is asked which sites exist and each is matched to a NetBox
-site. The durable key is a `unifi_site_id` custom field on the NetBox site
-(the UniFi site's API id, e.g. `7xk2p9qr`). When that field is empty the tool
-falls back to the slug, the site name, then both folded to alphanumerics.
-The slug guess comes from the site's description as shown in the UniFi UI
-("Head Office" → `head-office`), not from the API id.
+site. UniFi has two ids: the short API name used in `/s/{name}/` (`default`,
+`7xk2p9qr`) and the immutable `_id` (a hex ObjectId). NetBox stores both.
+`unifi_site_id` keeps the short API name, which is what earlier releases
+wrote there. `unifi_site_name` is that same short name under an explicit
+field, and `unifi_site_internal_id` is the `_id`. When those fields are
+empty the tool falls back to the slug, the site name, then both folded to
+alphanumerics. The slug guess comes from the site's description as shown in
+the UniFi UI ("Head Office" → `head-office`), not from the API id. An
+explicit `SITE_MAP` entry still chooses the slug when nothing is already
+linked; a stored id wins over that slug.
 
 **Missing sites are not created** unless `SITE_POLICY=create`. Leave the
 default `require` in place until a dry-run shows every UniFi site landing on
@@ -439,29 +548,46 @@ slugifies to `acme-s-depot-north-yard`, which does not equal an existing
 So before syncing, each UniFi site is resolved against the sites already in
 NetBox, in order:
 
-1. custom field **`unifi_site_id`** equal to the UniFi site id. This still
-   matches after someone renames the NetBox site or changes its slug.
-2. exact slug
-3. exact **name** (the UniFi site description vs the NetBox site name)
-4. both folded to alphanumerics, making apostrophes, dashes, spacing and case
+1. custom field **`unifi_site_internal_id`** equal to the controller `_id`.
+   This still matches after the UniFi description is renamed and after the
+   NetBox name or slug changes.
+2. custom field **`unifi_site_id`** or **`unifi_site_name`** equal to the
+   short API name (`default`, `7xk2p9qr`). `unifi_site_id` is what earlier
+   releases stored, and it still holds that short name, not the `_id`.
+3. exact slug
+4. exact **name** (the UniFi site description vs the NetBox site name)
+5. both folded to alphanumerics, making apostrophes, dashes, spacing and case
    irrelevant
 
 Every step is an exact comparison after folding — never fuzzy — so two
 genuinely different sites are not bound together. `SITE_MATCH=name` stops
 after the name step, `SITE_MATCH=slug` stops after the slug step. The id
-custom field is always tried first, and a hit counts only when the site's
-own `unifi_site_id` equals the UniFi id. NetBox ignores unknown filters, so
-before that custom field exists a `cf_unifi_site_id` query returns *every*
-site; the first of those is not a match. A dry-run does not create the
-field, which is why that check matters on the first preview.
+fields are always tried first, and a hit counts only when the site's own
+field equals the value we asked for. NetBox ignores unknown filters, so
+before a custom field exists a `cf_*` query returns *every* site; the first
+of those is not a match. A dry-run does not create the fields, which is why
+that check matters on the first preview.
+
+`SITE_MAP` keys stay the short API name (`default:main`). The value is the
+slug to create when no site is already linked. A site that already carries
+`unifi_site_internal_id`, `unifi_site_id`, or `unifi_site_name` for that
+UniFi site is used even when `SITE_MAP` names a different slug.
 
 The first time a site is matched by name or slug, and it is the only UniFi
-site that resolved to it, the UniFi id is recorded in `unifi_site_id` if
-that field is empty. That is the only write. **Name, slug, and status are
-never changed**, so a rename made in NetBox is not reverted and a later run
-follows the renamed site instead of creating the old name again. An id that
-is already set is not overwritten, and the same id is never copied onto a
-second site.
+site that resolved to it, empty identity fields are filled. `unifi_site_id`
+and `unifi_site_name` receive the short API name. If `unifi_site_id` is
+already set, it is copied into an empty `unifi_site_name` and is not
+changed. `unifi_site_internal_id` is set from the controller `_id` only;
+it is never guessed from the legacy field. A non-empty field that already
+holds a different value is not overwritten, and the same value is never
+copied onto a second site. **Name, slug, and status are never changed**, so
+a rename made in NetBox is not reverted and a later run follows the renamed
+site instead of creating the old name again.
+
+The same two fields are also created on devices. A device records the UniFi
+site (`unifi_site_name`, `unifi_site_internal_id`) it was last synced from,
+which is how an inventory site can tell a staging unit from a device that
+already lives somewhere else.
 
 If more than one UniFi site resolves to the same NetBox site, the run skips
 all of them, records an error, and does not stamp `unifi_site_id`. That is
@@ -490,9 +616,9 @@ Two independent, conservative-by-default policy knobs:
   (checked separately for each pair under `SITE_MAP`). `require` (default)
   records an error for that site and creates nothing — a typo, or a site
   you renamed in NetBox and have not linked yet, must not spawn a duplicate.
-  `create` is opt-in: it creates a minimal site (name, slug, status, and
-  `unifi_site_id`) when nothing matches. Neither setting modifies an
-  existing site's name or slug.
+  `create` is opt-in: it creates a minimal site (name, slug, status, and the
+  three UniFi identity fields) when nothing matches. Neither setting modifies
+  an existing site's name or slug.
 - **`DEVICE_UPDATE_POLICY`** governs a **tagged** client device's `name` and
   `status` after it was created. `create-only` (default) sets them once and
   leaves them alone, so a rename in NetBox sticks. `sync` is opt-in and
@@ -671,13 +797,14 @@ sites, rename devices, or replace cables:
 1. Deploy with `DRY_RUN=true` (the default) and `SITE_POLICY=require` (the
    default). Let one scheduled run finish and read the log.
 2. Check three things in that log: which UniFi sites linked to which existing
-   NetBox sites (`unifi_site_id` or a name match), which sites were **not**
-   matched (those would be created only if you later set `SITE_POLICY=create`),
-   and which cables were skipped because a switch or a port was missing.
-   Skipped cables do not create switches.
+   NetBox sites (`unifi_site_internal_id`, `unifi_site_id` / `unifi_site_name`,
+   or a name match), which sites were **not** matched (those would be created
+   only if you later set `SITE_POLICY=create`), and which cables were skipped
+   because a switch or a port was missing. Skipped cables do not create switches.
 3. For a NetBox site you renamed, either let the dry-run's name match record
-   `unifi_site_id` on the next real run, or set that custom field yourself to
-   the UniFi site id before applying. Do not rely on the old slug.
+   `unifi_site_id` (the short API name) on the next real run, or set that
+   custom field yourself before applying. `unifi_site_internal_id` is filled
+   from the controller `_id` on that same run. Do not rely on the old slug.
 4. Set `CABLE_SKIP_REPORT` and read the counts. `port_not_found` rows still
    need a `PORT_MODEL_TEMPLATES` entry. `shared_port` and `uplink_port` rows
    are intentional. `port_ambiguous` rows need a model template that names
@@ -748,7 +875,10 @@ every push/PR.
 - `naming.py` — device-name sanitization, the deterministic MAC-suffix
   collision fallback, and NetBox slug generation.
 - `devicetype_library.py` — optional index over a devicetype-library clone,
-  plus the UniFi-media/speed to NetBox-interface-type mapping.
+  plus the UniFi-media/speed to NetBox-interface-type mapping. A library hit
+  supplies interface and power templates; otherwise they are generated.
+- `model_map.py` — controller model codes to library SKUs, and which devices
+  are PDUs, RPS units, or UPS hardware rather than switches.
 - `oui.py` — locally-administered (randomized) MAC detection and the
   optional offline IEEE/Wireshark OUI file parser.
 - `metrics.py` — the JSON run-summary log line and optional Prometheus

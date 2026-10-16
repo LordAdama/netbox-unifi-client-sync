@@ -15,10 +15,23 @@ import requests
 
 from .config import Settings
 from .devicetype_library import DeviceTypeLibrary, spec_from_unifi_device
+from .model_map import device_kind
 from .metrics import log_json_summary, write_prometheus_textfile
 from .models import CableSkip, ClientSyncResult, SitePair, SiteSyncStats, SyncSummary, UnifiClient
 from .naming import mac_suffixed_name, sanitize_device_name, slugify
-from .netbox_client import UNIFI_SITE_ID_FIELD, NetboxGateway, SwitchHints, device_has_tag, site_unifi_id
+from .netbox_client import (
+    UNIFI_SITE_ID_FIELD,
+    UNIFI_SITE_INTERNAL_ID_FIELD,
+    UNIFI_SITE_NAME_FIELD,
+    NetboxGateway,
+    SwitchHints,
+    device_has_tag,
+    device_site_slug,
+    role_slug_of,
+    site_unifi_id,
+    site_unifi_internal_id,
+    site_unifi_name,
+)
 from .oui import OuiLookup, is_locally_administered
 from .portmatch import (
     candidate_names,
@@ -180,6 +193,11 @@ def _merge_summaries(summaries: list[SyncSummary]) -> SyncSummary:
         merged.sites_created += s.sites_created
         merged.devices_synced += s.devices_synced
         merged.infra_created += s.infra_created
+        merged.infra_merged += s.infra_merged
+        merged.infra_moved += s.infra_moved
+        merged.infra_duplicates_avoided += s.infra_duplicates_avoided
+        merged.infra_type_library += s.infra_type_library
+        merged.infra_type_generated += s.infra_type_generated
         merged.stale_marked_offline += s.stale_marked_offline
         merged.clients_unchanged += s.clients_unchanged
         merged.ips_unchanged += s.ips_unchanged
@@ -241,11 +259,33 @@ class SyncEngine:
         self._warned_ports: set[str] = set()
         # UniFi site id -> human label, for matching NetBox sites by name.
         self._site_labels: dict[str, str] = {}
+        # API site name -> controller _id.
+        self._site_internal_ids: dict[str, str] = {}
+        # NetBox slugs this run treats as inventory/staging sites.
+        self._inventory_netbox_slugs: set[str] = set()
+        # Serializes find-then-create across site workers so two sites cannot
+        # each create the same chassis.
+        self._infra_lock = threading.Lock()
         # Conflicts found while linking sites. Merged into the run summary so
         # a collapsed mapping cannot look like a successful sync.
         self._link_errors: list[str] = []
 
     # -- orchestration ---------------------------------------------------
+
+    def _load_controller_sites(self) -> None:
+        """Best-effort site list, so explicit SITE_MAP entries gain an _id."""
+        try:
+            sites = self.unifi.get_sites()
+        except Exception as exc:
+            logger.warning(
+                "Could not list UniFi sites (%s); site matching will use the API site name only",
+                exc,
+            )
+            return
+        for site in sites:
+            self._site_labels.setdefault(site.name, site.label)
+            if site.internal_id:
+                self._site_internal_ids[site.name] = site.internal_id
 
     def _discover_site_pairs(self) -> list[SitePair]:
         """Ask the controller which sites exist and derive a NetBox slug each.
@@ -282,7 +322,15 @@ class SyncEngine:
                 )
             slug_owners[slug] = site.name
             self._site_labels[site.name] = site.label
-            pairs.append(SitePair(unifi_site=site.name, netbox_site_slug=slug))
+            if site.internal_id:
+                self._site_internal_ids[site.name] = site.internal_id
+            pairs.append(
+                SitePair(
+                    unifi_site=site.name,
+                    netbox_site_slug=slug,
+                    unifi_internal_id=site.internal_id,
+                )
+            )
 
         logger.info(
             "Discovered %d site(s) from the controller: %s",
@@ -301,7 +349,17 @@ class SyncEngine:
 
     def run(self) -> SyncSummary:
         start = time.monotonic()
-        pairs = self._discover_site_pairs() if self.settings.sync_all_sites else self.settings.site_pairs()
+        if self.settings.sync_all_sites:
+            pairs = self._discover_site_pairs()
+        else:
+            # SITE_MAP still decides the slug. The controller site list, when
+            # readable, only adds the immutable _id so a later rename of the
+            # UniFi description still matches.
+            self._load_controller_sites()
+            pairs = self.settings.site_pairs()
+            for pair in pairs:
+                if not pair.unifi_internal_id:
+                    pair.unifi_internal_id = self._site_internal_ids.get(pair.unifi_site, "")
 
         if not self.settings.dry_run:
             # The id custom field has to exist before linking, which runs
@@ -317,6 +375,12 @@ class SyncEngine:
                 )
 
         pairs = self._link_existing_sites(pairs)
+        tokens = set(self.settings.inventory_site_ids)
+        self._inventory_netbox_slugs = {
+            pair.netbox_site_slug
+            for pair in pairs
+            if pair.unifi_site in tokens or (pair.unifi_internal_id and pair.unifi_internal_id in tokens)
+        }
 
         groups: dict[str, list[SitePair]] = {}
         for pair in pairs:
@@ -324,11 +388,13 @@ class SyncEngine:
 
         workers = max(1, min(self.settings.max_workers, len(groups)))
         logger.info(
-            "Policies: site=%s, device_update=%s, cable_conflict=%s | %d pair(s) in %d NetBox site "
-            "group(s), %d worker(s)",
+            "Policies: site=%s, device_update=%s, cable_conflict=%s, merge_client_infra=%s, "
+            "inventory_sites=%s | %d pair(s) in %d NetBox site group(s), %d worker(s)",
             self.settings.site_policy,
             self.settings.device_update_policy,
             self.settings.cable_conflict_policy,
+            self.settings.merge_client_infra,
+            ",".join(self.settings.inventory_site_ids) or "(none)",
             len(pairs),
             len(groups),
             workers,
@@ -412,6 +478,7 @@ class SyncEngine:
                     label,
                     self.settings.site_match,
                     pair.unifi_site,
+                    unifi_internal_id=pair.unifi_internal_id,
                 )
             except Exception as exc:
                 logger.warning(
@@ -456,26 +523,45 @@ class SyncEngine:
                     getattr(site, "name", ""),
                     pair.netbox_site_slug,
                 )
-            self._remember_site_link(site, pair.unifi_site)
-            resolved.append(SitePair(unifi_site=pair.unifi_site, netbox_site_slug=site.slug))
+            self._remember_site_link(site, pair.unifi_site, pair.unifi_internal_id)
+            resolved.append(
+                SitePair(
+                    unifi_site=pair.unifi_site,
+                    netbox_site_slug=site.slug,
+                    unifi_internal_id=pair.unifi_internal_id,
+                )
+            )
         return resolved
 
-    def _remember_site_link(self, site: object, unifi_site_id: str) -> None:
-        """Stamp the UniFi id onto a matched site, without renaming it.
+    def _remember_site_link(self, site: object, unifi_site_id: str, unifi_internal_id: str = "") -> None:
+        """Stamp UniFi identifiers onto a matched site, without renaming it.
 
-        An id that is already set is never replaced. A value that already
-        belongs to a different UniFi site is not written either; that case is
-        also a conflict and is reported on the summary.
+        ``unifi_site_id`` keeps the API site name. An id that is already set
+        to a different site is never replaced. When it already matches, empty
+        ``unifi_site_name`` / ``unifi_site_internal_id`` fields are still filled.
         """
         bound = site_unifi_id(site)
-        if bound:
-            if bound != unifi_site_id:
-                message = (
-                    f"Refusing to overwrite {UNIFI_SITE_ID_FIELD} on NetBox site "
-                    f"{getattr(site, 'slug', '')!r}: already {bound!r}, not {unifi_site_id!r}"
-                )
-                logger.error(message)
-                self._link_errors.append(message)
+        if bound and bound != unifi_site_id:
+            message = (
+                f"Refusing to overwrite {UNIFI_SITE_ID_FIELD} on NetBox site "
+                f"{getattr(site, 'slug', '')!r}: already {bound!r}, not {unifi_site_id!r}"
+            )
+            logger.error(message)
+            self._link_errors.append(message)
+            return
+        bound_internal = site_unifi_internal_id(site)
+        if bound_internal and unifi_internal_id and bound_internal != unifi_internal_id:
+            message = (
+                f"Refusing to overwrite {UNIFI_SITE_INTERNAL_ID_FIELD} on NetBox site "
+                f"{getattr(site, 'slug', '')!r}: already {bound_internal!r}, not {unifi_internal_id!r}"
+            )
+            logger.error(message)
+            self._link_errors.append(message)
+            return
+        needs_name = bool(unifi_site_id) and not site_unifi_name(site)
+        needs_id = bool(unifi_site_id) and not bound
+        needs_internal = bool(unifi_internal_id) and not bound_internal
+        if not (needs_name or needs_id or needs_internal):
             return
         if self.settings.dry_run:
             logger.info(
@@ -485,9 +571,18 @@ class SyncEngine:
                 getattr(site, "slug", ""),
                 getattr(site, "name", ""),
             )
+            if needs_name or needs_internal:
+                logger.info(
+                    "[dry-run] would record %s=%r and %s=%r on NetBox site %r",
+                    UNIFI_SITE_NAME_FIELD,
+                    unifi_site_id,
+                    UNIFI_SITE_INTERNAL_ID_FIELD,
+                    unifi_internal_id or "(unknown)",
+                    getattr(site, "slug", ""),
+                )
             return
         try:
-            self.netbox.remember_site_link(site, unifi_site_id)
+            self.netbox.remember_site_link(site, unifi_site_id, unifi_internal_id)
         except Exception as exc:
             logger.warning(
                 "Could not record %s on NetBox site %r (%s); it will be matched by name until this succeeds",
@@ -585,7 +680,9 @@ class SyncEngine:
             # a site created here can store it. Prerequisites (roles, the
             # generic device type) wait until the site is known to exist, so a
             # missing site does not create those objects on the way to failing.
-            _site, created = self.netbox.ensure_site(slug, s.site_policy, label, pair.unifi_site)
+            _site, created = self.netbox.ensure_site(
+                slug, s.site_policy, label, pair.unifi_site, pair.unifi_internal_id
+            )
             summary.sites_created = 1 if created else 0
             logger.info("NetBox site '%s': %s", slug, "created" if created else "reused existing")
             self.netbox.ensure_prerequisites(
@@ -613,7 +710,14 @@ class SyncEngine:
         if s.sync_unifi_devices:
             # Before clients, so a switch created now is immediately available
             # to terminate this same run's cables.
-            summary.devices_synced, summary.infra_created = self._sync_unifi_devices(pair)
+            infra = self._sync_unifi_devices(pair)
+            summary.devices_synced = infra.devices_synced
+            summary.infra_created = infra.infra_created
+            summary.infra_merged = infra.infra_merged
+            summary.infra_moved = infra.infra_moved
+            summary.infra_duplicates_avoided = infra.infra_duplicates_avoided
+            summary.infra_type_library = infra.infra_type_library
+            summary.infra_type_generated = infra.infra_type_generated
 
         clients = self.unifi.get_clients(pair.unifi_site)
         summary.clients_seen = len(clients)
@@ -718,82 +822,346 @@ class SyncEngine:
         logger.info("Loaded %d UniFi device(s) for site '%s' to match switches by name/serial",
                     len(devices), unifi_site)
 
-    # Per-type NetBox roles, so you can filter access points apart from
-    # switches in NetBox. Unrecognised types use unifi_device_role_slug.
-    _ROLE_BY_TYPE = {
-        "usw": "switch",
-        "uap": "wireless-ap",
-        "ugw": "router",
-        "udm": "router",
-        "uxg": "router",
-    }
+    def _role_for(self, device: object) -> tuple[str, str]:
+        """Return (kind, role slug) for an adopted UniFi device."""
+        s = self.settings
+        kind = device_kind(device)
+        role = {
+            "switch": s.unifi_switch_role_slug,
+            "ap": s.unifi_ap_role_slug,
+            "gateway": s.unifi_gateway_role_slug,
+            "power": s.unifi_power_role_slug,
+        }.get(kind, s.unifi_device_role_slug)
+        return kind, role
 
-    def _sync_unifi_devices(self, pair: SitePair) -> tuple[int, int]:
-        """Create/update adopted UniFi infrastructure. Returns (seen, created)."""
+    def _type_spec(self, device: object):
+        spec = self._library.lookup(getattr(device, "model", "") or "")
+        if spec is not None:
+            return spec, "library"
+        return spec_from_unifi_device(device), "generated"
+
+    def _is_inventory_pair(self, pair: SitePair) -> bool:
+        tokens = set(self.settings.inventory_site_ids)
+        if not tokens:
+            return False
+        return pair.unifi_site in tokens or (
+            bool(pair.unifi_internal_id) and pair.unifi_internal_id in tokens
+        )
+
+    def _device_from_inventory(self, existing: object) -> bool:
+        fields = getattr(existing, "custom_fields", None) or {}
+        tokens = set(self.settings.inventory_site_ids)
+        source_name = str(fields.get(UNIFI_SITE_NAME_FIELD) or "")
+        source_internal = str(fields.get(UNIFI_SITE_INTERNAL_ID_FIELD) or "")
+        if source_name and source_name in tokens:
+            return True
+        if source_internal and source_internal in tokens:
+            return True
+        site = device_site_slug(existing)
+        return bool(site) and site in self._inventory_netbox_slugs
+
+    def _sync_unifi_devices(self, pair: SitePair) -> SyncSummary:
+        """Create, merge, or move adopted UniFi infrastructure."""
+        summary = SyncSummary()
         s = self.settings
         try:
             devices = self.unifi.get_devices(pair.unifi_site)
         except EXPECTED_CLIENT_ERRORS as exc:
             logger.warning("Could not list UniFi devices for '%s': %s", pair.unifi_site, exc)
-            return 0, 0
+            return summary
 
         adopted = [d for d in devices if d.adopted and d.mac]
+        summary.devices_synced = len(adopted)
         if not adopted:
-            return 0, 0
+            return summary
 
-        created_count = 0
+        inventory = self._is_inventory_pair(pair)
+        created_by_kind: Counter[str] = Counter()
+        prefix = "[dry-run] " if s.dry_run else ""
+
         for device in adopted:
-            role_slug = self._ROLE_BY_TYPE.get(device.device_type, s.unifi_device_role_slug)
-            spec = self._library.lookup(device.model) or spec_from_unifi_device(device)
-            if s.dry_run:
-                logger.info(
-                    "[dry-run] would ensure UniFi %s %r (%s) as NetBox device type %r, role %r, "
-                    "with %d interface(s)",
-                    device.device_type or "device",
-                    device.name,
-                    device.model,
-                    spec.slug,
-                    role_slug,
-                    len(spec.interfaces),
-                )
-                continue
-
-            try:
-                self.netbox.ensure_device_role(role_slug)
-                type_slug = self.netbox.ensure_device_type_from_spec(spec)
-                _dev, created, _updated = self.netbox.upsert_infrastructure_device(
-                    device.mac,
-                    device.name,
-                    pair.netbox_site_slug,
-                    role_slug,
-                    type_slug,
-                    s.sync_tag,
-                    device.serial or "",
-                    s.device_update_policy,
-                )
-                created_count += int(created)
-                if created:
-                    logger.info(
-                        "Created NetBox device %r (%s %s) with %d port(s) from the controller",
-                        device.name,
-                        device.model,
-                        device.device_type,
-                        len(spec.interfaces),
+            kind, role_slug = self._role_for(device)
+            spec, source = self._type_spec(device)
+            status = s.inventory_device_status if inventory else "active"
+            with self._infra_lock:
+                try:
+                    self._sync_one_unifi_device(
+                        pair,
+                        device,
+                        kind,
+                        role_slug,
+                        spec,
+                        source,
+                        status,
+                        inventory,
+                        summary,
+                        created_by_kind,
+                        prefix,
                     )
-                    # A switch that didn't exist a moment ago is now cabling
-                    # material; drop any cached "not found" for it.
-                    self._forget_switch(device.mac)
-            except EXPECTED_CLIENT_ERRORS as exc:
-                logger.exception("Failed syncing UniFi device %s (%s)", device.mac, device.name)
-                raise LookupError(f"UniFi device {device.name} ({device.mac}): {exc}") from exc
+                except EXPECTED_CLIENT_ERRORS as exc:
+                    logger.exception("Failed syncing UniFi device %s (%s)", device.mac, device.name)
+                    raise LookupError(f"UniFi device {device.name} ({device.mac}): {exc}") from exc
 
+        kind_text = ", ".join(f"{name}={created_by_kind[name]}" for name in ("switch", "ap", "gateway", "power"))
         logger.info(
-            "Site '%s': %d adopted UniFi device(s), %d created in NetBox",
+            "%sSite '%s': %d adopted UniFi device(s); creates by kind: %s; "
+            "merged=%d; moved=%d; cross-site matches avoided=%d; "
+            "type sources library=%d generated=%d",
+            prefix,
             pair.unifi_site,
             len(adopted),
-            created_count,
+            kind_text,
+            summary.infra_merged,
+            summary.infra_moved,
+            summary.infra_duplicates_avoided,
+            summary.infra_type_library,
+            summary.infra_type_generated,
         )
-        return len(adopted), created_count
+        if s.dry_run:
+            # Dry-run logs the plan and writes nothing. Counters stay at zero
+            # so a preview is not mistaken for a completed write. The lines
+            # above are the record of what would have happened.
+            return SyncSummary(devices_synced=len(adopted))
+        return summary
+
+    def _sync_one_unifi_device(
+        self,
+        pair: SitePair,
+        device: object,
+        kind: str,
+        role_slug: str,
+        spec: object,
+        source: str,
+        status: str,
+        inventory: bool,
+        summary: SyncSummary,
+        created_by_kind: Counter,
+        prefix: str,
+    ) -> None:
+        s = self.settings
+        mac = device.mac
+        serial = device.serial or ""
+        existing, match = self.netbox.find_unifi_device(mac, serial, device.name, pair.netbox_site_slug)
+        is_legacy_client = (
+            existing is not None
+            and role_slug_of(existing) == s.client_device_role_slug
+            and device_has_tag(existing, s.sync_tag)
+            and str((getattr(existing, "custom_fields", None) or {}).get("unifi_mac") or "").lower() == mac.lower()
+        )
+        # Merging is independent of DEVICE_UPDATE_POLICY. When it is off, the
+        # client device stays a client and no second device is created.
+        legacy = is_legacy_client and s.merge_client_infra
+        current_site = device_site_slug(existing) if existing is not None else ""
+        cross_site = bool(existing is not None and current_site and current_site != pair.netbox_site_slug)
+        tagged = existing is None or device_has_tag(existing, s.sync_tag)
+        interface_names = [name for name, _ in spec.interfaces]
+        outlet_count = len(getattr(spec, "power_outlets", None) or [])
+
+        if existing is not None and not tagged:
+            summary.infra_duplicates_avoided += 1
+            logger.info(
+                "%scross-site match avoided: UniFi %s %r (%s) matches untagged NetBox device "
+                "id=%s %r at site %r by %s; not creating a duplicate",
+                prefix,
+                kind,
+                device.name,
+                device.model,
+                getattr(existing, "id", ""),
+                getattr(existing, "name", ""),
+                current_site or "?",
+                match,
+            )
+            return
+
+        if inventory and existing is not None and cross_site:
+            summary.infra_duplicates_avoided += 1
+            logger.info(
+                "%sinventory site %r: %s %r (%s) matches NetBox device id=%s %r at site %r by %s; "
+                "not creating a duplicate and not moving it",
+                prefix,
+                pair.unifi_site,
+                kind,
+                device.name,
+                device.model,
+                getattr(existing, "id", ""),
+                getattr(existing, "name", ""),
+                current_site,
+                match,
+            )
+            return
+
+        from_inventory = existing is not None and self._device_from_inventory(existing)
+        move_site = bool(
+            cross_site
+            and not inventory
+            and (s.device_update_policy != "create-only" or from_inventory or legacy)
+        )
+
+        if existing is not None and cross_site and not move_site and not legacy and not inventory:
+            summary.infra_duplicates_avoided += 1
+            logger.info(
+                "%scross-site match avoided: UniFi %s %r (%s) matches NetBox device id=%s %r "
+                "at site %r by %s; leaving it there (DEVICE_UPDATE_POLICY=%s)",
+                prefix,
+                kind,
+                device.name,
+                device.model,
+                getattr(existing, "id", ""),
+                getattr(existing, "name", ""),
+                current_site,
+                match,
+                s.device_update_policy,
+            )
+            return
+
+        if is_legacy_client and not s.merge_client_infra:
+            summary.infra_duplicates_avoided += 1
+            logger.info(
+                "%slegacy client device id=%s %r matches adopted %s %r by MAC; "
+                "MERGE_CLIENT_INFRA=false so it is left unchanged and not duplicated",
+                prefix,
+                getattr(existing, "id", ""),
+                getattr(existing, "name", ""),
+                kind,
+                device.name,
+            )
+            return
+
+        eth0_plan = ""
+        if legacy:
+            eth0_plan = self.netbox.legacy_eth0_plan(existing, interface_names)
+
+        if s.dry_run:
+            # Count on the local summary so the site line shows the plan.
+            # The caller discards these counts for a dry-run.
+            if source == "library":
+                summary.infra_type_library += 1
+            else:
+                summary.infra_type_generated += 1
+            if legacy:
+                summary.infra_merged += 1
+                logger.info(
+                    "[dry-run] would merge legacy client device id=%s name=%r (MAC %s) into %s %r "
+                    "role=%r type=%r source=%s status=%s site=%r; eth0 %s",
+                    getattr(existing, "id", ""),
+                    getattr(existing, "name", ""),
+                    mac,
+                    kind,
+                    device.name,
+                    role_slug,
+                    spec.slug,
+                    source,
+                    status,
+                    pair.netbox_site_slug,
+                    eth0_plan,
+                )
+            elif move_site:
+                summary.infra_moved += 1
+                logger.info(
+                    "[dry-run] would move NetBox device id=%s %r from site %r to %r "
+                    "(matched by %s) and set status=%s role=%r type=%r source=%s",
+                    getattr(existing, "id", ""),
+                    getattr(existing, "name", ""),
+                    current_site,
+                    pair.netbox_site_slug,
+                    match,
+                    status,
+                    role_slug,
+                    spec.slug,
+                    source,
+                )
+            elif existing is None:
+                created_by_kind[kind] += 1
+                summary.infra_created += 1
+                logger.info(
+                    "[dry-run] would create %s %r (%s) role=%r status=%s type=%r source=%s "
+                    "interfaces=%d power_outlets=%d",
+                    kind,
+                    device.name,
+                    device.model,
+                    role_slug,
+                    status,
+                    spec.slug,
+                    source,
+                    len(interface_names),
+                    outlet_count,
+                )
+            else:
+                logger.info(
+                    "[dry-run] would keep %s %r (%s) role=%r status=%s type=%r source=%s "
+                    "(already present, matched by %s)",
+                    kind,
+                    device.name,
+                    device.model,
+                    role_slug,
+                    status,
+                    spec.slug,
+                    source,
+                    match,
+                )
+            return
+
+        self.netbox.ensure_device_role(role_slug)
+        type_slug = self.netbox.ensure_device_type_from_spec(spec)
+        _dev, created, updated = self.netbox.upsert_infrastructure_device(
+            mac,
+            device.name,
+            pair.netbox_site_slug,
+            role_slug,
+            type_slug,
+            s.sync_tag,
+            serial,
+            s.device_update_policy,
+            status=status,
+            merge_client=legacy,
+            client_role_slug=s.client_device_role_slug,
+            move_site=move_site,
+            source_site_name=pair.unifi_site,
+            source_site_internal_id=pair.unifi_internal_id,
+            spec=spec,
+            looked_up=True,
+            existing=existing,
+            match=match,
+        )
+        if source == "library":
+            summary.infra_type_library += 1
+        else:
+            summary.infra_type_generated += 1
+        if created:
+            summary.infra_created += 1
+            created_by_kind[kind] += 1
+            logger.info(
+                "Created %s %r (%s) role=%r status=%s type=%r source=%s "
+                "interfaces=%d power_outlets=%d",
+                kind,
+                device.name,
+                device.model,
+                role_slug,
+                status,
+                type_slug,
+                source,
+                len(interface_names),
+                outlet_count,
+            )
+            self._forget_switch(mac)
+        elif legacy:
+            summary.infra_merged += 1
+            if cross_site:
+                summary.infra_moved += 1
+            logger.info(
+                "Merged legacy client device id=%s into %s %r role=%r type=%r source=%s; eth0 %s",
+                getattr(_dev, "id", ""),
+                kind,
+                device.name,
+                role_slug,
+                type_slug,
+                source,
+                eth0_plan,
+            )
+            self._forget_switch(mac)
+        elif move_site and updated:
+            summary.infra_moved += 1
+            self._forget_switch(mac)
 
     def _forget_switch(self, mac: str) -> None:
         """Invalidate a cached negative switch lookup after creating it."""

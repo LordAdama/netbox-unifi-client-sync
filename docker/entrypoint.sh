@@ -14,6 +14,12 @@ set -eu
 # HEARTBEAT_FILE (optional) -> where the loop records its last successful
 # run for healthcheck.sh to read. Defaults under /tmp; override if /tmp is a
 # size-constrained tmpfs shared with other processes in your setup.
+# A library cloned at build time, or mounted at this path, is used when
+# DEVICETYPE_LIBRARY_PATH is unset or empty. A non-empty path is left alone.
+if [ -z "${DEVICETYPE_LIBRARY_PATH:-}" ] && [ -d /opt/devicetype-library/device-types ]; then
+    export DEVICETYPE_LIBRARY_PATH=/opt/devicetype-library
+fi
+
 interval="${SYNC_INTERVAL_SECONDS:-0}"
 # Exported so the Python process can write the marker itself when a run
 # finishes with no errors. The shell writes it too, on exit 0, which is the

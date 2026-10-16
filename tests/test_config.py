@@ -159,3 +159,46 @@ def test_from_env_prefers_real_environment_over_dotenv_file(tmp_path, monkeypatc
     settings = Settings.from_env()
 
     assert settings.unifi_host == "https://from-real-env"
+
+
+def test_device_sync_settings_keep_compatible_defaults(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    settings = Settings.from_env()
+
+    assert settings.merge_client_infra is True
+    assert settings.unifi_switch_role_slug == "switch"
+    assert settings.unifi_ap_role_slug == "wireless-ap"
+    assert settings.unifi_gateway_role_slug == "router"
+    assert settings.unifi_power_role_slug == "pdu"
+    assert settings.inventory_site_ids == ()
+    assert settings.inventory_device_status == "inventory"
+
+
+def test_inventory_sites_accept_api_name_and_internal_id(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("UNIFI_INVENTORY_SITES", "staging, 64aabbccddeeff0011223344")
+    monkeypatch.setenv("INVENTORY_DEVICE_STATUS", "staged")
+    monkeypatch.setenv("UNIFI_SWITCH_ROLE_SLUG", "access-switch")
+    monkeypatch.setenv("MERGE_CLIENT_INFRA", "false")
+
+    settings = Settings.from_env()
+
+    assert settings.inventory_site_ids == ("staging", "64aabbccddeeff0011223344")
+    assert settings.inventory_device_status == "staged"
+    assert settings.unifi_switch_role_slug == "access-switch"
+    assert settings.merge_client_infra is False
+
+
+def test_inventory_device_status_rejects_unknown_values(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("INVENTORY_DEVICE_STATUS", "spare")
+
+    with pytest.raises(SystemExit):
+        Settings.from_env()

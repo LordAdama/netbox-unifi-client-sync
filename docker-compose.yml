@@ -11,9 +11,15 @@ services:
         # Set GIT_COMMIT from the host (`git rev-parse HEAD`) so the image
         # label records the commit this container was built from.
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
-        APP_VERSION: ${APP_VERSION:-0.11.0}
+        APP_VERSION: ${APP_VERSION:-0.12.0}
+        # true clones devicetype-library into the image. Default is a mount or
+        # an empty path; the image does not fetch the library unless asked.
+        FETCH_DEVICETYPE_LIBRARY: ${FETCH_DEVICETYPE_LIBRARY:-false}
     image: netbox-unifi-client-sync:latest
     container_name: unifi-netbox-sync
     restart: unless-stopped
     env_file:
       - .env
+    # Optional read-only mount instead of baking the library into the image:
+    # volumes:
+    #   - /path/to/devicetype-library:/opt/devicetype-library:ro

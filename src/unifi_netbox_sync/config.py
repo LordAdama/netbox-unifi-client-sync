@@ -63,6 +63,29 @@ def _duration_seconds(raw: str, name: str) -> float:
     return seconds
 
 
+_NETBOX_DEVICE_STATUSES = {
+    "offline",
+    "active",
+    "planned",
+    "staged",
+    "failed",
+    "inventory",
+    "decommissioning",
+}
+
+
+def _device_status(raw: str, name: str) -> str:
+    value = raw.strip().lower()
+    if value not in _NETBOX_DEVICE_STATUSES:
+        allowed = ", ".join(sorted(_NETBOX_DEVICE_STATUSES))
+        raise SystemExit(f"{name} must be one of {allowed}, got {raw!r}")
+    return value
+
+
+def _csv_tokens(raw: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 def _positive_int(raw: str, name: str) -> int:
     try:
         value = int(raw)
@@ -224,13 +247,31 @@ class Settings:
     # rather than requiring it to be there already. Off by default: creating
     # infrastructure is more invasive than creating clients.
     sync_unifi_devices: bool = False
-    # Local clone of netbox-community/devicetype-library, used for canonical
-    # model names, part numbers and rack heights. Ports always come from the
-    # controller's own port_table, not from here.
+    # Local clone of netbox-community/devicetype-library. When a model matches,
+    # its interface, power-port, and power-outlet templates are used. Otherwise
+    # the type is built from the controller port_table and outlet_table.
     devicetype_library_path: str | None = None
-    # Fallback role for created UniFi devices; per-type roles below take
-    # precedence when the device's type is recognised.
+    # Fallback role for created UniFi devices whose kind isn't recognised.
+    # Recognised kinds use the per-kind slugs below.
     unifi_device_role_slug: str = "network-device"
+    # Per-kind role slugs. Defaults match the historical hardcoded roles so an
+    # existing NetBox (switch / wireless-ap / router) keeps working. Point
+    # these at roles you already have (access-switch, wireless-access-point,
+    # gateway, pdu) and the tool reuses them instead of creating "switch".
+    unifi_switch_role_slug: str = "switch"
+    unifi_ap_role_slug: str = "wireless-ap"
+    unifi_gateway_role_slug: str = "router"
+    unifi_power_role_slug: str = "pdu"
+    # Convert a legacy client device (role = client role, unifi_mac set) into
+    # the adopted infrastructure device with the same MAC, in place. Independent
+    # of DEVICE_UPDATE_POLICY: create-only still merges when this is true.
+    # false leaves that client device untouched and does not create a second one.
+    merge_client_infra: bool = True
+    # UniFi site ids (API name and/or internal _id) whose adopted devices are
+    # inventory or failed-unit staging. Empty disables the behaviour.
+    inventory_site_ids: tuple[str, ...] = ()
+    # NetBox status for devices synced from an inventory site.
+    inventory_device_status: str = "inventory"
 
     def site_pairs(self) -> list[SitePair]:
         if self.site_map:
@@ -310,4 +351,14 @@ class Settings:
             sync_unifi_devices=_bool(os.environ.get("SYNC_UNIFI_DEVICES", "false")),
             devicetype_library_path=os.environ.get("DEVICETYPE_LIBRARY_PATH") or None,
             unifi_device_role_slug=os.environ.get("UNIFI_DEVICE_ROLE_SLUG", "network-device"),
+            unifi_switch_role_slug=os.environ.get("UNIFI_SWITCH_ROLE_SLUG", "switch"),
+            unifi_ap_role_slug=os.environ.get("UNIFI_AP_ROLE_SLUG", "wireless-ap"),
+            unifi_gateway_role_slug=os.environ.get("UNIFI_GATEWAY_ROLE_SLUG", "router"),
+            unifi_power_role_slug=os.environ.get("UNIFI_POWER_ROLE_SLUG", "pdu"),
+            merge_client_infra=_bool(os.environ.get("MERGE_CLIENT_INFRA", "true")),
+            inventory_site_ids=_csv_tokens(os.environ.get("UNIFI_INVENTORY_SITES", "")),
+            inventory_device_status=_device_status(
+                os.environ.get("INVENTORY_DEVICE_STATUS", "inventory"),
+                "INVENTORY_DEVICE_STATUS",
+            ),
         )
