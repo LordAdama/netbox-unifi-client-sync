@@ -393,37 +393,37 @@ def _resolver(api) -> PynetboxGateway:
     return gateway
 
 
-def test_ignored_site_id_filter_does_not_bind_every_unifi_site_to_site-a(caplog):
-    """A dry-run: 39 UniFi sites all 'matched via unifi_site_id' to Site A.
+def test_ignored_site_id_filter_does_not_bind_every_unifi_site_to_site_a(caplog):
+    """An ignored custom-field filter must not attach every UniFi site to Site A.
 
     UniFi id ``siteaid1`` really is Site A. The others must not be.
     """
-    sitea = SimpleNamespace(id=1, slug="site-a", name="Site A", custom_fields={})
-    site-b = SimpleNamespace(id=2, slug="site-b", name="Site B", custom_fields={})
-    sitec = SimpleNamespace(id=3, slug="site-c", name="Site C", custom_fields={})
-    gateway = _resolver(_sites_api([sitea, site-b, sitec]))
+    site_a = SimpleNamespace(id=1, slug="site-a", name="Site A", custom_fields={})
+    site_b = SimpleNamespace(id=2, slug="site-b", name="Site B", custom_fields={})
+    site_c = SimpleNamespace(id=3, slug="site-c", name="Site C", custom_fields={})
+    gateway = _resolver(_sites_api([site_a, site_b, site_c]))
 
     with caplog.at_level(logging.INFO):
-        assert gateway.resolve_existing_site("site-c", "Site C", "normalized", "sitecid3") is sitec
-        assert gateway.resolve_existing_site("site-b", "Site B", "normalized", "default") is site-b
+        assert gateway.resolve_existing_site("site-c", "Site C", "normalized", "sitecid3") is site_c
+        assert gateway.resolve_existing_site("site-b", "Site B", "normalized", "default") is site_b
         assert gateway.resolve_existing_site("other-site", "Other Site", "normalized", "siteoid4") is None
-        assert gateway.resolve_existing_site("site-a", "Site A", "normalized", "siteaid1") is sitea
+        assert gateway.resolve_existing_site("site-a", "Site A", "normalized", "siteaid1") is site_a
 
     text = "\n".join(record.getMessage() for record in caplog.records)
     assert "via unifi_site_id" not in text
     assert "filter is being ignored" in text
-    assert sitea.custom_fields == {}
+    assert site_a.custom_fields == {}
 
 
-class _CollapseTositea(FakeNetboxGateway):
-    """The production failure mode: every lookup returns the first NetBox site."""
+class _CollapseToSiteA(FakeNetboxGateway):
+    """Every lookup returns the first NetBox site, which is the failure mode."""
 
     def resolve_existing_site(self, desired_slug, label, mode="normalized", unifi_site_id=""):
         return self.existing_sites["site-a"]
 
 
-def test_every_unifi_site_resolving_to_site-a_is_a_conflict(caplog):
-    netbox = _CollapseTositea()
+def test_every_unifi_site_resolving_to_site_a_is_a_conflict(caplog):
+    netbox = _CollapseToSiteA()
     site = netbox.seed_site("site-a", "Site A")
     sites = [
         UnifiSite("sitecid3", "Site C"),
@@ -431,9 +431,9 @@ def test_every_unifi_site_resolving_to_site-a_is_a_conflict(caplog):
         UnifiSite("siteaid1", "Site A"),
     ]
     by_site = {
-        "sitecid3": [make_unifi_client(mac="11:22:33:44:55:01", name="sitec-laptop", ip="10.1.1.1", is_wired=False)],
+        "sitecid3": [make_unifi_client(mac="11:22:33:44:55:01", name="site-c-laptop", ip="10.1.1.1", is_wired=False)],
         "default": [make_unifi_client(mac="11:22:33:44:55:02", name="site-b-laptop", ip="10.2.2.2", is_wired=False)],
-        "siteaid1": [make_unifi_client(mac="11:22:33:44:55:03", name="sitea-laptop", ip="10.3.3.3", is_wired=False)],
+        "siteaid1": [make_unifi_client(mac="11:22:33:44:55:03", name="site-a-laptop", ip="10.3.3.3", is_wired=False)],
     }
     with caplog.at_level(logging.INFO):
         summary = SyncEngine(
@@ -451,8 +451,8 @@ def test_every_unifi_site_resolving_to_site-a_is_a_conflict(caplog):
     assert any("sitecid3" in error and "siteaid1" in error and "site-a" in error for error in summary.errors)
 
 
-def test_only_the_real_site-a_site_is_linked_when_the_filter_is_honest():
-    """Same controller listing as the dry-run, with only Site A present in NetBox."""
+def test_only_the_matching_site_is_linked_when_the_filter_is_honest():
+    """Only the UniFi site whose name is Site A links when that is the only NetBox site."""
     netbox = FakeNetboxGateway()
     site = netbox.seed_site("site-a", "Site A")
     sites = [
@@ -461,9 +461,9 @@ def test_only_the_real_site-a_site_is_linked_when_the_filter_is_honest():
         UnifiSite("siteaid1", "Site A"),
     ]
     by_site = {
-        "sitecid3": [make_unifi_client(mac="11:22:33:44:55:01", name="sitec-laptop", is_wired=False)],
+        "sitecid3": [make_unifi_client(mac="11:22:33:44:55:01", name="site-c-laptop", is_wired=False)],
         "default": [make_unifi_client(mac="11:22:33:44:55:02", name="site-b-laptop", is_wired=False)],
-        "siteaid1": [make_unifi_client(mac="11:22:33:44:55:03", name="sitea-laptop", is_wired=False)],
+        "siteaid1": [make_unifi_client(mac="11:22:33:44:55:03", name="site-a-laptop", is_wired=False)],
     }
     summary = SyncEngine(
         unifi=FakeUnifiClient(sites=sites, by_site=by_site),
@@ -482,13 +482,13 @@ def test_only_the_real_site-a_site_is_linked_when_the_filter_is_honest():
 
 def test_stored_unifi_site_id_is_never_overwritten_or_copied():
     netbox = FakeNetboxGateway()
-    sitea = netbox.seed_site("site-a", "Site A", unifi_site_id="siteaid1")
-    site-b = netbox.seed_site("site-b", "Site B")
+    site_a = netbox.seed_site("site-a", "Site A", unifi_site_id="siteaid1")
+    site_b = netbox.seed_site("site-b", "Site B")
 
-    assert netbox.remember_site_link(sitea, "sitecid3") is False
-    assert netbox.remember_site_link(site-b, "siteaid1") is False
-    assert sitea.custom_fields["unifi_site_id"] == "siteaid1"
-    assert site-b.custom_fields == {}
+    assert netbox.remember_site_link(site_a, "sitecid3") is False
+    assert netbox.remember_site_link(site_b, "siteaid1") is False
+    assert site_a.custom_fields["unifi_site_id"] == "siteaid1"
+    assert site_b.custom_fields == {}
 
 
 def test_create_only_skips_ip_changes_on_existing_untagged_devices(caplog):

@@ -551,9 +551,8 @@ class PynetboxGateway:
         NetBox ignores query parameters it does not know. On a dry-run the
         ``unifi_site_id`` custom field often does not exist yet, so
         ``?cf_unifi_site_id=<id>`` comes back 200 with *every* site, and the
-        first record (Site A) looks
-        like a hit for every UniFi id. A result counts only when that site's
-        own field equals the id we asked for.
+        first record looks like a hit for every UniFi id. A result counts only
+        when that site's own field equals the id we asked for.
         """
         try:
             iterator = iter(
