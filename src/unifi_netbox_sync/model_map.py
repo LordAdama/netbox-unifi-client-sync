@@ -142,6 +142,14 @@ _POWER_CODES = {
 _GATEWAY_TYPES = {"ugw", "udm", "uxg"}
 _POWER_TYPES = {"usp", "ups", "pdu"}
 
+# AC outlets the controller under-reports. UP6 / USP-Strip is six switched
+# outlets; some firmware sends one outlet_table row (or none), and the
+# generated type would otherwise keep the single-outlet fallback.
+_KNOWN_OUTLET_COUNTS = {
+    "UP6": 6,
+    "USPSTRIP": 6,
+}
+
 
 def candidate_keys(model_code: str) -> list[str]:
     """Normalized lookup keys for a controller model code, most specific first."""
@@ -156,6 +164,46 @@ def candidate_keys(model_code: str) -> list[str]:
     return keys
 
 
+def _is_gateway_code(code: str) -> bool:
+    """True for UXG, UGW, and UDM model codes.
+
+    ``UDMB`` is the BeaconHD AP, not a Dream Machine. ``UDR`` (Dream Router)
+    does not share those prefixes; its controller type is ``udm``, and the
+    code is listed so a missing type still classifies it as a gateway.
+    """
+    if not code or code.startswith("UDMB"):
+        return False
+    return code == "UDR" or code.startswith(("UXG", "UGW", "UDM"))
+
+
+def is_gateway_device(
+    model: str,
+    device_type: str = "",
+    shortname: str = "",
+) -> bool:
+    """True for UXG, UGW, and UDM gateways, including UXG-Pro.
+
+    Gateways report an ``outlet_table`` (UXG-Pro sends a single row). That
+    table must not classify them as PDUs.
+    """
+    dtype = (device_type or "").strip().lower()
+    if dtype in _GATEWAY_TYPES:
+        return True
+    return any(_is_gateway_code(token) for token in (_normalize(model), _normalize(shortname)))
+
+
+def known_outlet_count(model: str, shortname: str = "") -> int:
+    """Physical AC outlets when the controller sends a short ``outlet_table``.
+
+    Zero means "trust the table". UP6 / USP-Strip is six.
+    """
+    for token in (_normalize(model), _normalize(shortname)):
+        count = _KNOWN_OUTLET_COUNTS.get(token)
+        if count:
+            return count
+    return 0
+
+
 def is_power_device(
     model: str,
     device_type: str = "",
@@ -165,9 +213,13 @@ def is_power_device(
     """True for USP PDUs, USP-RPS, and USW-DA / UPS hardware.
 
     UniFi reports several of these with ``type: usw``. An ``outlet_table``
-    (toggleable outlets) is decisive. ``USWDA*`` is the UPS-tower family
-    (shortname ``UPS23`` and similar), not a switch.
+    (toggleable outlets) is decisive for those. It is not decisive for a
+    gateway: UXG-Pro and other UXG/UGW/UDM devices report a row too.
+    ``USWDA*`` is the UPS-tower family (shortname ``UPS23`` and similar),
+    not a switch.
     """
+    if is_gateway_device(model, device_type, shortname):
+        return False
     if outlet_count > 0:
         return True
     dtype = (device_type or "").strip().lower()
@@ -197,13 +249,17 @@ def device_is_power(device: object) -> bool:
 
 def device_kind(device: object) -> str:
     """``switch``, ``ap``, ``gateway``, ``power``, or ``other``."""
+    if is_gateway_device(
+        getattr(device, "model", "") or "",
+        getattr(device, "device_type", "") or "",
+        getattr(device, "shortname", "") or "",
+    ):
+        return "gateway"
     if device_is_power(device):
         return "power"
     dtype = (getattr(device, "device_type", "") or "").strip().lower()
     if dtype == "uap":
         return "ap"
-    if dtype in _GATEWAY_TYPES:
-        return "gateway"
     if dtype == "usw":
         return "switch"
     return "other"

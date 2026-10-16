@@ -379,7 +379,7 @@ class FakeNetboxGateway:
                 if existing.status.value != status:
                     existing.status = Choice(status)
                     updated = True
-            if (legacy or move_site) and cross_site:
+            if move_site and cross_site:
                 existing.site_slug = site_slug
                 existing.status = Choice(status)
                 updated = True

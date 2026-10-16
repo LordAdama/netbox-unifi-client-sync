@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -105,21 +106,66 @@ _PRIMARY_DEVICE_RE = re.compile(
 )
 
 
+# Reads are safe to repeat. Writes are not: a timed-out POST may have
+# succeeded, and retrying it could create a second object.
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_RETRYABLE_READ_ERRORS = (
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+)
+# One try plus two retries. Backoff is the pause before the next try.
+DEFAULT_READ_ATTEMPTS = 3
+DEFAULT_READ_BACKOFF = (1.0, 2.0)
+
+
 class TimeoutSession(requests.Session):
     """requests.Session that applies a default timeout to every call.
 
     pynetbox issues ``session.get/post/...`` without a timeout argument, so a
     stalled NetBox connection blocks the worker forever. ``Session.request``
     is the one choke point those verbs share.
+
+    A read that times out or fails to connect is retried a bounded number of
+    times with backoff. POSTs, PUTs, PATCHes, and DELETEs are not retried.
     """
 
-    def __init__(self, timeout: float) -> None:
+    def __init__(
+        self,
+        timeout: float,
+        *,
+        read_attempts: int = DEFAULT_READ_ATTEMPTS,
+        read_backoff: tuple[float, ...] = DEFAULT_READ_BACKOFF,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
         super().__init__()
         self.timeout = timeout
+        self.read_attempts = max(1, read_attempts)
+        self.read_backoff = read_backoff or (0.0,)
+        self._sleep = sleep or time.sleep
 
     def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         kwargs.setdefault("timeout", self.timeout)
-        return super().request(method, url, **kwargs)
+        verb = method.upper()
+        attempts = self.read_attempts if verb in _READ_METHODS else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return super().request(method, url, **kwargs)
+            except _RETRYABLE_READ_ERRORS as exc:
+                if attempt >= attempts:
+                    raise
+                delay = self.read_backoff[min(attempt - 1, len(self.read_backoff) - 1)]
+                logger.warning(
+                    "NetBox %s %s failed (%s); retrying in %.1fs (attempt %d/%d)",
+                    verb,
+                    url,
+                    exc.__class__.__name__,
+                    delay,
+                    attempt + 1,
+                    attempts,
+                )
+                if delay > 0:
+                    self._sleep(delay)
+        raise RuntimeError("NetBox request retry ended without a result")
 
 
 def device_has_tag(obj: Any, tag_slug: str) -> bool:
@@ -1279,7 +1325,9 @@ class PynetboxGateway:
         in place (same NetBox id). That runs even when ``update_policy`` is
         ``create-only``. ``move_site`` moves the device onto ``site_slug`` and
         sets ``status``; the caller decides when create-only still allows it
-        (an inventory device showing up at a real site).
+        (an inventory device showing up at a real site). A legacy merge does
+        not move on its own: an inventory observation passes ``move_site``
+        false so the client keeps its NetBox site.
         """
         mac = (mac or "").lower()
         if not looked_up:
@@ -1338,7 +1386,7 @@ class PynetboxGateway:
             status_now = getattr(getattr(existing, "status", None), "value", None) or ""
             if status and status_now != status:
                 changes["status"] = status
-        if (legacy or move_site) and cross_site:
+        if move_site and cross_site:
             changes["site"] = site.id
             if status:
                 changes["status"] = status

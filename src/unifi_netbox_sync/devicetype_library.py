@@ -223,9 +223,10 @@ def spec_from_unifi_device(device, manufacturer: str = "Ubiquiti") -> DeviceType
 
     Power devices (PDU, RPS, UPS) get power outlets from ``outlet_table``
     instead of a switch interface per outlet. Any ``port_table`` rows stay
-    network interfaces — that is the management Ethernet port.
+    network interfaces — that is the management Ethernet port. USP-Strip
+    (``UP6``) is filled out to six outlets when the table is shorter than that.
     """
-    from .model_map import device_is_power
+    from .model_map import device_is_power, known_outlet_count
     from .naming import slugify
 
     model = device.model or "Unknown"
@@ -236,13 +237,32 @@ def spec_from_unifi_device(device, manufacturer: str = "Ubiquiti") -> DeviceType
         if not interfaces:
             interfaces = [("Port 1", "1000base-t")]
         power_ports = [PowerPortSpec(name="Input", type="iec-60320-c14")]
-        for outlet in getattr(device, "outlets", None) or []:
+        reported = list(getattr(device, "outlets", None) or [])
+        slots: dict[int, PowerOutletSpec] = {}
+        for outlet in reported:
             label = outlet.name or f"Outlet {outlet.index}"
-            power_outlets.append(
-                PowerOutletSpec(name=label, type="iec-60320-c13", power_port="Input")
+            slots[outlet.index] = PowerOutletSpec(
+                name=label, type="iec-60320-c13", power_port="Input"
             )
-        if not power_outlets:
-            power_outlets = [PowerOutletSpec(name="Outlet 1", type="iec-60320-c13", power_port="Input")]
+        known = known_outlet_count(
+            getattr(device, "model", "") or "",
+            getattr(device, "shortname", "") or "",
+        )
+        # Pad only models whose hardware count is known. A short table on
+        # anything else stays as reported (one outlet when it is empty).
+        if known > len(reported):
+            for index in range(1, known + 1):
+                slots.setdefault(
+                    index,
+                    PowerOutletSpec(name=f"Outlet {index}", type="iec-60320-c13", power_port="Input"),
+                )
+            power_outlets = [slots[index] for index in sorted(slots)]
+        else:
+            power_outlets = list(slots.values())
+            if not power_outlets:
+                power_outlets = [
+                    PowerOutletSpec(name="Outlet 1", type="iec-60320-c13", power_port="Input")
+                ]
     elif not interfaces:
         # APs and gateways often report no port_table; they still need
         # somewhere to terminate an uplink cable.
