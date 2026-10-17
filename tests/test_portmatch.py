@@ -31,6 +31,12 @@ def _candidates(port: int, sfp: int | None = None, model: list[str] | None = Non
     return candidate_names(model or [], DEFAULTS, port, sfp, extra or [])
 
 
+def _pinned(port: int, sfp: int | None, model: list[str] | None) -> int:
+    if not model or port is None:
+        return 0
+    return len(candidate_names(model, [], port, sfp, []))
+
+
 def _match(names: list[str], port: int, sfp: int | None = None, model: list[str] | None = None, extra: list[str] | None = None):
     return match_port(
         names,
@@ -38,6 +44,7 @@ def _match(names: list[str], port: int, sfp: int | None = None, model: list[str]
         port,
         sfp,
         allow_structural=not model,
+        pinned_count=_pinned(port, sfp, model),
     )
 
 
@@ -174,6 +181,7 @@ def _uplink(names, port, sfp=None, model=None, extra=None, types=None):
         sfp,
         allow_fallback=not model,
         interface_types=types,
+        pinned_count=_pinned(port, sfp, model) if port is not None else 0,
     )
 
 
@@ -206,7 +214,7 @@ def test_uplink_sfp_flag_uses_the_client_structural_match():
 def test_uplink_sole_wired_interface_is_port_1_on_an_access_point():
     outcome = _uplink(["eth0", "wlan0", "wlan1", "vlan1"], 1)
     assert outcome.name == "eth0"
-    assert outcome.via == "sole-wired"
+    assert outcome.via == "zero-based"
 
 
 def test_uplink_unknown_local_port_uses_the_only_wired_interface():
@@ -219,16 +227,67 @@ def test_uplink_sole_wired_does_not_apply_to_any_other_port():
     assert _uplink(["eth0", "wlan0"], 2).name is None
 
 
-def test_uplink_second_wired_interface_is_not_forced_to_eth0():
+def test_uplink_access_point_eth0_eth1_maps_port_1_to_eth0():
     outcome = _uplink(["eth0", "eth1", "wlan0"], 1)
+    assert outcome.name == "eth0"
+    assert outcome.via == "zero-based"
+    assert _match(["eth0", "eth1", "wlan0"], 1).name == "eth0"
+
+
+def test_uplink_gateway_eth_ports_are_zero_based():
+    names = [f"eth{index}" for index in range(9)]
+    outcome = _uplink(names, 2)
     assert outcome.name == "eth1"
-    assert outcome.via == "exact"
+    assert outcome.via == "zero-based"
+    assert _uplink(names, 1).name == "eth0"
+    assert _uplink(names, 9).name == "eth8"
+    assert _match(names, 2).name == "eth1"
+
+
+@pytest.mark.parametrize("name", ["Port 1", "GE1", "Gi1"])
+def test_one_based_names_keep_the_unifi_index(name):
+    outcome = _match([name], 1)
+    assert outcome.name == name
+    assert outcome.via == "template"
+    assert _uplink([name], 1).name == name
+
+
+def test_zero_based_lan_family_shifts_the_same_way():
+    outcome = _uplink(["lan0", "lan1"], 2)
+    assert outcome.name == "lan1"
+    assert outcome.via == "zero-based"
+
+
+def test_management_port_zero_is_not_unifi_port_1():
+    assert _match(["mgmt0", "irb"], 1).name is None
+    assert _uplink(["mgmt0"], 1).name is None
+
+
+def test_zero_based_and_one_based_hits_are_ambiguous():
+    outcome = _uplink(["eth0", "eth1", "Port 1"], 1)
+    assert outcome.name is None
+    assert outcome.via == "ambiguous"
+    assert set(outcome.ambiguous_names) == {"eth0", "Port 1"}
+
+
+def test_two_zero_based_families_are_ambiguous():
+    outcome = _uplink(["eth0", "lan0"], 1)
+    assert outcome.name is None
+    assert outcome.via == "ambiguous"
+    assert set(outcome.ambiguous_names) == {"eth0", "lan0"}
+
+
+def test_model_template_beats_a_zero_based_family():
+    pinned = _uplink(["eth0", "eth1", "Gi1/0/1"], 1, model=["Gi1/0/{port}"])
+    assert pinned.name == "Gi1/0/1"
+    forced = _uplink(["eth0", "eth1"], 1, model=["eth{port}"])
+    assert forced.name == "eth1"
 
 
 def test_uplink_virtual_type_does_not_count_as_a_wired_interface():
     outcome = _uplink(["eth0", "eth1"], 1, types=["1000base-t", "virtual"])
     assert outcome.name == "eth0"
-    assert outcome.via == "sole-wired"
+    assert outcome.via == "zero-based"
 
 
 def test_uplink_numeric_suffix_ambiguity_skips():
@@ -251,10 +310,15 @@ def test_uplink_model_template_overrides_numeric_suffix_and_sole_wired():
     assert missed.name is None
     assert missed.via == "none"
 
-    # A known port does not fall through to the single-interface guess.
-    suppressed = _uplink(["eth0", "wlan0"], 1, model=["Gi1/0/{port}"])
+    # A name with no index still does not fall through to the single-interface
+    # guess once a model template is set. eth0 is zero-based, so port 1 maps
+    # there even when the pinned template does not name it.
+    suppressed = _uplink(["uplink"], 1, model=["Gi1/0/{port}"])
     assert suppressed.name is None
     assert suppressed.via == "none"
+    shifted = _uplink(["eth0", "wlan0"], 1, model=["Gi1/0/{port}"])
+    assert shifted.name == "eth0"
+    assert shifted.via == "zero-based"
 
 
 def test_uplink_unknown_port_still_uses_the_only_wired_interface_when_a_model_is_pinned():

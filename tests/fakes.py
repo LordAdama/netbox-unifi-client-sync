@@ -118,18 +118,27 @@ class FakeNetboxGateway:
         self.ensure_prerequisites_called = True
 
     def find_switch_device_by_mac(self, mac: str, hints=None):
+        device, _strategy = self.match_switch_device(mac, hints)
+        return device
+
+    def match_switch_device(self, mac: str, hints=None):
+        """Same device as ``find_switch_device_by_mac``, plus the join used.
+
+        A direct ``switches[mac]`` hit is the MAC join. Name is checked
+        before serial on each candidate, matching the previous fake order.
+        """
         device = self.switches.get(mac)
         if device is not None:
-            return device
+            return device, "unifi_mac custom field"
         # Mirror the real gateway's name/serial fallbacks, which are the only
         # way to reach a switch whose interfaces carry no MAC address.
         if hints is not None:
             for candidate in list(self.switches.values()) + self.switches_without_mac:
                 if hints.name and candidate.name == hints.name:
-                    return candidate
+                    return candidate, "device name"
                 if hints.serial and candidate.serial == hints.serial:
-                    return candidate
-        return None
+                    return candidate, "serial"
+        return None, ""
 
     def seed_unmatchable_switch(self, name: str, ports: list[str], serial: str | None = None):
         """A switch present in NetBox but NOT findable by interface MAC — the

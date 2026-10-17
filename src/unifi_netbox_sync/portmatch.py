@@ -34,8 +34,16 @@ order and then two fallbacks:
 
 Preference is exact candidate name, then the looser template and
 structural matches, then the trailing number, then the single interface.
-``PORT_MODEL_TEMPLATES`` stays an override: a model that lists templates
-does not take the structural guess or fallbacks 3 and 4 for a known port.
+``PORT_MODEL_TEMPLATES`` stays an override: a matching model template wins,
+and a model that lists templates does not take the structural guess or
+fallbacks 3 and 4 for a known port.
+
+Names in one family are zero-based when that family contains index 0
+(``eth0``/``eth1``, ``lan0``/``lan1``, or any other prefix). UniFi port
+``N`` then selects index ``N-1``. Families that start at 1 (``Port 1``,
+``GE1``, ``Gi1``) stay on ``N``. A zero-based hit and a different 1-based
+hit for the same port are ambiguous. Management names (``mgmt0``, ``fxp0``)
+are not a port family.
 """
 
 from __future__ import annotations
@@ -73,6 +81,7 @@ _SFP = re.compile(
 )
 _SFP_TEMPLATE = re.compile(r"\{sfp")
 _TRAILING_NUMBER = re.compile(r"(\d+)\s*$")
+_FAMILY_INDEX = re.compile(r"^(.*?)(\d+)\s*$")
 # Radios, VLANs, LAGs, bridges, loopbacks, and tunnels are not uplink ports.
 # ``po``/``ae``/``br``/``lo``/``tun`` require a digit so ``Port 1`` stays eligible.
 _NON_PHYSICAL_NAME = re.compile(
@@ -81,6 +90,8 @@ _NON_PHYSICAL_NAME = re.compile(
     re.IGNORECASE,
 )
 _VIRTUAL_TYPES = frozenset({"virtual", "lag", "bridge"})
+# A trailing 0 here is a management port, not UniFi port 1.
+_NOT_A_PORT_PREFIX = frozenset({"mgmt", "management", "fxp", "me"})
 
 
 @dataclass(frozen=True)
@@ -236,6 +247,15 @@ def candidate_names(
     return names
 
 
+def model_candidate_count(
+    model_templates: Sequence[str], port: int | None, sfp: int | None
+) -> int:
+    """How many leading ``candidate_names`` entries came from model templates."""
+    if not model_templates or port is None:
+        return 0
+    return len(candidate_names(model_templates, [], port, sfp, ()))
+
+
 def _copper_port(name: str) -> int | None:
     raw = name.strip()
     three = _THREE.fullmatch(raw)
@@ -260,6 +280,76 @@ def _sfp_number(name: str) -> int | None:
     return int(match.group(1))
 
 
+def _family_index(name: str) -> tuple[str, int] | None:
+    """Prefix and trailing index of a wired interface name.
+
+    ``eth0`` is ``("eth", 0)``, ``lan1`` is ``("lan", 1)``, ``Port 4`` is
+    ``("port", 4)``, and ``Gi1/0/4`` is ``("gi1/0/", 4)``. Wireless and
+    virtual names are not a family: callers skip those.
+    """
+    match = _FAMILY_INDEX.match((name or "").strip())
+    if not match:
+        return None
+    return match.group(1).strip().lower(), int(match.group(2))
+
+
+def zero_based_prefixes(interface_names: Sequence[str]) -> set[str]:
+    """Prefixes whose wired names include index 0.
+
+    ``eth0`` makes every ``eth*`` name zero-based. ``Port 1`` does not,
+    because that family never contains ``Port 0``. ``wlan0`` is ignored.
+    """
+    numbers: dict[str, set[int]] = {}
+    for name in interface_names:
+        if is_wireless_or_virtual(name):
+            continue
+        parsed = _family_index(name)
+        if parsed is None:
+            continue
+        prefix, number = parsed
+        numbers.setdefault(prefix, set()).add(number)
+    return {
+        prefix
+        for prefix, found in numbers.items()
+        if 0 in found and prefix not in _NOT_A_PORT_PREFIX
+    }
+
+
+def zero_based_hits(
+    interface_names: Sequence[str], port: int | None, prefixes: set[str]
+) -> list[str]:
+    """Wired interfaces at index ``port - 1`` in a zero-based family."""
+    if port is None or port < 1 or not prefixes:
+        return []
+    target = port - 1
+    hits: list[str] = []
+    for name in interface_names:
+        if is_wireless_or_virtual(name):
+            continue
+        parsed = _family_index(name)
+        if parsed is None:
+            continue
+        prefix, number = parsed
+        if prefix in prefixes and number == target:
+            hits.append(name)
+    return hits
+
+
+def _shifted_name(name: str, prefixes: set[str], port: int | None) -> bool:
+    """True when ``name`` is the 1-based index of a zero-based family.
+
+    ``eth1`` is shifted for UniFi port 1 once ``eth0`` exists. ``Port 1``
+    is not, and neither is ``eth1`` when the family has no index 0.
+    """
+    if port is None or port < 1 or not prefixes:
+        return False
+    parsed = _family_index(name)
+    if parsed is None:
+        return False
+    prefix, number = parsed
+    return prefix in prefixes and number != port - 1
+
+
 def match_port(
     interface_names: Sequence[str],
     candidates: Sequence[str],
@@ -267,30 +357,83 @@ def match_port(
     sfp_index: int | None,
     *,
     allow_structural: bool,
+    pinned_count: int = 0,
 ) -> PortMatch:
-    """Pick the interface name for this UniFi port, or say why not."""
+    """Pick the interface name for this UniFi port, or say why not.
+
+    ``pinned_count`` is how many leading ``candidates`` came from
+    ``PORT_MODEL_TEMPLATES``. Those are tried first and win even when the
+    device's own names are zero-based. Every other family that contains
+    index 0 maps port ``N`` to index ``N-1``; families that start at 1
+    keep ``N``.
+    """
     tried = tuple(candidates)
     grouped: dict[str, list[str]] = {}
     for name in interface_names:
         grouped.setdefault(numeric_key(name), []).append(name)
 
-    for candidate in candidates:
-        hits = grouped.get(numeric_key(candidate), [])
-        if len(hits) == 1:
-            return PortMatch(name=hits[0], via="template", names_tried=tried)
-        if len(hits) > 1:
+    def first_unique(
+        pool: Sequence[str], prefixes: set[str], *, shift: bool
+    ) -> PortMatch | None:
+        for candidate in pool:
+            hits = list(grouped.get(numeric_key(candidate), []))
+            if shift:
+                hits = [hit for hit in hits if not _shifted_name(hit, prefixes, port)]
+            if len(hits) == 1:
+                return PortMatch(name=hits[0], via="template", names_tried=tried)
+            if len(hits) > 1:
+                return PortMatch(
+                    name=None,
+                    via="ambiguous",
+                    names_tried=tried,
+                    ambiguous_names=tuple(hits),
+                )
+        return None
+
+    pinned = max(0, pinned_count)
+    if pinned:
+        # An explicit model template beats the zero-based correction.
+        chosen = first_unique(candidates[:pinned], set(), shift=False)
+        if chosen is not None:
+            return chosen
+
+    prefixes = zero_based_prefixes(interface_names) if port is not None else set()
+    zero_hits = zero_based_hits(interface_names, port, prefixes)
+    templated = first_unique(candidates, prefixes, shift=True)
+    if templated is not None and templated.via == "ambiguous":
+        return templated
+    template_name = templated.name if templated is not None else None
+    if template_name and zero_hits:
+        distinct = list(dict.fromkeys([template_name, *zero_hits]))
+        if len(distinct) > 1:
             return PortMatch(
                 name=None,
                 via="ambiguous",
                 names_tried=tried,
-                ambiguous_names=tuple(hits),
+                ambiguous_names=tuple(distinct),
             )
+        return templated
+    if template_name:
+        return templated
+    if len(zero_hits) == 1:
+        return PortMatch(name=zero_hits[0], via="zero-based", names_tried=tried)
+    if len(zero_hits) > 1:
+        return PortMatch(
+            name=None,
+            via="ambiguous",
+            names_tried=tried,
+            ambiguous_names=tuple(zero_hits),
+        )
 
     if port is None or not allow_structural:
         return PortMatch(name=None, via="none", names_tried=tried)
 
     structural: list[str] = []
     for name in interface_names:
+        parsed = _family_index(name)
+        if parsed is not None and parsed[0] in prefixes:
+            # Already decided above: this family uses N-1, and nothing matched.
+            continue
         copper = _copper_port(name)
         sfp_number = _sfp_number(name)
         sfp_hit = sfp_index is not None and sfp_number is not None and (
@@ -323,11 +466,11 @@ def trailing_number(name: str) -> int | None:
 
 
 def is_wireless_or_virtual(name: str, iface_type: str = "") -> bool:
-    """True for radios, virtual interfaces, and subinterfaces.
+    """True for radios, virtual interfaces, subinterfaces, and management ports.
 
-    Uplink fallbacks ignore these so ``wlan1`` is not port 1 and a bridge
-    or VLAN is not the device's only wired interface. ``eth0`` and
-    ``SFP+ 49`` are physical.
+    Uplink fallbacks ignore these so ``wlan1`` is not port 1, a bridge or
+    VLAN is not the device's only wired interface, and ``mgmt0`` is not
+    UniFi port 1. ``eth0`` and ``SFP+ 49`` are physical.
     """
     kind = (iface_type or "").strip().lower()
     if kind in _VIRTUAL_TYPES or kind.startswith("ieee802.11"):
@@ -335,7 +478,10 @@ def is_wireless_or_virtual(name: str, iface_type: str = "") -> bool:
     text = (name or "").strip()
     if not text or "." in text:
         return True
-    return _NON_PHYSICAL_NAME.match(text) is not None
+    if _NON_PHYSICAL_NAME.match(text) is not None:
+        return True
+    parsed = _family_index(text)
+    return parsed is not None and parsed[0] in _NOT_A_PORT_PREFIX
 
 
 def _physical_names(
@@ -352,11 +498,16 @@ def _physical_names(
     return physical
 
 
-def _exact_candidate_match(interface_names: Sequence[str], candidates: Sequence[str]) -> PortMatch | None:
+def _exact_candidate_match(
+    interface_names: Sequence[str],
+    candidates: Sequence[str],
+    skip: object = None,
+) -> PortMatch | None:
     """First candidate that equals one interface, case-insensitively.
 
     Leading zeros stay significant, so ``Port 49`` hits ``Port 49`` and not
     ``Port 049``. A candidate that equals more than one interface is ambiguous.
+    ``skip`` drops shifted zero-based names such as ``eth1`` for port 1.
     Returns None when no candidate equals any interface.
     """
     grouped: dict[str, list[str]] = {}
@@ -364,7 +515,9 @@ def _exact_candidate_match(interface_names: Sequence[str], candidates: Sequence[
         grouped.setdefault(name.strip().lower(), []).append(name)
     tried = tuple(candidates)
     for candidate in candidates:
-        hits = grouped.get(candidate.strip().lower(), [])
+        hits = list(grouped.get(candidate.strip().lower(), []))
+        if skip is not None:
+            hits = [hit for hit in hits if not skip(hit)]  # type: ignore[operator]
         if len(hits) == 1:
             return PortMatch(name=hits[0], via="exact", names_tried=tried)
         if len(hits) > 1:
@@ -385,44 +538,76 @@ def match_uplink_port(
     *,
     allow_fallback: bool,
     interface_types: Sequence[str] | None = None,
+    pinned_count: int = 0,
 ) -> PortMatch:
     """Resolve one end of an infra-to-infra uplink.
 
     Order, first unique hit wins:
 
-    1. Exact candidate name (model templates, then global templates, then
-       the UniFi port name). Comparison ignores case and keeps leading zeros.
-    2. The same looser template match and structural parse client cabling
-       uses (:func:`match_port`).
+    1. Exact model-template name, when ``PORT_MODEL_TEMPLATES`` rendered
+       one. That override is not rewritten for zero-based families.
+    2. Exact candidate name, then :func:`match_port` (templates, zero-based
+       families, structural names). A family that contains index 0 maps
+       port ``N`` to index ``N-1`` (``eth1`` is UniFi port 2). ``Port 1``,
+       ``GE1`` and ``Gi1`` stay 1-based. Two different hits are ambiguous.
     3. If the model has no templates of its own, an interface whose trailing
-       number equals ``port``. Any prefix qualifies (``SFP+ ``, ``SFP28 ``,
-       ``Port ``, ``GE``, ``Gi``, ``eth``). Two hits are ambiguous.
+       number equals ``port``, skipping families already treated as
+       zero-based. Any other prefix qualifies (``SFP+ ``, ``SFP28 ``).
     4. If ``port`` is 1, or UniFi did not report a local port, and exactly
        one physical wired interface remains, that interface.
 
-    Wireless and virtual interfaces are ignored in every step. A model
-    listed in ``PORT_MODEL_TEMPLATES`` sets ``allow_fallback`` false and
-    therefore skips steps 3 and 4 for a known port; step 4 still applies
-    when the local port itself is unknown, because a template cannot be
-    rendered without a port index.
+    Wireless and virtual interfaces are ignored. A model that lists
+    templates skips steps 3 and 4 for a known port. Step 4 still applies
+    when the local port itself is unknown.
     """
     tried = tuple(candidates)
     physical = _physical_names(interface_names, interface_types)
+    pinned = max(0, pinned_count)
+
+    if port is not None and pinned:
+        pinned_hit = _exact_candidate_match(physical, list(candidates)[:pinned])
+        if pinned_hit is not None:
+            return pinned_hit
+
+    prefixes = zero_based_prefixes(physical) if port is not None else set()
+    zero_hits = zero_based_hits(physical, port, prefixes) if port is not None else []
 
     if port is not None:
-        exact = _exact_candidate_match(physical, candidates)
-        if exact is not None:
+        exact = _exact_candidate_match(
+            physical,
+            candidates,
+            skip=lambda name: _shifted_name(name, prefixes, port),
+        )
+        if exact is not None and exact.via == "ambiguous":
             return exact
+        if exact is not None and exact.name:
+            distinct = list(dict.fromkeys([exact.name, *zero_hits]))
+            if len(distinct) == 1:
+                return exact
+            return PortMatch(
+                name=None,
+                via="ambiguous",
+                names_tried=tried,
+                ambiguous_names=tuple(distinct),
+            )
+
         templated = match_port(
             physical,
             candidates,
             port,
             sfp_index,
             allow_structural=allow_fallback,
+            pinned_count=pinned,
         )
         if templated.name is not None or templated.via == "ambiguous" or not allow_fallback:
             return templated
-        suffix = [name for name in physical if trailing_number(name) == port]
+        suffix: list[str] = []
+        for name in physical:
+            parsed = _family_index(name)
+            if parsed is not None and parsed[0] in prefixes:
+                continue
+            if trailing_number(name) == port:
+                suffix.append(name)
         if len(suffix) == 1:
             return PortMatch(name=suffix[0], via="numeric-suffix", names_tried=tried)
         if len(suffix) > 1:
