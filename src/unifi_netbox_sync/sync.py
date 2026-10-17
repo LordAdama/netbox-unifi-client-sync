@@ -38,6 +38,7 @@ from .portmatch import (
     coerce_port,
     is_uplink_port,
     match_port,
+    match_uplink_port,
     sfp_ordinal,
     templates_for_model,
 )
@@ -55,6 +56,12 @@ EXPECTED_CLIENT_ERRORS = (requests.exceptions.RequestException, pynetbox.Request
 
 def _interface_name(client: UnifiClient, wired_name: str = "eth0") -> str:
     return wired_name if client.is_wired else "wlan0"
+
+
+def _interface_type_value(interface: object) -> str:
+    raw = getattr(interface, "type", "") or ""
+    value = getattr(raw, "value", raw)
+    return str(value or "").strip()
 
 
 def _primary_ip_matches(device: object, ip: str) -> bool:
@@ -1318,24 +1325,75 @@ class SyncEngine:
             plan,
         )
 
-    def _uplink_port_candidates(self, mac: str, port_no: int) -> list[str]:
+    def _resolve_uplink_port(self, mac: str, netbox_device: object, port_no: int | None):
+        """NetBox interface for one end of an uplink, plus how it was chosen.
+
+        ``port_no`` is None when UniFi did not report the local port. Matching
+        follows client cabling, then a trailing-number fallback and, for port
+        1 or an unknown local port, the device's only physical wired interface.
+        """
         hints = self._hints_for(mac)
         ports = list(hints.ports) if hints is not None else []
         model = hints.model if hints is not None else None
-        extra = [p.name for p in ports if p.index == port_no and getattr(p, "name", None)]
-        return candidate_names(
-            templates_for_model(self.settings.port_model_templates, model),
-            self.settings.port_name_templates,
+        model_templates = templates_for_model(self.settings.port_model_templates, model)
+        sfp_index = sfp_ordinal(ports, port_no) if port_no is not None else None
+        extra: list[str] = []
+        if port_no is not None:
+            extra = [port.name for port in ports if port.index == port_no and port.name]
+            candidates = candidate_names(
+                model_templates,
+                self.settings.port_name_templates,
+                port_no,
+                sfp_index,
+                extra,
+            )
+        else:
+            candidates = []
+        interfaces = self._interfaces(netbox_device)
+        names = [getattr(iface, "name", "") for iface in interfaces]
+        types = [_interface_type_value(iface) for iface in interfaces]
+        outcome = match_uplink_port(
+            names,
+            candidates,
             port_no,
-            sfp_ordinal(ports, port_no),
-            extra,
+            sfp_index,
+            allow_fallback=not model_templates,
+            interface_types=types,
         )
+        chosen = None
+        if outcome.name is not None:
+            chosen = next(
+                (iface for iface in interfaces if getattr(iface, "name", None) == outcome.name),
+                None,
+            )
+        return chosen, outcome, names
+
+    def _uplink_miss_reason(self, device: object, port_no: int | None, outcome: object, names: list[str]) -> str:
+        label = getattr(device, "name", "") or "?"
+        if port_no is None and getattr(outcome, "via", "") != "ambiguous":
+            return "UniFi does not report which local port is the uplink"
+        if getattr(outcome, "via", "") == "ambiguous":
+            ambiguous = list(getattr(outcome, "ambiguous_names", ()))
+            tried = list(getattr(outcome, "names_tried", ()))
+            logger.warning(
+                "Uplink port %s on %r matched more than one NetBox interface (%s). "
+                "Looked for %s; that device's interfaces are named %s. "
+                "Pin the scheme with PORT_MODEL_TEMPLATES. No uplink cable will be created.",
+                port_no,
+                label,
+                ambiguous,
+                tried,
+                names,
+            )
+            return f"{label} port {port_no} matched more than one interface {ambiguous}"
+        return f"no NetBox interface for {label} port {port_no}"
 
     def _sync_uplink_cable(self, pair: SitePair, device: object, summary: SyncSummary, prefix: str) -> None:
-        """Cable a device's own uplink port to the upstream port UniFi reports.
+        """Cable a device's uplink port to the upstream port UniFi reports.
 
-        This is the infra-to-infra link, between real ports on both ends,
-        rather than a client-style eth0.
+        Both ends use the client port match, then a trailing-number fallback
+        (``SFP+ 49`` for port 49) and, when the device has one physical wired
+        interface, that interface for port 1 or an unreported local port.
         """
         up_mac = getattr(device, "uplink_mac", "") or ""
         remote = getattr(device, "uplink_remote_port", None)
@@ -1348,22 +1406,34 @@ class SyncEngine:
             summary.uplink_cables_skipped += 1
             logger.info("%suplink cable for %r skipped: %s", prefix, name, why)
 
-        if local is None:
-            skip("UniFi does not report which local port is the uplink")
-            return
         down_dev = self.netbox.find_switch_device_by_mac(device.mac, self._hints_for(device.mac))
         up_dev = self.netbox.find_switch_device_by_mac(up_mac, self._hints_for(up_mac))
         if down_dev is None or up_dev is None:
             skip(f"{'this device' if down_dev is None else 'upstream ' + up_mac} not found in NetBox")
             return
-        down_names = self._uplink_port_candidates(device.mac, local)
-        up_names = self._uplink_port_candidates(up_mac, remote)
-        down_if = self.netbox.find_interface_by_name_candidates(down_dev, down_names)
-        up_if = self.netbox.find_interface_by_name_candidates(up_dev, up_names)
+        down_if, down_outcome, down_names = self._resolve_uplink_port(device.mac, down_dev, local)
+        up_if, up_outcome, up_names = self._resolve_uplink_port(up_mac, up_dev, remote)
         if down_if is None or up_if is None:
-            missing = f"{name} port {local}" if down_if is None else f"{getattr(up_dev, 'name', up_mac)} port {remote}"
-            skip(f"no NetBox interface for {missing}")
+            reasons = []
+            if down_if is None:
+                reasons.append(self._uplink_miss_reason(down_dev, local, down_outcome, down_names))
+            if up_if is None:
+                reasons.append(self._uplink_miss_reason(up_dev, remote, up_outcome, up_names))
+            skip("; ".join(reasons))
             return
+        for end, outcome, port_no in (
+            (down_if, down_outcome, local),
+            (up_if, up_outcome, remote),
+        ):
+            if outcome.via in ("numeric-suffix", "sole-wired"):
+                logger.info(
+                    "%suplink port %s on %r matched interface %r via %s",
+                    prefix,
+                    port_no,
+                    getattr(getattr(end, "device", None), "name", name),
+                    getattr(end, "name", ""),
+                    outcome.via,
+                )
         label = (
             f"{getattr(down_dev, 'name', name)}:{getattr(down_if, 'name', '')} -- "
             f"{getattr(up_dev, 'name', up_mac)}:{getattr(up_if, 'name', '')}"

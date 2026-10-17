@@ -8,6 +8,7 @@ from unifi_netbox_sync.models import UnifiPort
 from unifi_netbox_sync.portmatch import (
     candidate_names,
     match_port,
+    match_uplink_port,
     parse_model_templates,
     sfp_ordinal,
     templates_for_model,
@@ -162,3 +163,107 @@ def test_parse_model_templates_rejects_a_bad_rule():
         parse_model_templates("USW-24")
     with pytest.raises(SystemExit):
         parse_model_templates("USW-24=Gi1/0/{port}|USW24=Port {port}")
+
+
+def _uplink(names, port, sfp=None, model=None, extra=None, types=None):
+    candidates = _candidates(port, sfp, model, extra) if port is not None else []
+    return match_uplink_port(
+        names,
+        candidates,
+        port,
+        sfp,
+        allow_fallback=not model,
+        interface_types=types,
+    )
+
+
+@pytest.mark.parametrize("name", ["SFP+ 49", "SFP+49", "SFP 49", "SFP28 49"])
+def test_uplink_trailing_number_matches_sfp_names_templates_do_not(name):
+    outcome = _uplink([name, "mgmt0"], 49, sfp=None, extra=["cage-a"])
+    assert outcome.name == name
+    assert outcome.via == "numeric-suffix"
+
+
+def test_uplink_port_template_still_beats_a_trailing_sfp_name():
+    outcome = _uplink(["Port 49", "SFP+ 49"], 49, extra=["SFP+ 1"])
+    assert outcome.name == "Port 49"
+    assert outcome.via == "exact"
+
+
+@pytest.mark.parametrize("name", ["GE49", "Gi49", "eth49", "Port 49"])
+def test_uplink_exact_template_covers_the_usual_prefixes(name):
+    outcome = _uplink([name], 49)
+    assert outcome.name == name
+    assert outcome.via == "exact"
+
+
+def test_uplink_sfp_flag_uses_the_client_structural_match():
+    outcome = _uplink(["SFP+ 49"], 49, sfp=1, extra=["SFP+ 1"])
+    assert outcome.name == "SFP+ 49"
+    assert outcome.via == "structural"
+
+
+def test_uplink_sole_wired_interface_is_port_1_on_an_access_point():
+    outcome = _uplink(["eth0", "wlan0", "wlan1", "vlan1"], 1)
+    assert outcome.name == "eth0"
+    assert outcome.via == "sole-wired"
+
+
+def test_uplink_unknown_local_port_uses_the_only_wired_interface():
+    outcome = _uplink(["eth0", "wlan0"], None)
+    assert outcome.name == "eth0"
+    assert outcome.via == "sole-wired"
+
+
+def test_uplink_sole_wired_does_not_apply_to_any_other_port():
+    assert _uplink(["eth0", "wlan0"], 2).name is None
+
+
+def test_uplink_second_wired_interface_is_not_forced_to_eth0():
+    outcome = _uplink(["eth0", "eth1", "wlan0"], 1)
+    assert outcome.name == "eth1"
+    assert outcome.via == "exact"
+
+
+def test_uplink_virtual_type_does_not_count_as_a_wired_interface():
+    outcome = _uplink(["eth0", "eth1"], 1, types=["1000base-t", "virtual"])
+    assert outcome.name == "eth0"
+    assert outcome.via == "sole-wired"
+
+
+def test_uplink_numeric_suffix_ambiguity_skips():
+    outcome = _uplink(["SFP+ 49", "SFP28 49", "wlan49"], 49, sfp=None)
+    assert outcome.name is None
+    assert outcome.via == "ambiguous"
+    assert set(outcome.ambiguous_names) == {"SFP+ 49", "SFP28 49"}
+
+
+def test_uplink_model_template_overrides_numeric_suffix_and_sole_wired():
+    pinned = _uplink(["SFP+ 49", "Gi1/0/49"], 49, model=["Gi1/0/{port}"])
+    assert pinned.name == "Gi1/0/49"
+    assert pinned.via == "exact"
+
+    padded = _uplink(["Gi1/0/049", "SFP+ 49"], 49, model=["Gi1/0/{port}"])
+    assert padded.name == "Gi1/0/049"
+    assert padded.via == "template"
+
+    missed = _uplink(["SFP+ 49"], 49, model=["Gi1/0/{port}"])
+    assert missed.name is None
+    assert missed.via == "none"
+
+    # A known port does not fall through to the single-interface guess.
+    suppressed = _uplink(["eth0", "wlan0"], 1, model=["Gi1/0/{port}"])
+    assert suppressed.name is None
+    assert suppressed.via == "none"
+
+
+def test_uplink_unknown_port_still_uses_the_only_wired_interface_when_a_model_is_pinned():
+    outcome = _uplink(["eth0", "wlan0"], None, model=["Gi1/0/{port}"])
+    assert outcome.name == "eth0"
+    assert outcome.via == "sole-wired"
+
+
+def test_uplink_template_beats_an_sfp_ordinal_on_port_1():
+    outcome = _uplink(["Port 1", "SFP 1"], 1, sfp=None)
+    assert outcome.name == "Port 1"
+    assert outcome.via == "exact"

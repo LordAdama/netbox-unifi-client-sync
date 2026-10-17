@@ -78,6 +78,22 @@ matched) and every ambiguous match (a MAC that appears on more than one
 NetBox interface, or two interfaces that parse to the same port) is logged
 at INFO/WARNING for troubleshooting.
 
+Infra-to-infra uplinks (a UniFi device's own uplink port cabled to the
+upstream port) use that same match on both ends, then two fallbacks. An
+interface whose trailing number equals the port index matches when nothing
+earlier did, for any prefix (`SFP+ 49`, `SFP 49`, `SFP28 49`, `Port 49`,
+`GE49`, `Gi49`, `eth12`). Wireless and virtual interfaces are ignored
+(`wlan*`, `vlan*`, LAG and bridge names, subinterfaces, and NetBox types
+`virtual`, `lag`, `bridge`, and `ieee802.11*`). More than one remaining
+physical interface is a skip, and the run logs the names. A device with
+exactly one physical wired interface — an access point whose interfaces are
+`eth0` plus `wlan*` — takes uplink port 1, or an uplink whose local port
+the controller left blank, on that interface. Preference is an exact
+candidate name, then the other template and structural matches, then the
+trailing number, then the single interface. `PORT_MODEL_TEMPLATES` is tried
+first and, when the model is listed, suppresses the structural guess and
+these fallbacks for a known port.
+
 ## Syncing UniFi devices (switches, APs, gateways, PDUs)
 
 By default this tool only creates *clients*, and expects your UniFi hardware
@@ -113,8 +129,9 @@ gives you the switch, its ports, the clients, and the cables between them.
 
 Generated ports are named `Port 1`, `Port 2`, … — which the default
 `PORT_NAME_TEMPLATES` already resolve, so cabling needs no extra setup.
-Library templates keep the names from the YAML (`eth0` on a UAP-AC-Pro, for
-example).
+Library templates keep the names from the YAML (`eth0` on an access point,
+`SFP+ 49` on a switch). Uplink cabling resolves those without a per-model
+entry; see "How matching works".
 
 Only *adopted* devices are synced; pending-adoption ones are ignored.
 
@@ -473,7 +490,7 @@ full list and defaults. Key ones:
 | `NETBOX_RATE_LIMIT_RETRIES` | How many times to retry HTTP 429 (default `5`), honoring `Retry-After` |
 | `NETBOX_IP_STATUS` | Status set on IP addresses this tool creates (default `active`) |
 | `PORT_NAME_TEMPLATES` | Candidate interface-name patterns tried against your switches, in order; blank uses the built-in list. `{port}` is the UniFi index, `{port2}` zero-pads it, `{sfp}` is the SFP ordinal |
-| `PORT_MODEL_TEMPLATES` | Per UniFi model, tried first. Example: `USW-Pro-48=Gi1/0/{port};SFP {sfp}`. Separate models with a vertical bar. A model listed here does not get the structural guess |
+| `PORT_MODEL_TEMPLATES` | Per UniFi model, tried first. Example: `USW-Pro-48=Gi1/0/{port};SFP {sfp}`. Separate models with a vertical bar. A model listed here does not get the structural guess, and on an uplink it also suppresses the trailing-number and single-interface fallbacks for a known port |
 | `CABLE_SKIP_REPORT` | Path of a CSV listing every skipped cable (site, switch, UniFi port, names tried, NetBox interfaces, reason). Blank logs the same rows and a count by reason without writing a file |
 | `SYNC_UNIFI_DEVICES` | Create adopted UniFi switches/APs/gateways/PDUs in NetBox (default `false`) — see "Syncing UniFi devices" |
 | `DEVICETYPE_LIBRARY_PATH` | Local devicetype-library clone. A match supplies the device type and its interface/power templates; otherwise they are generated. Recommended mount: `/opt/devicetype-library` |
@@ -811,7 +828,11 @@ level, for each distinct switch:
   ```
 
   A model with templates does not also take a structural guess, so a wrong
-  stack member cannot win.
+  stack member cannot win. The same pin suppresses an uplink's
+  trailing-number fallback (`SFP+ 49` for port 49) and the single-interface
+  fallback (`eth0` when that is the only wired port) for a known port. An
+  ambiguous trailing number is skipped and logged. A blank local port still
+  uses that single wired interface, because a template needs a port index.
 - *"port N on X is shared by multiple wired clients"* — more than one client
   is on that switch port (an uplink, or an unmanaged switch behind an AP).
   None of them is cabled. A port the controller marks `is_uplink` is skipped
@@ -927,7 +948,8 @@ every push/PR.
 - `unifi_client.py` — thin REST client for the UniFi controller (login,
   active clients, client history with `last_seen`, infrastructure devices).
 - `portmatch.py` — UniFi port index to NetBox interface name: templates,
-  per-model templates, and structural names (slot/module, Juniper, SFP).
+  per-model templates, structural names (slot/module, Juniper, SFP), and the
+  uplink trailing-number and single-wired-interface fallbacks.
 - `staleness.py` — offline decision from `last_seen` and the grace window.
 - `netbox_client.py` — `NetboxGateway` defines the interface the sync
   engine depends on; `PynetboxGateway` is the real implementation backed by

@@ -20,6 +20,22 @@ Matching is deliberately ordered:
 
 SFP names are only considered when the controller's port table says this
 index is an SFP. Otherwise copper port 1 would cable to ``SFP 1``.
+
+Infra-to-infra uplinks call :func:`match_uplink_port`, which uses that
+order and then two fallbacks:
+
+3. An interface whose trailing number equals the port index, for any
+   prefix (``SFP+ 49``, ``SFP 49``, ``SFP28 49``, ``GE49``, ``eth12``).
+   Wireless and virtual interfaces are ignored. More than one remaining
+   hit is a skip, not a guess.
+4. When the device has exactly one physical wired interface, uplink port
+   1 — or an uplink whose local port UniFi did not report — lands there
+   (an access point whose only wired interface is ``eth0``).
+
+Preference is exact candidate name, then the looser template and
+structural matches, then the trailing number, then the single interface.
+``PORT_MODEL_TEMPLATES`` stays an override: a model that lists templates
+does not take the structural guess or fallbacks 3 and 4 for a known port.
 """
 
 from __future__ import annotations
@@ -56,6 +72,15 @@ _SFP = re.compile(
     re.IGNORECASE,
 )
 _SFP_TEMPLATE = re.compile(r"\{sfp")
+_TRAILING_NUMBER = re.compile(r"(\d+)\s*$")
+# Radios, VLANs, LAGs, bridges, loopbacks, and tunnels are not uplink ports.
+# ``po``/``ae``/``br``/``lo``/``tun`` require a digit so ``Port 1`` stays eligible.
+_NON_PHYSICAL_NAME = re.compile(
+    r"^(?:wlan|wifi|wireless|radio|vlan|lag|bond|bridge|loopback|virtual|tunnel|null)(?:\d|\b)"
+    r"|^(?:ae|po|br|lo|tun)\d",
+    re.IGNORECASE,
+)
+_VIRTUAL_TYPES = frozenset({"virtual", "lag", "bridge"})
 
 
 @dataclass(frozen=True)
@@ -63,7 +88,7 @@ class PortMatch:
     """Outcome of matching one UniFi port against one switch's interfaces."""
 
     name: str | None
-    via: str  # "template", "structural", "ambiguous", "none"
+    via: str  # "exact", "template", "structural", "numeric-suffix", "sole-wired", "ambiguous", "none"
     names_tried: tuple[str, ...]
     ambiguous_names: tuple[str, ...] = ()
 
@@ -282,4 +307,134 @@ def match_port(
             names_tried=tried,
             ambiguous_names=tuple(structural),
         )
+    return PortMatch(name=None, via="none", names_tried=tried)
+
+
+def trailing_number(name: str) -> int | None:
+    """Integer at the end of an interface name, or None when there is none.
+
+    ``SFP+ 49``, ``SFP28 49``, ``GE49`` and ``eth0`` yield 49, 49, 49 and 0.
+    Leading zeros are not significant: ``Port 04`` is 4.
+    """
+    match = _TRAILING_NUMBER.search((name or "").strip())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def is_wireless_or_virtual(name: str, iface_type: str = "") -> bool:
+    """True for radios, virtual interfaces, and subinterfaces.
+
+    Uplink fallbacks ignore these so ``wlan1`` is not port 1 and a bridge
+    or VLAN is not the device's only wired interface. ``eth0`` and
+    ``SFP+ 49`` are physical.
+    """
+    kind = (iface_type or "").strip().lower()
+    if kind in _VIRTUAL_TYPES or kind.startswith("ieee802.11"):
+        return True
+    text = (name or "").strip()
+    if not text or "." in text:
+        return True
+    return _NON_PHYSICAL_NAME.match(text) is not None
+
+
+def _physical_names(
+    interface_names: Sequence[str],
+    interface_types: Sequence[str] | None,
+) -> list[str]:
+    physical: list[str] = []
+    for index, name in enumerate(interface_names):
+        iface_type = ""
+        if interface_types is not None and index < len(interface_types):
+            iface_type = interface_types[index] or ""
+        if not is_wireless_or_virtual(name, iface_type):
+            physical.append(name)
+    return physical
+
+
+def _exact_candidate_match(interface_names: Sequence[str], candidates: Sequence[str]) -> PortMatch | None:
+    """First candidate that equals one interface, case-insensitively.
+
+    Leading zeros stay significant, so ``Port 49`` hits ``Port 49`` and not
+    ``Port 049``. A candidate that equals more than one interface is ambiguous.
+    Returns None when no candidate equals any interface.
+    """
+    grouped: dict[str, list[str]] = {}
+    for name in interface_names:
+        grouped.setdefault(name.strip().lower(), []).append(name)
+    tried = tuple(candidates)
+    for candidate in candidates:
+        hits = grouped.get(candidate.strip().lower(), [])
+        if len(hits) == 1:
+            return PortMatch(name=hits[0], via="exact", names_tried=tried)
+        if len(hits) > 1:
+            return PortMatch(
+                name=None,
+                via="ambiguous",
+                names_tried=tried,
+                ambiguous_names=tuple(hits),
+            )
+    return None
+
+
+def match_uplink_port(
+    interface_names: Sequence[str],
+    candidates: Sequence[str],
+    port: int | None,
+    sfp_index: int | None,
+    *,
+    allow_fallback: bool,
+    interface_types: Sequence[str] | None = None,
+) -> PortMatch:
+    """Resolve one end of an infra-to-infra uplink.
+
+    Order, first unique hit wins:
+
+    1. Exact candidate name (model templates, then global templates, then
+       the UniFi port name). Comparison ignores case and keeps leading zeros.
+    2. The same looser template match and structural parse client cabling
+       uses (:func:`match_port`).
+    3. If the model has no templates of its own, an interface whose trailing
+       number equals ``port``. Any prefix qualifies (``SFP+ ``, ``SFP28 ``,
+       ``Port ``, ``GE``, ``Gi``, ``eth``). Two hits are ambiguous.
+    4. If ``port`` is 1, or UniFi did not report a local port, and exactly
+       one physical wired interface remains, that interface.
+
+    Wireless and virtual interfaces are ignored in every step. A model
+    listed in ``PORT_MODEL_TEMPLATES`` sets ``allow_fallback`` false and
+    therefore skips steps 3 and 4 for a known port; step 4 still applies
+    when the local port itself is unknown, because a template cannot be
+    rendered without a port index.
+    """
+    tried = tuple(candidates)
+    physical = _physical_names(interface_names, interface_types)
+
+    if port is not None:
+        exact = _exact_candidate_match(physical, candidates)
+        if exact is not None:
+            return exact
+        templated = match_port(
+            physical,
+            candidates,
+            port,
+            sfp_index,
+            allow_structural=allow_fallback,
+        )
+        if templated.name is not None or templated.via == "ambiguous" or not allow_fallback:
+            return templated
+        suffix = [name for name in physical if trailing_number(name) == port]
+        if len(suffix) == 1:
+            return PortMatch(name=suffix[0], via="numeric-suffix", names_tried=tried)
+        if len(suffix) > 1:
+            return PortMatch(
+                name=None,
+                via="ambiguous",
+                names_tried=tried,
+                ambiguous_names=tuple(suffix),
+            )
+        if port != 1:
+            return templated
+
+    if (port is None or port == 1) and len(physical) == 1:
+        return PortMatch(name=physical[0], via="sole-wired", names_tried=tried)
     return PortMatch(name=None, via="none", names_tried=tried)
