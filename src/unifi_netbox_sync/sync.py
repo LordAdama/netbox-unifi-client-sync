@@ -1542,10 +1542,7 @@ class SyncEngine:
         if existing is None:
             return False
         s = self.settings
-        if not device_has_tag(existing, s.sync_tag):
-            return False
-        role = role_slug_of(existing)
-        if role and role != s.client_device_role_slug:
+        if not self._owns_client_placeholder(existing):
             return False
         base_name = sanitize_device_name(client.display_name, client.mac)
         if getattr(existing, "name", None) != base_name:
@@ -1645,6 +1642,13 @@ class SyncEngine:
                 result.unchanged = True
                 return result
 
+            if existing is not None and not self._owns_client_placeholder(existing):
+                # Matched by MAC, so this pass must not create a second device.
+                # The placeholder interface and the IP on it belong only to
+                # devices this sync still owns.
+                self._skip_client_placeholder(client, existing, result)
+                return result
+
             if s.netbox_fast_path and self._try_unchanged_fast_path(
                 client, existing, result, netbox_site_slug, cable_ctx
             ):
@@ -1714,6 +1718,49 @@ class SyncEngine:
             logger.exception("Failed syncing client %s (%s)", client.mac, client.display_name)
             result.error = str(exc)
         return result
+
+    def _managed_client_roles(self) -> frozenset[str]:
+        return frozenset(self.settings.managed_client_roles())
+
+    def _owns_client_placeholder(self, device: object) -> bool:
+        """True when this sync may create the placeholder interface and move the IP.
+
+        Owned means the device carries the sync tag, its role is one of the
+        managed client roles, and it does not carry the opt-out tag. A device
+        a person has re-roled, or marked unmanaged, stays matched by MAC.
+        """
+        s = self.settings
+        if not device_has_tag(device, s.sync_tag):
+            return False
+        if s.sync_unmanaged_tag and device_has_tag(device, s.sync_unmanaged_tag):
+            return False
+        return role_slug_of(device) in self._managed_client_roles()
+
+    def _placeholder_skip_reason(self, device: object) -> str:
+        reasons: list[str] = []
+        tag = self.settings.sync_unmanaged_tag
+        if tag and device_has_tag(device, tag):
+            reasons.append(f"tagged {tag!r}")
+        role = role_slug_of(device) or "(none)"
+        managed = self._managed_client_roles()
+        if role not in managed:
+            listed = ", ".join(sorted(managed)) or "(none)"
+            reasons.append(f"role {role!r} is not a managed client role ({listed})")
+        return "; ".join(reasons) if reasons else "not a managed client device"
+
+    def _skip_client_placeholder(self, client: UnifiClient, existing: object, result: ClientSyncResult) -> None:
+        """One log line. No interface, IP, cable, or second device."""
+        result.name = getattr(existing, "name", None) or result.name
+        result.unchanged = True
+        prefix = "[dry-run] " if self.settings.dry_run else ""
+        logger.info(
+            "%sskipping placeholder interface and IP for %r (%s): %s. "
+            "Matched by MAC; not creating a duplicate.",
+            prefix,
+            result.name,
+            client.mac,
+            self._placeholder_skip_reason(existing),
+        )
 
     def _may_assign_ip(self, existing: object | None) -> bool:
         """Whether this client's address may be written onto ``existing``.

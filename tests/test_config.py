@@ -249,6 +249,34 @@ def test_prefetch_settings_can_be_turned_down(monkeypatch):
     assert settings.max_workers == 1
 
 
+def test_managed_client_roles_follow_the_client_role(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    monkeypatch.delenv("MANAGED_CLIENT_ROLE_SLUGS", raising=False)
+    monkeypatch.delenv("SYNC_UNMANAGED_TAG", raising=False)
+    monkeypatch.setenv("CLIENT_DEVICE_ROLE_SLUG", "endpoint")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    settings = Settings.from_env()
+
+    assert settings.client_device_role_slug == "endpoint"
+    assert settings.managed_client_roles() == ("endpoint",)
+    assert settings.sync_unmanaged_tag == "sync-unmanaged"
+
+
+def test_managed_client_roles_and_opt_out_tag_are_configurable(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("MANAGED_CLIENT_ROLE_SLUGS", "unifi-client, endpoint")
+    monkeypatch.setenv("SYNC_UNMANAGED_TAG", "leave-alone")
+
+    settings = Settings.from_env()
+
+    assert settings.managed_client_roles() == ("unifi-client", "endpoint")
+    assert settings.sync_unmanaged_tag == "leave-alone"
+
+
 def test_page_size_rejects_zero(monkeypatch):
     monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
     for key, value in REQUIRED_ENV.items():

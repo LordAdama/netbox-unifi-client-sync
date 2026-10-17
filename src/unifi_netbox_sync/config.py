@@ -86,6 +86,20 @@ def _csv_tokens(raw: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
+def _managed_client_roles_from_env() -> tuple[str, ...]:
+    """Roles whose placeholder interface and IP the sync may write.
+
+    Unset ``MANAGED_CLIENT_ROLE_SLUGS`` follows ``CLIENT_DEVICE_ROLE_SLUG``.
+    An explicit list replaces that default; include the client role in it
+    when new client devices should keep being managed on later passes.
+    """
+    client_role = (os.environ.get("CLIENT_DEVICE_ROLE_SLUG") or "unifi-client").strip() or "unifi-client"
+    raw = os.environ.get("MANAGED_CLIENT_ROLE_SLUGS")
+    if raw is None or not raw.strip():
+        return (client_role,)
+    return _csv_tokens(raw) or (client_role,)
+
+
 def _positive_int(raw: str, name: str) -> int:
     try:
         value = int(raw)
@@ -214,6 +228,15 @@ class Settings:
     log_format: str = "text"
     sync_tag: str = "unifi-sync"
     client_device_role_slug: str = "unifi-client"
+    # Roles whose placeholder client interface and IP this sync may write.
+    # Empty means "only client_device_role_slug". A device in any other role
+    # is still matched by MAC, so no duplicate is created, but eth0/wlan0
+    # and the address on it are left alone.
+    managed_client_role_slugs: tuple[str, ...] = ()
+    # Opt-out tag. A device carrying it is matched by MAC (no duplicate) and
+    # does not get placeholder interface or IP changes, even if its role is
+    # still a managed client role.
+    sync_unmanaged_tag: str = "sync-unmanaged"
     client_manufacturer_slug: str = "generic"
     client_device_type_slug: str = "generic-network-client"
     # Interface name used for wired client devices. Wireless stays wlan0.
@@ -303,6 +326,19 @@ class Settings:
             return [SitePair(unifi_site=u, netbox_site_slug=n) for u, n in self.site_map.items()]
         return [SitePair(unifi_site=self.unifi_site, netbox_site_slug=self.netbox_site_slug)]
 
+    def managed_client_roles(self) -> tuple[str, ...]:
+        """Role slugs whose placeholder interface and IP this sync may write.
+
+        An explicit list wins. Otherwise the single configured client role is
+        the whole set, so renaming ``CLIENT_DEVICE_ROLE_SLUG`` keeps new
+        client devices managed without a second setting.
+        """
+        roles = tuple(slug.strip() for slug in self.managed_client_role_slugs if slug and slug.strip())
+        if roles:
+            return roles
+        slug = (self.client_device_role_slug or "").strip()
+        return (slug,) if slug else ()
+
     @classmethod
     def from_env(cls) -> "Settings":
         _load_dotenv()
@@ -366,7 +402,13 @@ class Settings:
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
             log_format=os.environ.get("LOG_FORMAT", "text"),
             sync_tag=os.environ.get("SYNC_TAG", "unifi-sync"),
-            client_device_role_slug=os.environ.get("CLIENT_DEVICE_ROLE_SLUG", "unifi-client"),
+            client_device_role_slug=(
+                os.environ.get("CLIENT_DEVICE_ROLE_SLUG") or "unifi-client"
+            ).strip()
+            or "unifi-client",
+            managed_client_role_slugs=_managed_client_roles_from_env(),
+            sync_unmanaged_tag=(os.environ.get("SYNC_UNMANAGED_TAG") or "sync-unmanaged").strip()
+            or "sync-unmanaged",
             client_manufacturer_slug=os.environ.get("CLIENT_MANUFACTURER_SLUG", "generic"),
             client_device_type_slug=os.environ.get("CLIENT_DEVICE_TYPE_SLUG", "generic-network-client"),
             client_wired_interface_name=(os.environ.get("CLIENT_WIRED_INTERFACE_NAME") or "eth0").strip() or "eth0",
