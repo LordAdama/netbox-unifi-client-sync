@@ -46,6 +46,16 @@ replacement, and stale-offline marking are limited to objects with that tag,
 so a device or cable entered by hand in NetBox is left alone even when it
 shares a MAC or a switch port with something UniFi reports.
 
+The placeholder interface (`eth0` for wired clients, `wlan0` for wireless)
+and the IP moved onto it are written only for a device this sync still owns.
+Owned means it carries `SYNC_TAG`, its role is listed in
+`MANAGED_CLIENT_ROLE_SLUGS` (by default, just `CLIENT_DEVICE_ROLE_SLUG`), and
+it does not carry `SYNC_UNMANAGED_TAG` (default `sync-unmanaged`). A device
+someone has re-roled, or tagged `sync-unmanaged` after building it by hand,
+is matched by MAC so a second device is not created. That pass logs one line
+and does not add the placeholder interface, move the IP, or cable that
+interface.
+
 ## How matching works
 
 | UniFi side | NetBox side |
@@ -453,6 +463,8 @@ full list and defaults. Key ones:
 | `SITE_MATCH` | `normalized` (default), `name`, or `slug` — fallback after the UniFi site id fields; see "Linking to sites you already have" |
 | `SITE_POLICY` | `require` (default) or `create` — creating sites is opt-in; see "Site & update policies" |
 | `DEVICE_UPDATE_POLICY` | `create-only` (default) or `sync` — see "Site & update policies" |
+| `MANAGED_CLIENT_ROLE_SLUGS` | Comma-separated roles whose placeholder interface and IP this sync may write. Unset follows `CLIENT_DEVICE_ROLE_SLUG`. Other roles are matched by MAC and left alone |
+| `SYNC_UNMANAGED_TAG` | Opt-out tag (default `sync-unmanaged`). The device is still matched by MAC; its interfaces and IP are not changed |
 | `NETBOX_TIMEOUT` / `UNIFI_TIMEOUT` | Per-request HTTP timeouts in seconds (default `30`). A NetBox call with no timeout is what hung a run indefinitely. A NetBox read that times out is retried twice; writes are not |
 | `NETBOX_PREFETCH` | Bulk-load devices and interfaces once per site and answer client MAC lookups from that index (default `true`). `false` restores one device lookup per client |
 | `NETBOX_FAST_PATH` | Skip the write path when the prefetched client already matches (default `true`). Creates, updates, skips, and offline marks stay the same |
@@ -639,15 +651,44 @@ Two independent, conservative-by-default policy knobs:
   keeps them matched to UniFi, which will revert those renames. Objects
   that do not carry `SYNC_TAG` are never updated, regardless of this
   setting — not their name, interface, IP, or cables. `create-only` still
-  updates the IP of a device that *does* carry the tag (addresses move),
-  and a dry-run logs `would assign IP` only for that case or for a device
-  that does not exist yet. An existing untagged device produces no IP plan
-  and no IP write.
+  updates the IP of a device that *does* carry the tag, is still in a
+  managed client role, and is not tagged `SYNC_UNMANAGED_TAG` (addresses
+  move). A dry-run logs `would assign IP` only for that case or for a
+  device that does not exist yet. An existing untagged device, a device
+  whose role is not in `MANAGED_CLIENT_ROLE_SLUGS`, or a device tagged
+  `SYNC_UNMANAGED_TAG` produces no IP plan and no IP write.
 
-Both apply in dry-run too (as previews, not real writes), and every
-decision — site created vs. reused, an update skipped by policy — is
-logged and counted in the run summary (`sites_created`,
-`devices_update_skipped`) for auditability.
+`SITE_POLICY` and `DEVICE_UPDATE_POLICY` apply in dry-run too (as previews,
+not real writes), and every decision — site created vs. reused, an update
+skipped by policy — is logged and counted in the run summary
+(`sites_created`, `devices_update_skipped`) for auditability.
+
+### Devices you have already built
+
+A client this sync created can later be turned into real gear: the role
+changed to `switch`, the device type replaced, or the ports filled in by
+hand. The MAC custom field is still set, so the next pass finds that device.
+It must not grow a client `eth0` and it must not have its address pulled
+onto that interface.
+
+That write happens only when all three are true:
+
+- the device carries `SYNC_TAG`
+- its role slug is in `MANAGED_CLIENT_ROLE_SLUGS`
+- it does not carry `SYNC_UNMANAGED_TAG`
+
+`MANAGED_CLIENT_ROLE_SLUGS` defaults to `CLIENT_DEVICE_ROLE_SLUG` (normally
+`unifi-client`). Set it to a comma-separated list when more than one role
+should keep the placeholder, and include the client role in that list so
+devices this sync creates stay managed on later passes. Changing only the
+device type does not opt a device out; add `sync-unmanaged`, or move it to a
+role that is not in the list.
+
+`SYNC_UNMANAGED_TAG` (default `sync-unmanaged`) is the per-device opt-out for
+something that is still in a client role. Tag it in NetBox and the sync
+keeps matching the MAC, does not create a second device, and does not touch
+the placeholder interface or the IP. Each such device logs one line per run,
+including in a dry-run.
 
 ### NetBox compatibility
 

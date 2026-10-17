@@ -172,6 +172,10 @@ class CachingNetboxGateway:
         # Not cached: infrastructure devices are created and merged during the run.
         return self._inner.find_unifi_device(mac, serial, name, site_slug)
 
+    def find_device_name_conflict(self, name: str, site_slug: str, exclude_id: Any) -> Any | None:
+        # Not cached: names change as the run creates and merges devices.
+        return self._inner.find_device_name_conflict(name, site_slug, exclude_id)
+
     def legacy_eth0_plan(self, device: Any, interface_names: list[str]) -> str:
         return self._inner.legacy_eth0_plan(device, interface_names)
 
