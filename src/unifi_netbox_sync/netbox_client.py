@@ -290,6 +290,10 @@ class NetboxGateway(Protocol):
 
     def find_switch_device_by_mac(self, mac: str, hints: SwitchHints | None = None) -> Any | None: ...
 
+    def match_switch_device(
+        self, mac: str, hints: SwitchHints | None = None
+    ) -> tuple[Any | None, str]: ...
+
     def ensure_client_device_type(self, manufacturer_name: str) -> str: ...
 
     def ensure_device_type_from_spec(self, spec: Any) -> str: ...
@@ -583,6 +587,19 @@ class PynetboxGateway:
         because a partial index can hold a different device than the first
         row of the global filter.
         """
+        device, _strategy = self.match_switch_device(mac, hints)
+        return device
+
+    def match_switch_device(
+        self, mac: str, hints: SwitchHints | None = None
+    ) -> tuple[Any | None, str]:
+        """Like ``find_switch_device_by_mac``, plus the join that won.
+
+        The strategy is ``interface MAC``, ``unifi_mac custom field``,
+        ``serial``, or ``device name``. Uplink cabling uses it when two
+        UniFi devices resolve to one NetBox device and the MAC match should
+        be the one that is cabled.
+        """
         for strategy, finder in (
             ("interface MAC", lambda: self._switch_by_interface_mac(mac)),
             ("unifi_mac custom field", lambda: self._switch_by_unifi_mac(mac)),
@@ -592,12 +609,12 @@ class PynetboxGateway:
             device = finder()
             if device is not None:
                 logger.info("Matched UniFi switch %s to NetBox device %r via %s", mac, device.name, strategy)
-                return device
+                return device, strategy
 
         # The operator-facing warning is emitted by the sync engine, which
         # owns that guidance for every gateway implementation.
         logger.debug("No NetBox device matched UniFi switch %s by any strategy", mac)
-        return None
+        return None, ""
 
     @staticmethod
     def _first(results: Any) -> Any | None:

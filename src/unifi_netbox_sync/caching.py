@@ -36,6 +36,7 @@ class CachingNetboxGateway:
         self._lock = threading.Lock()
         self._sites: dict[str, Any] = {}
         self._switches: dict[str, Any] = {}
+        self._switch_strategy: dict[str, str] = {}
         self._switch_ports: dict[tuple[Any, tuple[str, ...]], Any] = {}
         self._device_interfaces: dict[Any, dict[str, Any]] = {}
         self._prereqs_done: set[tuple[str, str, str, str]] = set()
@@ -97,6 +98,28 @@ class CachingNetboxGateway:
             self._switches[mac] = device
             self.misses += 1
         return device
+
+    def match_switch_device(self, mac: str, hints: Any | None = None) -> tuple[Any | None, str]:
+        """Cached ``(device, strategy)`` for the uplink duplicate check.
+
+        Populated separately from ``find_switch_device_by_mac`` so a client
+        lookup that only needs the device does not have to learn the join.
+        A later find for the same MAC reuses the device stored here.
+        """
+        with self._lock:
+            if mac in self._switch_strategy:
+                self.hits += 1
+                return self._switches.get(mac), self._switch_strategy[mac]
+        matcher = getattr(self._inner, "match_switch_device", None)
+        if matcher is None:
+            device = self.find_switch_device_by_mac(mac, hints)
+            return device, ""
+        device, strategy = matcher(mac, hints)
+        with self._lock:
+            self._switches[mac] = device
+            self._switch_strategy[mac] = strategy or ""
+            self.misses += 1
+        return device, strategy or ""
 
     def find_interface_by_name_candidates(self, device: Any, candidates: list[str]) -> Any | None:
         """Resolve a switch port, fetching the switch's interfaces once.
@@ -285,6 +308,7 @@ class CachingNetboxGateway:
         just-created switch invisible for the rest of the run."""
         with self._lock:
             self._switches.pop(mac, None)
+            self._switch_strategy.pop(mac, None)
 
     def ensure_device_type_from_spec(self, spec: Any) -> str:
         return self._inner.ensure_device_type_from_spec(spec)

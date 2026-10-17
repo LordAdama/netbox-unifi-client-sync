@@ -38,6 +38,8 @@ from .portmatch import (
     coerce_port,
     is_uplink_port,
     match_port,
+    match_uplink_port,
+    model_candidate_count,
     sfp_ordinal,
     templates_for_model,
 )
@@ -55,6 +57,23 @@ EXPECTED_CLIENT_ERRORS = (requests.exceptions.RequestException, pynetbox.Request
 
 def _interface_name(client: UnifiClient, wired_name: str = "eth0") -> str:
     return wired_name if client.is_wired else "wlan0"
+
+
+def _interface_type_value(interface: object) -> str:
+    raw = getattr(interface, "type", "") or ""
+    value = getattr(raw, "value", raw)
+    return str(value or "").strip()
+
+
+def _switch_match_rank(strategy: str) -> int:
+    """Lower is a better claim on a NetBox device. MAC beats name."""
+    if strategy in ("interface MAC", "unifi_mac custom field"):
+        return 0
+    if strategy == "serial":
+        return 1
+    if strategy == "device name":
+        return 2
+    return 3
 
 
 def _primary_ip_matches(device: object, ip: str) -> bool:
@@ -273,6 +292,11 @@ class SyncEngine:
         # Serializes find-then-create across site workers so two sites cannot
         # each create the same chassis.
         self._infra_lock = threading.Lock()
+        # Adopted devices waiting for the run-wide uplink pass. Cabling waits
+        # until every site has synced so a name match in one site and a MAC
+        # match in another cannot plan the same cable twice.
+        self._uplink_queue: list[tuple[SitePair, object]] = []
+        self._uplink_lock = threading.Lock()
         # Conflicts found while linking sites. Merged into the run summary so
         # a collapsed mapping cannot look like a successful sync.
         self._link_errors: list[str] = []
@@ -356,6 +380,7 @@ class SyncEngine:
 
     def run(self) -> SyncSummary:
         start = time.monotonic()
+        self._uplink_queue = []
         if self.settings.sync_all_sites:
             pairs = self._discover_site_pairs()
         else:
@@ -423,6 +448,7 @@ class SyncEngine:
                 )
 
         summary = _merge_summaries(group_summaries)
+        summary = _merge_summaries([summary, self._finish_uplink_cables()])
         if self._link_errors:
             summary.errors.extend(self._link_errors)
         summary.duration_seconds = time.monotonic() - start
@@ -968,19 +994,17 @@ class SyncEngine:
                     logger.exception("Failed syncing UniFi device %s (%s)", device.mac, device.name)
                     summary.errors.append(f"{pair.unifi_site}/{device.mac}: UniFi device {device.name}: {exc}")
 
-        for device in adopted:
-            try:
-                self._sync_uplink_cable(pair, device, summary, prefix)
-            except EXPECTED_CLIENT_ERRORS as exc:
-                logger.exception("Failed cabling uplink for UniFi device %s (%s)", device.mac, device.name)
-                summary.errors.append(f"{pair.unifi_site}/{device.mac}: uplink cable for {device.name}: {exc}")
+        # Uplink cabling is deferred until every site in the run has synced,
+        # so the duplicate check can see a MAC match and a name match that
+        # live in different UniFi sites.
+        with self._uplink_lock:
+            self._uplink_queue.extend((pair, device) for device in adopted)
 
         kind_text = ", ".join(f"{name}={created_by_kind[name]}" for name in ("switch", "ap", "gateway", "power"))
         logger.info(
             "%sSite '%s': %d adopted UniFi device(s); creates by kind: %s; "
             "merged=%d; moved=%d; cross-site matches avoided=%d; name conflicts=%d; errors=%d; "
-            "uplink cables created=%d unchanged=%d skipped=%d; legacy eth0 found=%d; "
-            "type sources library=%d generated=%d",
+            "legacy eth0 found=%d; type sources library=%d generated=%d",
             prefix,
             pair.unifi_site,
             len(adopted),
@@ -990,9 +1014,6 @@ class SyncEngine:
             summary.infra_duplicates_avoided,
             summary.infra_name_conflicts,
             len(summary.errors),
-            summary.uplink_cables_created,
-            summary.uplink_cables_unchanged,
-            summary.uplink_cables_skipped,
             summary.legacy_eth0_found,
             summary.infra_type_library,
             summary.infra_type_generated,
@@ -1006,9 +1027,6 @@ class SyncEngine:
             return SyncSummary(
                 devices_synced=len(adopted),
                 infra_name_conflicts=summary.infra_name_conflicts,
-                uplink_cables_created=summary.uplink_cables_created,
-                uplink_cables_unchanged=summary.uplink_cables_unchanged,
-                uplink_cables_skipped=summary.uplink_cables_skipped,
                 legacy_eth0_found=summary.legacy_eth0_found,
                 errors=list(summary.errors),
             )
@@ -1318,24 +1336,188 @@ class SyncEngine:
             plan,
         )
 
-    def _uplink_port_candidates(self, mac: str, port_no: int) -> list[str]:
+    def _locate_switch(self, mac: str) -> tuple[object | None, str]:
+        """NetBox device for ``mac`` and which join found it.
+
+        The strategy is empty when the gateway cannot say. MAC joins outrank
+        a name join when two UniFi devices land on one NetBox device.
+        """
+        hints = self._hints_for(mac)
+        matcher = getattr(self.netbox, "match_switch_device", None)
+        if matcher is not None:
+            device, strategy = matcher(mac, hints)
+            return device, strategy or ""
+        return self.netbox.find_switch_device_by_mac(mac, hints), ""
+
+    def _finish_uplink_cables(self) -> SyncSummary:
+        """Cable uplinks once every site has synced its devices.
+
+        The duplicate check is over the whole run. A device matched by MAC in
+        one UniFi site and another matched by name in a different site must
+        not both plan the cable.
+        """
+        with self._uplink_lock:
+            queued = list(self._uplink_queue)
+            self._uplink_queue = []
+        if not queued:
+            return SyncSummary()
+        prefix = "[dry-run] " if self.settings.dry_run else ""
+        duplicate_macs = self._uplink_duplicate_macs(queued, prefix)
+        by_site: dict[str, SyncSummary] = {}
+        for pair, device in queued:
+            site_summary = by_site.setdefault(pair.unifi_site, SyncSummary())
+            if device.mac in duplicate_macs:
+                site_summary.uplink_cables_skipped += 1
+                logger.info(
+                    "%suplink cable for %r (%s, site %s) skipped: another UniFi device "
+                    "matches the same NetBox device",
+                    prefix,
+                    getattr(device, "name", ""),
+                    device.mac,
+                    pair.unifi_site,
+                )
+                continue
+            try:
+                self._sync_uplink_cable(pair, device, site_summary, prefix)
+            except EXPECTED_CLIENT_ERRORS as exc:
+                logger.exception(
+                    "Failed cabling uplink for UniFi device %s (%s)", device.mac, device.name
+                )
+                site_summary.errors.append(
+                    f"{pair.unifi_site}/{device.mac}: uplink cable for {device.name}: {exc}"
+                )
+        for site in sorted(by_site):
+            site_summary = by_site[site]
+            logger.info(
+                "%sSite '%s': uplink cables created=%d unchanged=%d skipped=%d",
+                prefix,
+                site,
+                site_summary.uplink_cables_created,
+                site_summary.uplink_cables_unchanged,
+                site_summary.uplink_cables_skipped,
+            )
+        return _merge_summaries(list(by_site.values()))
+
+    def _uplink_duplicate_macs(
+        self, queued: list[tuple[SitePair, object]], prefix: str
+    ) -> set[str]:
+        """UniFi MACs that must not cable because a better match owns the device.
+
+        ``queued`` is every adopted device in the run, from every UniFi site.
+        One NetBox device can be found twice: once by MAC and once because
+        another UniFi device, possibly in another site, carries the same name.
+        Cabling both plans the same link twice. The MAC match is kept; the
+        other is skipped.
+        """
+        located: list[tuple[object, str, object, str]] = []
+        for pair, device in queued:
+            netbox_device, strategy = self._locate_switch(device.mac)
+            if netbox_device is None:
+                continue
+            located.append((device, pair.unifi_site, netbox_device, strategy))
+        groups: dict[object, list[tuple[object, str, object, str]]] = {}
+        for device, site, netbox_device, strategy in located:
+            key = getattr(netbox_device, "id", None)
+            if key is None:
+                key = id(netbox_device)
+            groups.setdefault(key, []).append((device, site, netbox_device, strategy))
+        skipped: set[str] = set()
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            winner = min(group, key=lambda item: (_switch_match_rank(item[3]),))
+            winner_device, winner_site, netbox_device, winner_strategy = winner
+            for device, site, _, strategy in group:
+                if device is winner_device:
+                    continue
+                skipped.add(device.mac)
+                logger.warning(
+                    "%sUniFi device %r (%s, site %s) matches NetBox device %r via %s, "
+                    "but %r (%s, site %s) matches it via %s. Skipping the uplink cable for %r.",
+                    prefix,
+                    getattr(device, "name", ""),
+                    device.mac,
+                    site,
+                    getattr(netbox_device, "name", ""),
+                    strategy or "unknown",
+                    getattr(winner_device, "name", ""),
+                    winner_device.mac,
+                    winner_site,
+                    winner_strategy or "unknown",
+                    getattr(device, "name", ""),
+                )
+        return skipped
+
+    def _resolve_uplink_port(self, mac: str, netbox_device: object, port_no: int | None):
+        """NetBox interface for one end of an uplink, plus how it was chosen.
+
+        ``port_no`` is None when UniFi did not report the local port. Matching
+        follows client cabling, then a trailing-number fallback and, for port
+        1 or an unknown local port, the device's only physical wired interface.
+        """
         hints = self._hints_for(mac)
         ports = list(hints.ports) if hints is not None else []
         model = hints.model if hints is not None else None
-        extra = [p.name for p in ports if p.index == port_no and getattr(p, "name", None)]
-        return candidate_names(
-            templates_for_model(self.settings.port_model_templates, model),
-            self.settings.port_name_templates,
+        model_templates = templates_for_model(self.settings.port_model_templates, model)
+        sfp_index = sfp_ordinal(ports, port_no) if port_no is not None else None
+        extra: list[str] = []
+        if port_no is not None:
+            extra = [port.name for port in ports if port.index == port_no and port.name]
+            candidates = candidate_names(
+                model_templates,
+                self.settings.port_name_templates,
+                port_no,
+                sfp_index,
+                extra,
+            )
+        else:
+            candidates = []
+        interfaces = self._interfaces(netbox_device)
+        names = [getattr(iface, "name", "") for iface in interfaces]
+        types = [_interface_type_value(iface) for iface in interfaces]
+        outcome = match_uplink_port(
+            names,
+            candidates,
             port_no,
-            sfp_ordinal(ports, port_no),
-            extra,
+            sfp_index,
+            allow_fallback=not model_templates,
+            interface_types=types,
+            pinned_count=model_candidate_count(model_templates, port_no, sfp_index),
         )
+        chosen = None
+        if outcome.name is not None:
+            chosen = next(
+                (iface for iface in interfaces if getattr(iface, "name", None) == outcome.name),
+                None,
+            )
+        return chosen, outcome, names
+
+    def _uplink_miss_reason(self, device: object, port_no: int | None, outcome: object, names: list[str]) -> str:
+        label = getattr(device, "name", "") or "?"
+        if port_no is None and getattr(outcome, "via", "") != "ambiguous":
+            return "UniFi does not report which local port is the uplink"
+        if getattr(outcome, "via", "") == "ambiguous":
+            ambiguous = list(getattr(outcome, "ambiguous_names", ()))
+            tried = list(getattr(outcome, "names_tried", ()))
+            logger.warning(
+                "Uplink port %s on %r matched more than one NetBox interface (%s). "
+                "Looked for %s; that device's interfaces are named %s. "
+                "Pin the scheme with PORT_MODEL_TEMPLATES. No uplink cable will be created.",
+                port_no,
+                label,
+                ambiguous,
+                tried,
+                names,
+            )
+            return f"{label} port {port_no} matched more than one interface {ambiguous}"
+        return f"no NetBox interface for {label} port {port_no}"
 
     def _sync_uplink_cable(self, pair: SitePair, device: object, summary: SyncSummary, prefix: str) -> None:
-        """Cable a device's own uplink port to the upstream port UniFi reports.
+        """Cable a device's uplink port to the upstream port UniFi reports.
 
-        This is the infra-to-infra link, between real ports on both ends,
-        rather than a client-style eth0.
+        Both ends use the client port match, then a trailing-number fallback
+        (``SFP+ 49`` for port 49) and, when the device has one physical wired
+        interface, that interface for port 1 or an unreported local port.
         """
         up_mac = getattr(device, "uplink_mac", "") or ""
         remote = getattr(device, "uplink_remote_port", None)
@@ -1348,22 +1530,34 @@ class SyncEngine:
             summary.uplink_cables_skipped += 1
             logger.info("%suplink cable for %r skipped: %s", prefix, name, why)
 
-        if local is None:
-            skip("UniFi does not report which local port is the uplink")
-            return
         down_dev = self.netbox.find_switch_device_by_mac(device.mac, self._hints_for(device.mac))
         up_dev = self.netbox.find_switch_device_by_mac(up_mac, self._hints_for(up_mac))
         if down_dev is None or up_dev is None:
             skip(f"{'this device' if down_dev is None else 'upstream ' + up_mac} not found in NetBox")
             return
-        down_names = self._uplink_port_candidates(device.mac, local)
-        up_names = self._uplink_port_candidates(up_mac, remote)
-        down_if = self.netbox.find_interface_by_name_candidates(down_dev, down_names)
-        up_if = self.netbox.find_interface_by_name_candidates(up_dev, up_names)
+        down_if, down_outcome, down_names = self._resolve_uplink_port(device.mac, down_dev, local)
+        up_if, up_outcome, up_names = self._resolve_uplink_port(up_mac, up_dev, remote)
         if down_if is None or up_if is None:
-            missing = f"{name} port {local}" if down_if is None else f"{getattr(up_dev, 'name', up_mac)} port {remote}"
-            skip(f"no NetBox interface for {missing}")
+            reasons = []
+            if down_if is None:
+                reasons.append(self._uplink_miss_reason(down_dev, local, down_outcome, down_names))
+            if up_if is None:
+                reasons.append(self._uplink_miss_reason(up_dev, remote, up_outcome, up_names))
+            skip("; ".join(reasons))
             return
+        for end, outcome, port_no in (
+            (down_if, down_outcome, local),
+            (up_if, up_outcome, remote),
+        ):
+            if outcome.via in ("numeric-suffix", "sole-wired", "zero-based"):
+                logger.info(
+                    "%suplink port %s on %r matched interface %r via %s",
+                    prefix,
+                    port_no,
+                    getattr(getattr(end, "device", None), "name", name),
+                    getattr(end, "name", ""),
+                    outcome.via,
+                )
         label = (
             f"{getattr(down_dev, 'name', name)}:{getattr(down_if, 'name', '')} -- "
             f"{getattr(up_dev, 'name', up_mac)}:{getattr(up_if, 'name', '')}"
@@ -2179,12 +2373,17 @@ class SyncEngine:
                 )
             return None
 
+        # Client cables keep the pre-shift match: templates and structural
+        # names only. The zero-based shift and the single-interface fallback
+        # belong to uplinks, so a leftover client record whose only wired
+        # interface is the placeholder eth0 does not gain a cable.
         outcome = match_port(
             netbox_names,
             candidates,
             port_no,
             sfp_index,
             allow_structural=not model_templates,
+            zero_based=False,
         )
         if outcome.via == "ambiguous" or outcome.name is None:
             if outcome.via == "ambiguous":
