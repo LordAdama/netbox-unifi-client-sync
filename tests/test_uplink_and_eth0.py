@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import logging
 
+from unifi_netbox_sync.caching import CachingNetboxGateway
 from unifi_netbox_sync.models import UnifiPort, UnifiSwitchDevice
+from unifi_netbox_sync.portmatch import parse_model_templates
+from unifi_netbox_sync.sync import SyncEngine
 from unifi_netbox_sync.unifi_client import _parse_uplink
 
-from .fakes import FakeNetboxGateway, make_unifi_client
+from .fakes import FakeNetboxGateway, FakeUnifiClient, make_unifi_client
 from .test_device_sync import SWITCH_MAC, _run, _switch
+from .test_sync import make_settings
 
 DOWN_MAC = "aa:bb:cc:dd:ee:09"
 
@@ -108,6 +112,292 @@ def test_legacy_eth0_report_is_dry_run_only():
 
     assert summary.legacy_eth0_found == 0
     assert "eth0" in holder.interfaces
+
+
+def _seed(netbox, mac, name, ports, serial):
+    device = netbox.seed_switch(mac, name, ports)
+    device.custom_fields["unifi_mac"] = mac
+    device.tags.append("unifi-sync")
+    device.site_slug = "main"
+    device.serial = serial
+    return device
+
+
+def _cable_pair(left, right):
+    return tuple(sorted((left.id, right.id)))
+
+
+def test_uplink_sfp_index_name_cables_when_templates_do_not(caplog):
+    """Library interface ``SFP+ 49`` for UniFi port 49, whatever the port label is."""
+    netbox = FakeNetboxGateway()
+    upstream = _seed(netbox, SWITCH_MAC, "core-switch", ["Port 5"], "F09FC2AAAA01")
+    downstream = _seed(netbox, DOWN_MAC, "edge-switch", ["SFP+ 49", "Port 1"], "F09FC2AAAA09")
+    device = _downstream(local=49, remote=5)
+    device.ports = [UnifiPort(index=49, media="GE", name="cage-a")]
+
+    with caplog.at_level(logging.INFO):
+        summary, _ = _run([_switch(), device], netbox=netbox)
+
+    assert summary.errors == []
+    assert summary.uplink_cables_created == 1
+    assert summary.uplink_cables_skipped == 0
+    pair = _cable_pair(downstream.interfaces["SFP+ 49"], upstream.interfaces["Port 5"])
+    assert netbox.cables == {pair}
+    assert "via numeric-suffix" in caplog.text
+
+
+def test_uplink_access_point_with_only_eth0_uses_that_interface():
+    netbox = FakeNetboxGateway()
+    upstream = _seed(netbox, SWITCH_MAC, "core-switch", ["Port 3"], "F09FC2AAAA01")
+    ap_mac = "aa:bb:cc:dd:ee:21"
+    ap_nb = _seed(netbox, ap_mac, "ap-01", ["eth0", "wlan0", "wlan1"], "F09FC2AAAA21")
+    ap = UnifiSwitchDevice(
+        mac=ap_mac,
+        name="ap-01",
+        model="AP-LAB",
+        device_type="uap",
+        serial="F09FC2AAAA21",
+        ports=[UnifiPort(index=1, media="GE", name="eth0")],
+        uplink_mac=SWITCH_MAC,
+        uplink_remote_port=3,
+        uplink_local_port=1,
+    )
+
+    summary, _ = _run([_switch(), ap], netbox=netbox)
+
+    assert summary.errors == []
+    assert summary.uplink_cables_created == 1
+    pair = _cable_pair(ap_nb.interfaces["eth0"], upstream.interfaces["Port 3"])
+    assert netbox.cables == {pair}
+    assert ap_nb.interfaces["wlan0"].cable is None
+
+
+def test_uplink_unknown_local_port_uses_the_only_wired_interface():
+    netbox = FakeNetboxGateway()
+    upstream = _seed(netbox, SWITCH_MAC, "core-switch", ["Port 3"], "F09FC2AAAA01")
+    ap_mac = "aa:bb:cc:dd:ee:22"
+    ap_nb = _seed(netbox, ap_mac, "ap-02", ["eth0", "wlan0"], "F09FC2AAAA22")
+    ap = UnifiSwitchDevice(
+        mac=ap_mac,
+        name="ap-02",
+        model="AP-LAB",
+        device_type="uap",
+        serial="F09FC2AAAA22",
+        ports=[],
+        uplink_mac=SWITCH_MAC,
+        uplink_remote_port=3,
+        uplink_local_port=None,
+    )
+
+    summary, _ = _run([_switch(), ap], netbox=netbox)
+
+    assert summary.uplink_cables_skipped == 0
+    assert summary.uplink_cables_created == 1
+    pair = _cable_pair(ap_nb.interfaces["eth0"], upstream.interfaces["Port 3"])
+    assert netbox.cables == {pair}
+
+
+def test_uplink_trailing_number_ambiguity_skips_and_logs(caplog):
+    netbox = FakeNetboxGateway()
+    _seed(netbox, SWITCH_MAC, "core-switch", ["Port 5"], "F09FC2AAAA01")
+    downstream = _seed(
+        netbox, DOWN_MAC, "edge-switch", ["SFP+ 49", "SFP28 49"], "F09FC2AAAA09"
+    )
+    device = _downstream(local=49, remote=5)
+    device.ports = [UnifiPort(index=49, media="GE", name="cage-a")]
+
+    with caplog.at_level(logging.WARNING):
+        summary, _ = _run([_switch(), device], netbox=netbox)
+
+    assert summary.uplink_cables_created == 0
+    assert summary.uplink_cables_skipped == 1
+    assert netbox.cables == set()
+    assert downstream.interfaces["SFP+ 49"].cable is None
+    assert "more than one" in caplog.text
+    assert "SFP+ 49" in caplog.text
+    assert "SFP28 49" in caplog.text
+
+
+def test_uplink_model_template_overrides_the_trailing_number():
+    netbox = FakeNetboxGateway()
+    upstream = _seed(netbox, SWITCH_MAC, "core-switch", ["Port 5"], "F09FC2AAAA01")
+    downstream = _seed(
+        netbox, DOWN_MAC, "edge-switch", ["SFP+ 49", "Gi1/0/49"], "F09FC2AAAA09"
+    )
+    device = _downstream(local=49, remote=5)
+    device.model = "LAB-SW-48"
+    device.ports = [UnifiPort(index=49, media="SFP+", name="SFP+ 1")]
+
+    summary, _ = _run(
+        [_switch(), device],
+        netbox=netbox,
+        port_model_templates=parse_model_templates("LAB-SW-48=Gi1/0/{port}"),
+    )
+
+    assert summary.uplink_cables_created == 1
+    pair = _cable_pair(downstream.interfaces["Gi1/0/49"], upstream.interfaces["Port 5"])
+    assert netbox.cables == {pair}
+    assert downstream.interfaces["SFP+ 49"].cable is None
+
+
+def test_uplink_model_template_suppresses_a_numeric_guess():
+    netbox = FakeNetboxGateway()
+    _seed(netbox, SWITCH_MAC, "core-switch", ["Port 5"], "F09FC2AAAA01")
+    downstream = _seed(netbox, DOWN_MAC, "edge-switch", ["SFP+ 49"], "F09FC2AAAA09")
+    device = _downstream(local=49, remote=5)
+    device.model = "LAB-SW-48"
+    device.ports = [UnifiPort(index=49, media="GE", name="cage-a")]
+
+    summary, _ = _run(
+        [_switch(), device],
+        netbox=netbox,
+        port_model_templates=parse_model_templates("LAB-SW-48=Gi1/0/{port}"),
+    )
+
+    assert summary.uplink_cables_created == 0
+    assert summary.uplink_cables_skipped == 1
+    assert downstream.interfaces["SFP+ 49"].cable is None
+
+
+def test_uplink_two_port_access_point_uses_eth0_for_port_1():
+    netbox = FakeNetboxGateway()
+    upstream = _seed(netbox, SWITCH_MAC, "core-switch", ["Port 3"], "F09FC2AAAA01")
+    ap_mac = "aa:bb:cc:dd:ee:31"
+    ap_nb = _seed(netbox, ap_mac, "ap-31", ["eth0", "eth1", "wlan0"], "F09FC2AAAA31")
+    ap = UnifiSwitchDevice(
+        mac=ap_mac,
+        name="ap-31",
+        model="AP-LAB",
+        device_type="uap",
+        serial="F09FC2AAAA31",
+        ports=[UnifiPort(index=1, media="GE"), UnifiPort(index=2, media="GE")],
+        uplink_mac=SWITCH_MAC,
+        uplink_remote_port=3,
+        uplink_local_port=1,
+    )
+
+    summary, _ = _run([_switch(), ap], netbox=netbox)
+
+    assert summary.errors == []
+    assert summary.uplink_cables_created == 1
+    assert summary.uplink_cables_skipped == 0
+    pair = _cable_pair(ap_nb.interfaces["eth0"], upstream.interfaces["Port 3"])
+    assert netbox.cables == {pair}
+    assert ap_nb.interfaces["eth1"].cable is None
+    assert ap_nb.interfaces["wlan0"].cable is None
+
+
+def test_uplink_gateway_port_2_uses_eth1():
+    netbox = FakeNetboxGateway()
+    upstream = _seed(netbox, SWITCH_MAC, "core-switch", ["Port 4"], "F09FC2AAAA01")
+    gw_mac = "aa:bb:cc:dd:ee:41"
+    names = [f"eth{index}" for index in range(9)]
+    gw_nb = _seed(netbox, gw_mac, "gw-lab", names, "F09FC2AAAA41")
+    gateway = UnifiSwitchDevice(
+        mac=gw_mac,
+        name="gw-lab",
+        model="GW-LAB",
+        device_type="ugw",
+        serial="F09FC2AAAA41",
+        ports=[UnifiPort(index=index, media="GE") for index in range(1, 10)],
+        uplink_mac=SWITCH_MAC,
+        uplink_remote_port=4,
+        uplink_local_port=2,
+    )
+
+    summary, _ = _run([_switch(), gateway], netbox=netbox)
+
+    assert summary.errors == []
+    assert summary.uplink_cables_created == 1
+    pair = _cable_pair(gw_nb.interfaces["eth1"], upstream.interfaces["Port 4"])
+    assert netbox.cables == {pair}
+    assert gw_nb.interfaces["eth0"].cable is None
+    assert gw_nb.interfaces["eth2"].cable is None
+
+
+def test_uplink_name_match_does_not_plan_a_second_cable(caplog):
+    netbox = FakeNetboxGateway()
+    _seed(netbox, SWITCH_MAC, "core-switch", ["Port 4"], "F09FC2AAAA01")
+    mac_match = "aa:bb:cc:dd:ee:51"
+    name_match = "aa:bb:cc:dd:ee:52"
+    _seed(netbox, mac_match, "gw-lab", ["eth0", "eth1"], "F09FC2AAAA51")
+
+    def _gw(mac: str) -> UnifiSwitchDevice:
+        return UnifiSwitchDevice(
+            mac=mac,
+            name="gw-lab",
+            model="GW-LAB",
+            device_type="ugw",
+            serial="F09FC2AAAA51" if mac == mac_match else "F09FC2AAAA52",
+            ports=[UnifiPort(index=1, media="GE"), UnifiPort(index=2, media="GE")],
+            uplink_mac=SWITCH_MAC,
+            uplink_remote_port=4,
+            uplink_local_port=1,
+        )
+
+    with caplog.at_level(logging.INFO):
+        summary, _ = _run([_gw(mac_match), _gw(name_match)], netbox=netbox, dry_run=True)
+
+    assert summary.uplink_cables_created == 1
+    assert summary.uplink_cables_skipped == 1
+    assert netbox.cables == set()
+    assert caplog.text.count("would create uplink cable") == 1
+    assert "gw-lab:eth0" in caplog.text
+    assert name_match in caplog.text
+    assert "Skipping the uplink cable" in caplog.text
+
+
+def test_uplink_duplicate_across_sites_keeps_the_mac_match(caplog):
+    """A name match in one UniFi site and a MAC match in another share a device.
+
+    The duplicate check is for the whole run, so the name match is skipped
+    and the dry-run plans the uplink once.
+    """
+    netbox = FakeNetboxGateway()
+    _seed(netbox, SWITCH_MAC, "core-switch", ["Port 4"], "F09FC2AAAA01")
+    mac_match = "aa:bb:cc:dd:ee:61"
+    name_match = "aa:bb:cc:dd:ee:62"
+    _seed(netbox, mac_match, "gw-lab", ["eth0", "eth1"], "F09FC2AAAA61")
+
+    def _gw(mac: str) -> UnifiSwitchDevice:
+        return UnifiSwitchDevice(
+            mac=mac,
+            name="gw-lab",
+            model="GW-LAB",
+            device_type="ugw",
+            serial="F09FC2AAAA61" if mac == mac_match else "F09FC2AAAA62",
+            ports=[UnifiPort(index=1, media="GE"), UnifiPort(index=2, media="GE")],
+            uplink_mac=SWITCH_MAC,
+            uplink_remote_port=4,
+            uplink_local_port=1,
+        )
+
+    engine = SyncEngine(
+        unifi=FakeUnifiClient(
+            devices_by_site={"site-a": [_gw(mac_match)], "site-b": [_gw(name_match)]}
+        ),
+        netbox=CachingNetboxGateway(netbox),
+        settings=make_settings(
+            sync_unifi_devices=True,
+            dry_run=True,
+            site_map={"site-a": "netbox-a", "site-b": "netbox-b"},
+            netbox_site_slug="",
+            max_workers=2,
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        summary = engine.run()
+
+    assert summary.errors == []
+    assert summary.uplink_cables_created == 1
+    assert summary.uplink_cables_skipped == 1
+    assert netbox.cables == set()
+    assert caplog.text.count("would create uplink cable") == 1
+    assert "gw-lab:eth0" in caplog.text
+    assert name_match in caplog.text
+    assert "site-b" in caplog.text
+    assert "Skipping the uplink cable" in caplog.text
 
 
 def test_client_wired_interface_name_is_configurable():
