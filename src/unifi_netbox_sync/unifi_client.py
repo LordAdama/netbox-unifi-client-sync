@@ -70,6 +70,25 @@ def _parse_port_table(raw: list[dict]) -> list[UnifiPort]:
     return sorted(ports, key=lambda p: p.index)
 
 
+def _parse_uplink(raw: dict) -> dict:
+    """Wired uplink fields, or empty values for wireless/unknown uplinks."""
+    if not isinstance(raw, dict) or raw.get("type") != "wire":
+        return {}
+
+    def _port(value: object) -> int | None:
+        try:
+            number = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+
+    return {
+        "uplink_mac": str(raw.get("uplink_mac") or "").lower(),
+        "uplink_remote_port": _port(raw.get("uplink_remote_port")),
+        "uplink_local_port": _port(raw.get("port_idx")),
+    }
+
+
 def _parse_outlet_table(raw: list[dict]) -> list[UnifiOutlet]:
     """Toggleable PDU/UPS outlets. These are not switch ports."""
     outlets = []
@@ -216,6 +235,7 @@ class UnifiClientAPI:
                     ports=_parse_port_table(entry.get("port_table") or []),
                     shortname=(entry.get("shortname") or "").strip(),
                     outlets=_parse_outlet_table(entry.get("outlet_table") or []),
+                    **_parse_uplink(entry.get("uplink") or {}),
                 )
             )
         return devices

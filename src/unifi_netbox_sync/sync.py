@@ -53,8 +53,8 @@ logger = logging.getLogger(__name__)
 EXPECTED_CLIENT_ERRORS = (requests.exceptions.RequestException, pynetbox.RequestError, LookupError)
 
 
-def _interface_name(client: UnifiClient) -> str:
-    return "eth0" if client.is_wired else "wlan0"
+def _interface_name(client: UnifiClient, wired_name: str = "eth0") -> str:
+    return wired_name if client.is_wired else "wlan0"
 
 
 def _primary_ip_matches(device: object, ip: str) -> bool:
@@ -198,6 +198,10 @@ def _merge_summaries(summaries: list[SyncSummary]) -> SyncSummary:
         merged.infra_moved += s.infra_moved
         merged.infra_duplicates_avoided += s.infra_duplicates_avoided
         merged.infra_name_conflicts += s.infra_name_conflicts
+        merged.legacy_eth0_found += s.legacy_eth0_found
+        merged.uplink_cables_skipped += s.uplink_cables_skipped
+        merged.uplink_cables_unchanged += s.uplink_cables_unchanged
+        merged.uplink_cables_created += s.uplink_cables_created
         merged.infra_type_library += s.infra_type_library
         merged.infra_type_generated += s.infra_type_generated
         merged.stale_marked_offline += s.stale_marked_offline
@@ -770,6 +774,10 @@ class SyncEngine:
             summary.infra_moved = infra.infra_moved
             summary.infra_duplicates_avoided = infra.infra_duplicates_avoided
             summary.infra_name_conflicts = infra.infra_name_conflicts
+            summary.legacy_eth0_found = infra.legacy_eth0_found
+            summary.uplink_cables_skipped = infra.uplink_cables_skipped
+            summary.uplink_cables_unchanged = infra.uplink_cables_unchanged
+            summary.uplink_cables_created = infra.uplink_cables_created
             summary.errors.extend(infra.errors or [])
             summary.infra_type_library = infra.infra_type_library
             summary.infra_type_generated = infra.infra_type_generated
@@ -960,10 +968,18 @@ class SyncEngine:
                     logger.exception("Failed syncing UniFi device %s (%s)", device.mac, device.name)
                     summary.errors.append(f"{pair.unifi_site}/{device.mac}: UniFi device {device.name}: {exc}")
 
+        for device in adopted:
+            try:
+                self._sync_uplink_cable(pair, device, summary, prefix)
+            except EXPECTED_CLIENT_ERRORS as exc:
+                logger.exception("Failed cabling uplink for UniFi device %s (%s)", device.mac, device.name)
+                summary.errors.append(f"{pair.unifi_site}/{device.mac}: uplink cable for {device.name}: {exc}")
+
         kind_text = ", ".join(f"{name}={created_by_kind[name]}" for name in ("switch", "ap", "gateway", "power"))
         logger.info(
             "%sSite '%s': %d adopted UniFi device(s); creates by kind: %s; "
             "merged=%d; moved=%d; cross-site matches avoided=%d; name conflicts=%d; errors=%d; "
+            "uplink cables created=%d unchanged=%d skipped=%d; legacy eth0 found=%d; "
             "type sources library=%d generated=%d",
             prefix,
             pair.unifi_site,
@@ -974,6 +990,10 @@ class SyncEngine:
             summary.infra_duplicates_avoided,
             summary.infra_name_conflicts,
             len(summary.errors),
+            summary.uplink_cables_created,
+            summary.uplink_cables_unchanged,
+            summary.uplink_cables_skipped,
+            summary.legacy_eth0_found,
             summary.infra_type_library,
             summary.infra_type_generated,
         )
@@ -986,6 +1006,10 @@ class SyncEngine:
             return SyncSummary(
                 devices_synced=len(adopted),
                 infra_name_conflicts=summary.infra_name_conflicts,
+                uplink_cables_created=summary.uplink_cables_created,
+                uplink_cables_unchanged=summary.uplink_cables_unchanged,
+                uplink_cables_skipped=summary.uplink_cables_skipped,
+                legacy_eth0_found=summary.legacy_eth0_found,
                 errors=list(summary.errors),
             )
         return summary
@@ -1022,6 +1046,8 @@ class SyncEngine:
         tagged = existing is None or device_has_tag(existing, s.sync_tag)
         interface_names = [name for name, _ in spec.interfaces]
         outlet_count = len(getattr(spec, "power_outlets", None) or [])
+        if s.dry_run and existing is not None:
+            self._report_legacy_eth0(existing, device, kind, interface_names, summary)
 
         if existing is not None and not tagged:
             summary.infra_duplicates_avoided += 1
@@ -1269,6 +1295,101 @@ class SyncEngine:
             summary.infra_moved += 1
             self._forget_switch(mac)
 
+    def _report_legacy_eth0(
+        self, existing: object, device: object, kind: str, interface_names: list[str], summary: SyncSummary
+    ) -> None:
+        """Dry-run only: note an eth0 on a device UniFi says is infrastructure.
+
+        Covers tagged and untagged devices, and untagged cables, because a
+        hand-made record is exactly where a stale eth0 hides. Nothing is
+        written; a real merge moves eth0 through align_device_components.
+        """
+        plan = self.netbox.legacy_eth0_plan(existing, interface_names)
+        if plan == "absent" or plan.startswith("kept (eth0 is part"):
+            return
+        summary.legacy_eth0_found += 1
+        logger.info(
+            "[dry-run] legacy eth0 on %s %r (NetBox id=%s %r, MAC %s): %s",
+            kind,
+            getattr(device, "name", ""),
+            getattr(existing, "id", ""),
+            getattr(existing, "name", ""),
+            getattr(device, "mac", ""),
+            plan,
+        )
+
+    def _uplink_port_candidates(self, mac: str, port_no: int) -> list[str]:
+        hints = self._hints_for(mac)
+        ports = list(hints.ports) if hints is not None else []
+        model = hints.model if hints is not None else None
+        extra = [p.name for p in ports if p.index == port_no and getattr(p, "name", None)]
+        return candidate_names(
+            templates_for_model(self.settings.port_model_templates, model),
+            self.settings.port_name_templates,
+            port_no,
+            sfp_ordinal(ports, port_no),
+            extra,
+        )
+
+    def _sync_uplink_cable(self, pair: SitePair, device: object, summary: SyncSummary, prefix: str) -> None:
+        """Cable a device's own uplink port to the upstream port UniFi reports.
+
+        This is the infra-to-infra link, between real ports on both ends,
+        rather than a client-style eth0.
+        """
+        up_mac = getattr(device, "uplink_mac", "") or ""
+        remote = getattr(device, "uplink_remote_port", None)
+        local = getattr(device, "uplink_local_port", None)
+        if not up_mac or remote is None:
+            return
+        name = getattr(device, "name", "")
+
+        def skip(why: str) -> None:
+            summary.uplink_cables_skipped += 1
+            logger.info("%suplink cable for %r skipped: %s", prefix, name, why)
+
+        if local is None:
+            skip("UniFi does not report which local port is the uplink")
+            return
+        down_dev = self.netbox.find_switch_device_by_mac(device.mac, self._hints_for(device.mac))
+        up_dev = self.netbox.find_switch_device_by_mac(up_mac, self._hints_for(up_mac))
+        if down_dev is None or up_dev is None:
+            skip(f"{'this device' if down_dev is None else 'upstream ' + up_mac} not found in NetBox")
+            return
+        down_names = self._uplink_port_candidates(device.mac, local)
+        up_names = self._uplink_port_candidates(up_mac, remote)
+        down_if = self.netbox.find_interface_by_name_candidates(down_dev, down_names)
+        up_if = self.netbox.find_interface_by_name_candidates(up_dev, up_names)
+        if down_if is None or up_if is None:
+            missing = f"{name} port {local}" if down_if is None else f"{getattr(up_dev, 'name', up_mac)} port {remote}"
+            skip(f"no NetBox interface for {missing}")
+            return
+        label = (
+            f"{getattr(down_dev, 'name', name)}:{getattr(down_if, 'name', '')} -- "
+            f"{getattr(up_dev, 'name', up_mac)}:{getattr(up_if, 'name', '')}"
+        )
+        if _already_cabled_to(down_if, up_if):
+            summary.uplink_cables_unchanged += 1
+            return
+        if self.settings.dry_run:
+            busy = getattr(down_if, "cable", None) or getattr(up_if, "cable", None)
+            if busy and self.settings.cable_conflict_policy != "replace":
+                skip(f"{label}: an end is already cabled (CABLE_CONFLICT_POLICY={self.settings.cable_conflict_policy})")
+                return
+            summary.uplink_cables_created += 1
+            logger.info("[dry-run] would create uplink cable %s", label)
+            return
+        created, reason = self.netbox.ensure_cable(
+            down_if, up_if, self.settings.cable_conflict_policy, self.settings.sync_tag
+        )
+        if created:
+            summary.uplink_cables_created += 1
+            logger.info("Created uplink cable %s", label)
+        elif reason:
+            skip(f"{label}: {reason}")
+        else:
+            summary.uplink_cables_unchanged += 1
+
     def _forget_switch(self, mac: str) -> None:
         """Invalidate a cached negative switch lookup after creating it."""
         forget = getattr(self.netbox, "forget_switch", None)
@@ -1440,7 +1561,7 @@ class SyncEngine:
             if current_type is not None and current_type != desired_type:
                 return False
 
-        iface_name = _interface_name(client)
+        iface_name = _interface_name(client, self.settings.client_wired_interface_name)
         resolved: _ResolvedCable | None = None
         if client.is_wired and client.switch_mac and client.switch_port:
             client_iface = self._iface_for_fast_path(existing, iface_name, dry_run=s.dry_run)
@@ -1506,7 +1627,7 @@ class SyncEngine:
     ) -> ClientSyncResult:
         result = ClientSyncResult(mac=client.mac, name=client.display_name)
         s = self.settings
-        iface_name = _interface_name(client)
+        iface_name = _interface_name(client, self.settings.client_wired_interface_name)
         try:
             existing = self.netbox.find_client_device_by_mac(client.mac)
             if existing is not None and not device_has_tag(existing, s.sync_tag):
@@ -1620,7 +1741,7 @@ class SyncEngine:
         cable_ctx: _CableContext,
     ) -> None:
         """Log every write this client would cause. Performs no NetBox writes."""
-        iface_name = _interface_name(client)
+        iface_name = _interface_name(client, self.settings.client_wired_interface_name)
         s = self.settings
         if existing is None:
             result.device_created = True

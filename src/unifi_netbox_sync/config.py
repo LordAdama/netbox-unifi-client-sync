@@ -216,6 +216,8 @@ class Settings:
     client_device_role_slug: str = "unifi-client"
     client_manufacturer_slug: str = "generic"
     client_device_type_slug: str = "generic-network-client"
+    # Interface name used for wired client devices. Wireless stays wlan0.
+    client_wired_interface_name: str = "eth0"
     port_name_templates: list[str] = field(
         default_factory=lambda: DEFAULT_PORT_NAME_TEMPLATES.copy()
     )
@@ -367,6 +369,7 @@ class Settings:
             client_device_role_slug=os.environ.get("CLIENT_DEVICE_ROLE_SLUG", "unifi-client"),
             client_manufacturer_slug=os.environ.get("CLIENT_MANUFACTURER_SLUG", "generic"),
             client_device_type_slug=os.environ.get("CLIENT_DEVICE_TYPE_SLUG", "generic-network-client"),
+            client_wired_interface_name=(os.environ.get("CLIENT_WIRED_INTERFACE_NAME") or "eth0").strip() or "eth0",
             port_name_templates=port_name_templates,
             port_model_templates=parse_model_templates(os.environ.get("PORT_MODEL_TEMPLATES", "")),
             cable_skip_report=os.environ.get("CABLE_SKIP_REPORT") or None,

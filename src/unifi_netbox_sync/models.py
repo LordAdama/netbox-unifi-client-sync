@@ -48,6 +48,11 @@ class UnifiSwitchDevice:
     # Product shortname from the controller ("UPS23", "USP-PDU-Pro"), when present.
     shortname: str = ""
     outlets: list[UnifiOutlet] = field(default_factory=list)
+    # Wired uplink from UniFi: the upstream device MAC, the port on that
+    # device, and this device's own port. Empty or None when not wired.
+    uplink_mac: str = ""
+    uplink_remote_port: int | None = None
+    uplink_local_port: int | None = None
 
     @property
     def is_switch(self) -> bool:
@@ -198,6 +203,13 @@ class SyncSummary:
     # Legacy merges skipped because another device already holds the target
     # name at the site. Also counted in infra_duplicates_avoided.
     infra_name_conflicts: int = 0
+    # Infra-to-infra cables from UniFi uplink data.
+    uplink_cables_created: int = 0
+    uplink_cables_unchanged: int = 0
+    uplink_cables_skipped: int = 0
+    # Legacy eth0 interfaces still holding a cable or IP on devices that
+    # UniFi says are infrastructure. Reported only; never written.
+    legacy_eth0_found: int = 0
     infra_type_library: int = 0
     infra_type_generated: int = 0
     # Work that was inspected and correctly required no write. High numbers
