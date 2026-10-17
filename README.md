@@ -79,14 +79,16 @@ NetBox interface, or two interfaces that parse to the same port) is logged
 at INFO/WARNING for troubleshooting.
 
 Infra-to-infra uplinks (a UniFi device's own uplink port cabled to the
-upstream port) use that same match on both ends. UniFi indexes start at 1.
-When a wired name family contains index 0 (`eth0`/`eth1`, `lan0`/`lan1`, or
-any other prefix), port `N` selects index `N-1`, so port 1 is `eth0` and
-port 2 is `eth1` on a gateway with `eth0`..`eth8`. Families that start at 1
-(`Port 1`, `GE1`, `Gi1`) stay on `N`. The same shift is used for client
-cables. A zero-based hit and a different 1-based hit are ambiguous: the
-cable is skipped and the names are logged. A matching `PORT_MODEL_TEMPLATES`
-entry still wins over that shift.
+upstream port) use that same match on both ends, plus an uplink-only shift.
+UniFi indexes start at 1. When a wired name family contains index 0
+(`eth0`/`eth1`, `lan0`/`lan1`, or any other prefix), port `N` selects index
+`N-1`, so port 1 is `eth0` and port 2 is `eth1` on a gateway with
+`eth0`..`eth8`. Families that start at 1 (`Port 1`, `GE1`, `Gi1`) stay on
+`N`. A zero-based hit and a different 1-based hit are ambiguous: the cable
+is skipped and the names are logged. A matching `PORT_MODEL_TEMPLATES` entry
+still wins over that shift. Client cables do not use the shift or the
+single-interface fallback, so a leftover client record whose only interface
+is the placeholder `eth0` (`CLIENT_WIRED_INTERFACE_NAME`) is not cabled.
 
 After that, an interface whose trailing number equals the port index matches
 when nothing earlier did, for any other prefix (`SFP+ 49`, `SFP 49`,
@@ -99,8 +101,9 @@ port the controller left blank, on that interface. A model that lists templates 
 structural guess and these last two fallbacks for a known port.
 
 If two UniFi devices resolve to the same NetBox device, one by MAC and one
-by name, only the MAC match is cabled. The other uplink is skipped and
-logged, so a dry-run does not plan the same cable twice.
+by name, only the MAC match is cabled. The check covers every UniFi site in
+the run, not one site at a time. The other uplink is skipped and logged, so
+a dry-run does not plan the same cable twice.
 
 ## Syncing UniFi devices (switches, APs, gateways, PDUs)
 
@@ -838,12 +841,15 @@ level, for each distinct switch:
   A model with templates does not also take a structural guess, so a wrong
   stack member cannot win. The same pin suppresses an uplink's
   trailing-number fallback (`SFP+ 49` for port 49) and the single-interface
-  fallback for a known port. It does not turn off the zero-based shift: a
-  family that contains `eth0` still maps port 1 to `eth0` unless the model
-  template itself matches a name. An ambiguous match is skipped and logged.
-  A blank local port still uses the single wired interface, because a
+  fallback for a known port. It does not turn off the uplink zero-based
+  shift: a family that contains `eth0` still maps uplink port 1 to `eth0`
+  unless the model template itself matches a name. Client cables are not
+  shifted, and a device whose only interface is the placeholder `eth0` does
+  not get a client cable. An ambiguous match is skipped and logged. A blank
+  local uplink port still uses the single wired interface, because a
   template needs a port index. Two UniFi devices that resolve to one NetBox
-  device do not both get an uplink cable; the MAC match is kept.
+  device, including devices from different UniFi sites, do not both get an
+  uplink cable; the MAC match is kept.
 - *"port N on X is shared by multiple wired clients"* — more than one client
   is on that switch port (an uplink, or an unmanaged switch behind an AP).
   None of them is cabled. A port the controller marks `is_uplink` is skipped
@@ -959,9 +965,10 @@ every push/PR.
 - `unifi_client.py` — thin REST client for the UniFi controller (login,
   active clients, client history with `last_seen`, infrastructure devices).
 - `portmatch.py` — UniFi port index to NetBox interface name: templates,
-  per-model templates, structural names (slot/module, Juniper, SFP), a
-  zero-based shift when a name family contains index 0 (`eth0` is port 1),
-  and the uplink trailing-number and single-wired-interface fallbacks.
+  per-model templates, structural names (slot/module, Juniper, SFP), an
+  uplink-only zero-based shift when a name family contains index 0 (`eth0`
+  is uplink port 1), and the uplink trailing-number and
+  single-wired-interface fallbacks. Client cables do not use those fallbacks.
 - `staleness.py` — offline decision from `last_seen` and the grace window.
 - `netbox_client.py` — `NetboxGateway` defines the interface the sync
   engine depends on; `PynetboxGateway` is the real implementation backed by

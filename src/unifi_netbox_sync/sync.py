@@ -292,6 +292,11 @@ class SyncEngine:
         # Serializes find-then-create across site workers so two sites cannot
         # each create the same chassis.
         self._infra_lock = threading.Lock()
+        # Adopted devices waiting for the run-wide uplink pass. Cabling waits
+        # until every site has synced so a name match in one site and a MAC
+        # match in another cannot plan the same cable twice.
+        self._uplink_queue: list[tuple[SitePair, object]] = []
+        self._uplink_lock = threading.Lock()
         # Conflicts found while linking sites. Merged into the run summary so
         # a collapsed mapping cannot look like a successful sync.
         self._link_errors: list[str] = []
@@ -375,6 +380,7 @@ class SyncEngine:
 
     def run(self) -> SyncSummary:
         start = time.monotonic()
+        self._uplink_queue = []
         if self.settings.sync_all_sites:
             pairs = self._discover_site_pairs()
         else:
@@ -442,6 +448,7 @@ class SyncEngine:
                 )
 
         summary = _merge_summaries(group_summaries)
+        summary = _merge_summaries([summary, self._finish_uplink_cables()])
         if self._link_errors:
             summary.errors.extend(self._link_errors)
         summary.duration_seconds = time.monotonic() - start
@@ -987,28 +994,17 @@ class SyncEngine:
                     logger.exception("Failed syncing UniFi device %s (%s)", device.mac, device.name)
                     summary.errors.append(f"{pair.unifi_site}/{device.mac}: UniFi device {device.name}: {exc}")
 
-        duplicate_macs = self._uplink_duplicate_macs(adopted, prefix)
-        for device in adopted:
-            if device.mac in duplicate_macs:
-                summary.uplink_cables_skipped += 1
-                logger.info(
-                    "%suplink cable for %r skipped: another UniFi device matches the same NetBox device",
-                    prefix,
-                    getattr(device, "name", ""),
-                )
-                continue
-            try:
-                self._sync_uplink_cable(pair, device, summary, prefix)
-            except EXPECTED_CLIENT_ERRORS as exc:
-                logger.exception("Failed cabling uplink for UniFi device %s (%s)", device.mac, device.name)
-                summary.errors.append(f"{pair.unifi_site}/{device.mac}: uplink cable for {device.name}: {exc}")
+        # Uplink cabling is deferred until every site in the run has synced,
+        # so the duplicate check can see a MAC match and a name match that
+        # live in different UniFi sites.
+        with self._uplink_lock:
+            self._uplink_queue.extend((pair, device) for device in adopted)
 
         kind_text = ", ".join(f"{name}={created_by_kind[name]}" for name in ("switch", "ap", "gateway", "power"))
         logger.info(
             "%sSite '%s': %d adopted UniFi device(s); creates by kind: %s; "
             "merged=%d; moved=%d; cross-site matches avoided=%d; name conflicts=%d; errors=%d; "
-            "uplink cables created=%d unchanged=%d skipped=%d; legacy eth0 found=%d; "
-            "type sources library=%d generated=%d",
+            "legacy eth0 found=%d; type sources library=%d generated=%d",
             prefix,
             pair.unifi_site,
             len(adopted),
@@ -1018,9 +1014,6 @@ class SyncEngine:
             summary.infra_duplicates_avoided,
             summary.infra_name_conflicts,
             len(summary.errors),
-            summary.uplink_cables_created,
-            summary.uplink_cables_unchanged,
-            summary.uplink_cables_skipped,
             summary.legacy_eth0_found,
             summary.infra_type_library,
             summary.infra_type_generated,
@@ -1034,9 +1027,6 @@ class SyncEngine:
             return SyncSummary(
                 devices_synced=len(adopted),
                 infra_name_conflicts=summary.infra_name_conflicts,
-                uplink_cables_created=summary.uplink_cables_created,
-                uplink_cables_unchanged=summary.uplink_cables_unchanged,
-                uplink_cables_skipped=summary.uplink_cables_skipped,
                 legacy_eth0_found=summary.legacy_eth0_found,
                 errors=list(summary.errors),
             )
@@ -1359,45 +1349,100 @@ class SyncEngine:
             return device, strategy or ""
         return self.netbox.find_switch_device_by_mac(mac, hints), ""
 
-    def _uplink_duplicate_macs(self, adopted: list[object], prefix: str) -> set[str]:
+    def _finish_uplink_cables(self) -> SyncSummary:
+        """Cable uplinks once every site has synced its devices.
+
+        The duplicate check is over the whole run. A device matched by MAC in
+        one UniFi site and another matched by name in a different site must
+        not both plan the cable.
+        """
+        with self._uplink_lock:
+            queued = list(self._uplink_queue)
+            self._uplink_queue = []
+        if not queued:
+            return SyncSummary()
+        prefix = "[dry-run] " if self.settings.dry_run else ""
+        duplicate_macs = self._uplink_duplicate_macs(queued, prefix)
+        by_site: dict[str, SyncSummary] = {}
+        for pair, device in queued:
+            site_summary = by_site.setdefault(pair.unifi_site, SyncSummary())
+            if device.mac in duplicate_macs:
+                site_summary.uplink_cables_skipped += 1
+                logger.info(
+                    "%suplink cable for %r (%s, site %s) skipped: another UniFi device "
+                    "matches the same NetBox device",
+                    prefix,
+                    getattr(device, "name", ""),
+                    device.mac,
+                    pair.unifi_site,
+                )
+                continue
+            try:
+                self._sync_uplink_cable(pair, device, site_summary, prefix)
+            except EXPECTED_CLIENT_ERRORS as exc:
+                logger.exception(
+                    "Failed cabling uplink for UniFi device %s (%s)", device.mac, device.name
+                )
+                site_summary.errors.append(
+                    f"{pair.unifi_site}/{device.mac}: uplink cable for {device.name}: {exc}"
+                )
+        for site in sorted(by_site):
+            site_summary = by_site[site]
+            logger.info(
+                "%sSite '%s': uplink cables created=%d unchanged=%d skipped=%d",
+                prefix,
+                site,
+                site_summary.uplink_cables_created,
+                site_summary.uplink_cables_unchanged,
+                site_summary.uplink_cables_skipped,
+            )
+        return _merge_summaries(list(by_site.values()))
+
+    def _uplink_duplicate_macs(
+        self, queued: list[tuple[SitePair, object]], prefix: str
+    ) -> set[str]:
         """UniFi MACs that must not cable because a better match owns the device.
 
+        ``queued`` is every adopted device in the run, from every UniFi site.
         One NetBox device can be found twice: once by MAC and once because
-        another UniFi device carries the same name. Cabling both plans the
-        same link twice. The MAC match is kept; the other is skipped.
+        another UniFi device, possibly in another site, carries the same name.
+        Cabling both plans the same link twice. The MAC match is kept; the
+        other is skipped.
         """
-        located: list[tuple[object, object, str]] = []
-        for device in adopted:
+        located: list[tuple[object, str, object, str]] = []
+        for pair, device in queued:
             netbox_device, strategy = self._locate_switch(device.mac)
             if netbox_device is None:
                 continue
-            located.append((device, netbox_device, strategy))
-        groups: dict[object, list[tuple[object, object, str]]] = {}
-        for device, netbox_device, strategy in located:
+            located.append((device, pair.unifi_site, netbox_device, strategy))
+        groups: dict[object, list[tuple[object, str, object, str]]] = {}
+        for device, site, netbox_device, strategy in located:
             key = getattr(netbox_device, "id", None)
             if key is None:
                 key = id(netbox_device)
-            groups.setdefault(key, []).append((device, netbox_device, strategy))
+            groups.setdefault(key, []).append((device, site, netbox_device, strategy))
         skipped: set[str] = set()
         for group in groups.values():
             if len(group) < 2:
                 continue
-            winner = min(group, key=lambda item: (_switch_match_rank(item[2]),))
-            winner_device, netbox_device, winner_strategy = winner
-            for device, _, strategy in group:
-                if device.mac == winner_device.mac:
+            winner = min(group, key=lambda item: (_switch_match_rank(item[3]),))
+            winner_device, winner_site, netbox_device, winner_strategy = winner
+            for device, site, _, strategy in group:
+                if device is winner_device:
                     continue
                 skipped.add(device.mac)
                 logger.warning(
-                    "%sUniFi device %r (%s) matches NetBox device %r via %s, "
-                    "but %r (%s) matches it via %s. Skipping the uplink cable for %r.",
+                    "%sUniFi device %r (%s, site %s) matches NetBox device %r via %s, "
+                    "but %r (%s, site %s) matches it via %s. Skipping the uplink cable for %r.",
                     prefix,
                     getattr(device, "name", ""),
                     device.mac,
+                    site,
                     getattr(netbox_device, "name", ""),
                     strategy or "unknown",
                     getattr(winner_device, "name", ""),
                     winner_device.mac,
+                    winner_site,
                     winner_strategy or "unknown",
                     getattr(device, "name", ""),
                 )
@@ -2328,13 +2373,17 @@ class SyncEngine:
                 )
             return None
 
+        # Client cables keep the pre-shift match: templates and structural
+        # names only. The zero-based shift and the single-interface fallback
+        # belong to uplinks, so a leftover client record whose only wired
+        # interface is the placeholder eth0 does not gain a cable.
         outcome = match_port(
             netbox_names,
             candidates,
             port_no,
             sfp_index,
             allow_structural=not model_templates,
-            pinned_count=model_candidate_count(model_templates, port_no, sfp_index),
+            zero_based=False,
         )
         if outcome.via == "ambiguous" or outcome.name is None:
             if outcome.via == "ambiguous":

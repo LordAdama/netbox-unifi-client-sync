@@ -231,7 +231,11 @@ def test_uplink_access_point_eth0_eth1_maps_port_1_to_eth0():
     outcome = _uplink(["eth0", "eth1", "wlan0"], 1)
     assert outcome.name == "eth0"
     assert outcome.via == "zero-based"
-    assert _match(["eth0", "eth1", "wlan0"], 1).name == "eth0"
+    # Client matching does not shift. The eth{port} template still selects eth1.
+    client = _match(["eth0", "eth1", "wlan0"], 1)
+    assert client.name == "eth1"
+    assert client.via == "template"
+    assert _match(["eth0"], 1).name is None
 
 
 def test_uplink_gateway_eth_ports_are_zero_based():
@@ -241,7 +245,8 @@ def test_uplink_gateway_eth_ports_are_zero_based():
     assert outcome.via == "zero-based"
     assert _uplink(names, 1).name == "eth0"
     assert _uplink(names, 9).name == "eth8"
-    assert _match(names, 2).name == "eth1"
+    # Client matching keeps the 1-based eth{port} template.
+    assert _match(names, 2).name == "eth2"
 
 
 @pytest.mark.parametrize("name", ["Port 1", "GE1", "Gi1"])

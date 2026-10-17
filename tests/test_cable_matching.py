@@ -40,28 +40,45 @@ def test_slot_module_juniper_and_zero_pad_names_get_cables():
         assert netbox.switches[SWITCH_MAC].interfaces[name].cable is not None
 
 
-def test_zero_based_eth_names_cable_port_1_to_eth0_and_port_2_to_eth1():
+def test_client_cable_does_not_shift_zero_based_names_or_use_a_lone_eth0():
+    """Client cables stay on the template match.
+
+    A leftover client record whose only interface is the placeholder eth0
+    must not gain a cable, and eth0/eth1 must not be shifted down by one.
+    Port 1 still hits eth1 through the eth{port} template. Port 2 hits nothing.
+    """
     netbox = FakeNetboxGateway()
-    netbox.seed_switch(SWITCH_MAC, "sw", ["eth0", "eth1", "wlan0"])
+    netbox.seed_switch(SWITCH_MAC, "sw", ["eth0"])
     summary = _run(
         netbox,
         [make_unifi_client(mac="11:22:33:44:55:66", is_wired=True, switch_mac=SWITCH_MAC, switch_port=1)],
     )
-    assert summary.cables_created == 1
-    switch = netbox.switches[SWITCH_MAC]
-    assert switch.interfaces["eth0"].cable is not None
-    assert switch.interfaces["eth1"].cable is None
+    assert summary.cables_created == 0
+    assert summary.cables_skipped == 1
+    assert netbox.switches[SWITCH_MAC].interfaces["eth0"].cable is None
 
     netbox = FakeNetboxGateway()
-    netbox.seed_switch(SWITCH_MAC, "sw", ["eth0", "eth1"])
+    netbox.seed_switch(SWITCH_MAC, "sw", ["eth0", "eth1", "wlan0"])
     summary = _run(
         netbox,
-        [make_unifi_client(mac="11:22:33:44:55:67", is_wired=True, switch_mac=SWITCH_MAC, switch_port=2)],
+        [make_unifi_client(mac="11:22:33:44:55:67", is_wired=True, switch_mac=SWITCH_MAC, switch_port=1)],
     )
     assert summary.cables_created == 1
     switch = netbox.switches[SWITCH_MAC]
     assert switch.interfaces["eth1"].cable is not None
     assert switch.interfaces["eth0"].cable is None
+
+    netbox = FakeNetboxGateway()
+    netbox.seed_switch(SWITCH_MAC, "sw", ["eth0", "eth1"])
+    summary = _run(
+        netbox,
+        [make_unifi_client(mac="11:22:33:44:55:68", is_wired=True, switch_mac=SWITCH_MAC, switch_port=2)],
+    )
+    assert summary.cables_created == 0
+    assert summary.cables_skipped == 1
+    switch = netbox.switches[SWITCH_MAC]
+    assert switch.interfaces["eth0"].cable is None
+    assert switch.interfaces["eth1"].cable is None
 
 
 def test_exact_port_name_still_preferred_when_a_structural_name_also_exists():

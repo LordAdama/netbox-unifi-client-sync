@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import logging
 
+from unifi_netbox_sync.caching import CachingNetboxGateway
 from unifi_netbox_sync.models import UnifiPort, UnifiSwitchDevice
 from unifi_netbox_sync.portmatch import parse_model_templates
+from unifi_netbox_sync.sync import SyncEngine
 from unifi_netbox_sync.unifi_client import _parse_uplink
 
-from .fakes import FakeNetboxGateway, make_unifi_client
+from .fakes import FakeNetboxGateway, FakeUnifiClient, make_unifi_client
 from .test_device_sync import SWITCH_MAC, _run, _switch
+from .test_sync import make_settings
 
 DOWN_MAC = "aa:bb:cc:dd:ee:09"
 
@@ -341,6 +344,59 @@ def test_uplink_name_match_does_not_plan_a_second_cable(caplog):
     assert caplog.text.count("would create uplink cable") == 1
     assert "gw-lab:eth0" in caplog.text
     assert name_match in caplog.text
+    assert "Skipping the uplink cable" in caplog.text
+
+
+def test_uplink_duplicate_across_sites_keeps_the_mac_match(caplog):
+    """A name match in one UniFi site and a MAC match in another share a device.
+
+    The duplicate check is for the whole run, so the name match is skipped
+    and the dry-run plans the uplink once.
+    """
+    netbox = FakeNetboxGateway()
+    _seed(netbox, SWITCH_MAC, "core-switch", ["Port 4"], "F09FC2AAAA01")
+    mac_match = "aa:bb:cc:dd:ee:61"
+    name_match = "aa:bb:cc:dd:ee:62"
+    _seed(netbox, mac_match, "gw-lab", ["eth0", "eth1"], "F09FC2AAAA61")
+
+    def _gw(mac: str) -> UnifiSwitchDevice:
+        return UnifiSwitchDevice(
+            mac=mac,
+            name="gw-lab",
+            model="GW-LAB",
+            device_type="ugw",
+            serial="F09FC2AAAA61" if mac == mac_match else "F09FC2AAAA62",
+            ports=[UnifiPort(index=1, media="GE"), UnifiPort(index=2, media="GE")],
+            uplink_mac=SWITCH_MAC,
+            uplink_remote_port=4,
+            uplink_local_port=1,
+        )
+
+    engine = SyncEngine(
+        unifi=FakeUnifiClient(
+            devices_by_site={"site-a": [_gw(mac_match)], "site-b": [_gw(name_match)]}
+        ),
+        netbox=CachingNetboxGateway(netbox),
+        settings=make_settings(
+            sync_unifi_devices=True,
+            dry_run=True,
+            site_map={"site-a": "netbox-a", "site-b": "netbox-b"},
+            netbox_site_slug="",
+            max_workers=2,
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        summary = engine.run()
+
+    assert summary.errors == []
+    assert summary.uplink_cables_created == 1
+    assert summary.uplink_cables_skipped == 1
+    assert netbox.cables == set()
+    assert caplog.text.count("would create uplink cable") == 1
+    assert "gw-lab:eth0" in caplog.text
+    assert name_match in caplog.text
+    assert "site-b" in caplog.text
     assert "Skipping the uplink cable" in caplog.text
 
 

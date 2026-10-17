@@ -38,12 +38,14 @@ structural matches, then the trailing number, then the single interface.
 and a model that lists templates does not take the structural guess or
 fallbacks 3 and 4 for a known port.
 
-Names in one family are zero-based when that family contains index 0
-(``eth0``/``eth1``, ``lan0``/``lan1``, or any other prefix). UniFi port
-``N`` then selects index ``N-1``. Families that start at 1 (``Port 1``,
-``GE1``, ``Gi1``) stay on ``N``. A zero-based hit and a different 1-based
-hit for the same port are ambiguous. Management names (``mgmt0``, ``fxp0``)
-are not a port family.
+Uplinks also shift a name family that contains index 0 (``eth0``/``eth1``,
+``lan0``/``lan1``, or any other prefix): UniFi port ``N`` selects index
+``N-1``. Families that start at 1 (``Port 1``, ``GE1``, ``Gi1``) stay on
+``N``. A zero-based hit and a different 1-based hit for the same port are
+ambiguous. Management names (``mgmt0``, ``fxp0``) are not a port family.
+Client cables do not use that shift or the single-interface fallback, so a
+leftover client record whose only interface is the placeholder ``eth0`` is
+not port 1.
 """
 
 from __future__ import annotations
@@ -358,14 +360,20 @@ def match_port(
     *,
     allow_structural: bool,
     pinned_count: int = 0,
+    zero_based: bool = False,
 ) -> PortMatch:
     """Pick the interface name for this UniFi port, or say why not.
 
-    ``pinned_count`` is how many leading ``candidates`` came from
-    ``PORT_MODEL_TEMPLATES``. Those are tried first and win even when the
-    device's own names are zero-based. Every other family that contains
-    index 0 maps port ``N`` to index ``N-1``; families that start at 1
-    keep ``N``.
+    Client cables call this with ``zero_based`` false. Templates and
+    structural names then behave as they did before the uplink shift, so a
+    device whose only interface is the placeholder ``eth0`` does not become
+    port 1, and there is no single-interface fallback.
+
+    Uplink matching passes ``zero_based`` true. ``pinned_count`` is how many
+    leading ``candidates`` came from ``PORT_MODEL_TEMPLATES``. Those are
+    tried first and win even when the device's own names are zero-based.
+    Every other family that contains index 0 maps port ``N`` to index
+    ``N-1``; families that start at 1 keep ``N``.
     """
     tried = tuple(candidates)
     grouped: dict[str, list[str]] = {}
@@ -391,39 +399,45 @@ def match_port(
         return None
 
     pinned = max(0, pinned_count)
-    if pinned:
-        # An explicit model template beats the zero-based correction.
-        chosen = first_unique(candidates[:pinned], set(), shift=False)
-        if chosen is not None:
-            return chosen
+    prefixes: set[str] = set()
+    if zero_based:
+        if pinned:
+            # An explicit model template beats the zero-based correction.
+            chosen = first_unique(candidates[:pinned], set(), shift=False)
+            if chosen is not None:
+                return chosen
 
-    prefixes = zero_based_prefixes(interface_names) if port is not None else set()
-    zero_hits = zero_based_hits(interface_names, port, prefixes)
-    templated = first_unique(candidates, prefixes, shift=True)
-    if templated is not None and templated.via == "ambiguous":
-        return templated
-    template_name = templated.name if templated is not None else None
-    if template_name and zero_hits:
-        distinct = list(dict.fromkeys([template_name, *zero_hits]))
-        if len(distinct) > 1:
+        prefixes = zero_based_prefixes(interface_names) if port is not None else set()
+        zero_hits = zero_based_hits(interface_names, port, prefixes)
+        templated = first_unique(candidates, prefixes, shift=True)
+        if templated is not None and templated.via == "ambiguous":
+            return templated
+        template_name = templated.name if templated is not None else None
+        if template_name and zero_hits:
+            distinct = list(dict.fromkeys([template_name, *zero_hits]))
+            if len(distinct) > 1:
+                return PortMatch(
+                    name=None,
+                    via="ambiguous",
+                    names_tried=tried,
+                    ambiguous_names=tuple(distinct),
+                )
+            return templated
+        if template_name:
+            return templated
+        if len(zero_hits) == 1:
+            return PortMatch(name=zero_hits[0], via="zero-based", names_tried=tried)
+        if len(zero_hits) > 1:
             return PortMatch(
                 name=None,
                 via="ambiguous",
                 names_tried=tried,
-                ambiguous_names=tuple(distinct),
+                ambiguous_names=tuple(zero_hits),
             )
-        return templated
-    if template_name:
-        return templated
-    if len(zero_hits) == 1:
-        return PortMatch(name=zero_hits[0], via="zero-based", names_tried=tried)
-    if len(zero_hits) > 1:
-        return PortMatch(
-            name=None,
-            via="ambiguous",
-            names_tried=tried,
-            ambiguous_names=tuple(zero_hits),
-        )
+    else:
+        templated = first_unique(candidates, set(), shift=False)
+        if templated is not None:
+            return templated
 
     if port is None or not allow_structural:
         return PortMatch(name=None, via="none", names_tried=tried)
@@ -598,6 +612,7 @@ def match_uplink_port(
             sfp_index,
             allow_structural=allow_fallback,
             pinned_count=pinned,
+            zero_based=True,
         )
         if templated.name is not None or templated.via == "ambiguous" or not allow_fallback:
             return templated
