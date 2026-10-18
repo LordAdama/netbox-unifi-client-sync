@@ -81,6 +81,20 @@ def role_slug_of(device: Any) -> str:
     return str(slug or "")
 
 
+def _is_already_exists(exc: BaseException) -> bool:
+    """True when a create lost a race with another worker that created the same object.
+
+    NetBox answers that POST with "already exists". A unique violation that
+    reaches the database is reported as "duplicate key" or "unique constraint".
+    """
+    chunks = [str(exc)]
+    error = getattr(exc, "error", None)
+    if error:
+        chunks.append(str(error))
+    text = " ".join(chunks).lower()
+    return any(phrase in text for phrase in ("already exists", "duplicate key", "unique constraint"))
+
+
 def _custom_field_object_types(field: Any) -> set[str]:
     """Content-type strings already attached to a custom field."""
     found: set[str] = set()
@@ -491,9 +505,12 @@ class PynetboxGateway:
     def ensure_prerequisites(
         self, role_slug: str, manufacturer_slug: str, device_type_slug: str, tag_slug: str
     ) -> None:
-        self.api.extras.tags.get(slug=tag_slug) or self.api.extras.tags.create(
-            name=tag_slug, slug=tag_slug, color="2196f3"
-        )
+        if self.api.extras.tags.get(slug=tag_slug) is None:
+            self._create_or_refetch(
+                lambda: self.api.extras.tags.create(name=tag_slug, slug=tag_slug, color="2196f3"),
+                lambda: self.api.extras.tags.get(slug=tag_slug),
+                f"tag {tag_slug!r}",
+            )
 
         self._ensure_custom_field(UNIFI_MAC_FIELD, "UniFi MAC", ["dcim.device"])
         self._ensure_custom_field(
@@ -509,20 +526,52 @@ class PynetboxGateway:
 
         manufacturer = self.api.dcim.manufacturers.get(slug=manufacturer_slug)
         if not manufacturer:
-            manufacturer = self.api.dcim.manufacturers.create(
-                name=manufacturer_slug.replace("-", " ").title(), slug=manufacturer_slug
+            manufacturer, _created = self._create_or_refetch(
+                lambda: self.api.dcim.manufacturers.create(
+                    name=manufacturer_slug.replace("-", " ").title(), slug=manufacturer_slug
+                ),
+                lambda: self.api.dcim.manufacturers.get(slug=manufacturer_slug),
+                f"manufacturer {manufacturer_slug!r}",
             )
 
         if not self.api.dcim.device_types.get(slug=device_type_slug):
-            self.api.dcim.device_types.create(
-                manufacturer=manufacturer.id,
-                model=device_type_slug.replace("-", " ").title(),
-                slug=device_type_slug,
-                u_height=0,
-                is_full_depth=False,
+            self._create_or_refetch(
+                lambda: self.api.dcim.device_types.create(
+                    manufacturer=manufacturer.id,
+                    model=device_type_slug.replace("-", " ").title(),
+                    slug=device_type_slug,
+                    u_height=0,
+                    is_full_depth=False,
+                ),
+                lambda: self.api.dcim.device_types.get(slug=device_type_slug),
+                f"device type {device_type_slug!r}",
             )
 
         self._ensure_device_role(role_slug)
+
+    def _create_or_refetch(
+        self, create: Callable[[], Any], refetch: Callable[[], Any], label: str
+    ) -> tuple[Any, bool]:
+        """Create an object, or use the one another worker just created.
+
+        Returns ``(object, True)`` when this call created it, and
+        ``(object, False)`` when NetBox reported that it already exists and
+        a follow-up fetch found it. Any other error propagates. A conflict
+        whose refetch still misses is re-raised: that is not success.
+        """
+        try:
+            return create(), True
+        except pynetbox.RequestError as exc:
+            if not _is_already_exists(exc):
+                raise
+            try:
+                found = refetch()
+            except pynetbox.RequestError as refetch_exc:
+                raise exc from refetch_exc
+            if found is None:
+                raise exc
+            logger.info("NetBox %s already exists; using the existing object", label)
+            return found, False
 
     def _ensure_custom_field(
         self, name: str, label: str, object_types: list[str], description: str | None = None
@@ -531,14 +580,19 @@ class PynetboxGateway:
         if existing:
             self._extend_custom_field_types(existing, object_types)
             return
-        self.api.extras.custom_fields.create(
-            object_types=object_types,
-            type="text",
-            name=name,
-            label=label,
-            description=description or label,
-            filter_logic="exact",
+        created, _won = self._create_or_refetch(
+            lambda: self.api.extras.custom_fields.create(
+                object_types=object_types,
+                type="text",
+                name=name,
+                label=label,
+                description=description or label,
+                filter_logic="exact",
+            ),
+            lambda: self.api.extras.custom_fields.get(name=name),
+            f"custom field {name!r}",
         )
+        self._extend_custom_field_types(created, object_types)
 
     def _extend_custom_field_types(self, field: Any, object_types: list[str]) -> None:
         """Add object types to a custom field that already exists.
@@ -597,10 +651,15 @@ class PynetboxGateway:
             # second role beside it.
             logger.info("Reusing existing NetBox device role %r", role_slug)
             return
-        self.api.dcim.device_roles.create(
-            name=role_slug.replace("-", " ").title(), slug=role_slug, color="9e9e9e"
+        _role, created = self._create_or_refetch(
+            lambda: self.api.dcim.device_roles.create(
+                name=role_slug.replace("-", " ").title(), slug=role_slug, color="9e9e9e"
+            ),
+            lambda: self.api.dcim.device_roles.get(slug=role_slug),
+            f"device role {role_slug!r}",
         )
-        logger.info("Created NetBox device role %r", role_slug)
+        if created:
+            logger.info("Created NetBox device role %r", role_slug)
 
     # -- lookups -----------------------------------------------------------
 
@@ -1712,31 +1771,40 @@ class PynetboxGateway:
             logger.info("Reusing NetBox device type %r for %s", resolved, spec.part_number or spec.model)
         else:
             manufacturer = self._ensure_manufacturer(spec.manufacturer)
-            created = self.api.dcim.device_types.create(
-                manufacturer=manufacturer.id,
-                model=spec.model,
-                slug=spec.slug,
-                part_number=spec.part_number,
-                u_height=spec.u_height,
-                is_full_depth=spec.is_full_depth,
+            created, won = self._create_or_refetch(
+                lambda: self.api.dcim.device_types.create(
+                    manufacturer=manufacturer.id,
+                    model=spec.model,
+                    slug=spec.slug,
+                    part_number=spec.part_number,
+                    u_height=spec.u_height,
+                    is_full_depth=spec.is_full_depth,
+                ),
+                lambda: self.api.dcim.device_types.get(slug=spec.slug),
+                f"device type {spec.slug!r}",
             )
             resolved = created.slug
-            if spec.interfaces:
-                self.api.dcim.interface_templates.create(
-                    [
-                        {"device_type": created.id, "name": name, "type": iface_type}
-                        for name, iface_type in spec.interfaces
-                    ]
+            if won:
+                if spec.interfaces:
+                    self.api.dcim.interface_templates.create(
+                        [
+                            {"device_type": created.id, "name": name, "type": iface_type}
+                            for name, iface_type in spec.interfaces
+                        ]
+                    )
+                self._create_power_templates(created.id, spec)
+                logger.info(
+                    "Created NetBox device type %r with %d interface template(s), "
+                    "%d power port template(s), %d power outlet template(s)",
+                    spec.model,
+                    len(spec.interfaces),
+                    len(getattr(spec, "power_ports", None) or []),
+                    len(getattr(spec, "power_outlets", None) or []),
                 )
-            self._create_power_templates(created.id, spec)
-            logger.info(
-                "Created NetBox device type %r with %d interface template(s), "
-                "%d power port template(s), %d power outlet template(s)",
-                spec.model,
-                len(spec.interfaces),
-                len(getattr(spec, "power_ports", None) or []),
-                len(getattr(spec, "power_outlets", None) or []),
-            )
+            else:
+                logger.info(
+                    "Reusing NetBox device type %r for %s", resolved, spec.part_number or spec.model
+                )
 
         with self._memo_lock:
             self._infra_type_memo[spec.slug] = resolved
@@ -1798,8 +1866,13 @@ class PynetboxGateway:
         slug = slugify(name)
         manufacturer = self.api.dcim.manufacturers.get(slug=slug)
         if manufacturer is None:
-            manufacturer = self.api.dcim.manufacturers.create(name=name, slug=slug)
-            logger.info("Created NetBox manufacturer %r", name)
+            manufacturer, created = self._create_or_refetch(
+                lambda: self.api.dcim.manufacturers.create(name=name, slug=slug),
+                lambda: self.api.dcim.manufacturers.get(slug=slug),
+                f"manufacturer {slug!r}",
+            )
+            if created:
+                logger.info("Created NetBox manufacturer %r", name)
         return manufacturer
 
     def find_unifi_device(
@@ -2186,16 +2259,26 @@ class PynetboxGateway:
         if self.api.dcim.device_types.get(slug=type_slug) is None:
             manufacturer = self.api.dcim.manufacturers.get(slug=slug)
             if manufacturer is None:
-                manufacturer = self.api.dcim.manufacturers.create(name=manufacturer_name, slug=slug)
-                logger.info("Created NetBox manufacturer %r", manufacturer_name)
-            self.api.dcim.device_types.create(
-                manufacturer=manufacturer.id,
-                model=f"{manufacturer_name} Client",
-                slug=type_slug,
-                u_height=0,
-                is_full_depth=False,
+                manufacturer, created_manufacturer = self._create_or_refetch(
+                    lambda: self.api.dcim.manufacturers.create(name=manufacturer_name, slug=slug),
+                    lambda: self.api.dcim.manufacturers.get(slug=slug),
+                    f"manufacturer {slug!r}",
+                )
+                if created_manufacturer:
+                    logger.info("Created NetBox manufacturer %r", manufacturer_name)
+            _device_type, created_type = self._create_or_refetch(
+                lambda: self.api.dcim.device_types.create(
+                    manufacturer=manufacturer.id,
+                    model=f"{manufacturer_name} Client",
+                    slug=type_slug,
+                    u_height=0,
+                    is_full_depth=False,
+                ),
+                lambda: self.api.dcim.device_types.get(slug=type_slug),
+                f"device type {type_slug!r}",
             )
-            logger.info("Created NetBox device type %r", f"{manufacturer_name} Client")
+            if created_type:
+                logger.info("Created NetBox device type %r", f"{manufacturer_name} Client")
 
         with self._memo_lock:
             self._client_type_memo[type_slug] = type_slug

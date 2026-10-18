@@ -61,8 +61,9 @@ class CachingNetboxGateway:
                 return
         # Deliberately outside the lock: this makes several network calls, and
         # holding the lock across them would serialize every site worker.
-        # Worst case two workers race and both run it — ensure_prerequisites
-        # is idempotent, so that costs a duplicate call, not correctness.
+        # The engine also runs this once before workers start. If two callers
+        # still both miss, the inner ensure treats "already exists" as success
+        # and re-fetches the object the other caller created.
         self._inner.ensure_prerequisites(role_slug, manufacturer_slug, device_type_slug, tag_slug)
         with self._lock:
             self._prereqs_done.add(key)
