@@ -162,8 +162,12 @@ Do not put a downstream client's MAC in `unifi_macs` or on a switch port's
 No rewrite of existing `unifi_mac` values. Leave the chassis MAC there.
 
 On the next apply, the sync creates the `unifi_macs` custom field (text) if
-it is missing, the same way it creates `unifi_mac`. A dry-run does not
-create custom fields.
+it is missing, the same way it creates `unifi_mac`. That happens once,
+before site workers start. A dry-run does not create custom fields. If
+another run creates the same field at the same time, NetBox's "already
+exists" response is treated as success and the existing field is reused;
+that conflict does not skip the site. The same applies to the tag, device
+role, manufacturer, and generic device type this sync ensures.
 
 To claim the other port addresses, either:
 

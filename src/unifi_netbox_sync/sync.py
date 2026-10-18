@@ -438,6 +438,18 @@ class SyncEngine:
             self.settings.netbox_prefetch,
             self.settings.netbox_fast_path,
         )
+        if not self.settings.dry_run and groups:
+            # Tag, custom fields, the client role, and the generic device type
+            # are global. Create them once on this thread before site workers
+            # start, so the first pass after a new field is added does not have
+            # every worker POST the same object. Another process can still win
+            # that POST; the gateway treats "already exists" as success.
+            self.netbox.ensure_prerequisites(
+                self.settings.client_device_role_slug,
+                self.settings.client_manufacturer_slug,
+                self.settings.client_device_type_slug,
+                self.settings.sync_tag,
+            )
         if self.settings.netbox_prefetch:
             prepare = getattr(self.netbox, "prepare_prefetch", None)
             if prepare is not None:
@@ -763,10 +775,11 @@ class SyncEngine:
 
         label = self._site_labels.get(pair.unifi_site, "")
         if not s.dry_run:
-            # The site-id custom field was ensured at the start of the run, so
-            # a site created here can store it. Prerequisites (roles, the
-            # generic device type) wait until the site is known to exist, so a
-            # missing site does not create those objects on the way to failing.
+            # Shared schema (custom fields, tag, role, generic device type) was
+            # ensured once before workers started. Call it again so this site
+            # still has those objects if that earlier call did not run. When
+            # they already exist this is a lookup, including after a concurrent
+            # create that lost the race.
             _site, created = self.netbox.ensure_site(
                 slug, s.site_policy, label, pair.unifi_site, pair.unifi_internal_id
             )
