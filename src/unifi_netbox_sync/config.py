@@ -315,6 +315,12 @@ class Settings:
     # of DEVICE_UPDATE_POLICY: create-only still merges when this is true.
     # false leaves that client device untouched and does not create a second one.
     merge_client_infra: bool = True
+    # A device owns more than its single unifi_mac: addresses listed in
+    # unifi_macs, and addresses on its interfaces (mac_address or a MAC
+    # address object). A UniFi client that presents one of those addresses
+    # is not created as a second device. Exact unifi_mac matching is unchanged.
+    # false keeps the previous single-field join.
+    match_owned_macs: bool = True
     # UniFi site ids (API name and/or internal _id) whose adopted devices are
     # inventory or failed-unit staging. Empty disables the behaviour.
     inventory_site_ids: tuple[str, ...] = ()
@@ -435,6 +441,7 @@ class Settings:
             unifi_gateway_role_slug=os.environ.get("UNIFI_GATEWAY_ROLE_SLUG", "router"),
             unifi_power_role_slug=os.environ.get("UNIFI_POWER_ROLE_SLUG", "pdu"),
             merge_client_infra=_bool(os.environ.get("MERGE_CLIENT_INFRA", "true")),
+            match_owned_macs=_bool(os.environ.get("MATCH_OWNED_MACS", "true")),
             inventory_site_ids=_csv_tokens(os.environ.get("UNIFI_INVENTORY_SITES", "")),
             inventory_device_status=_device_status(
                 os.environ.get("INVENTORY_DEVICE_STATUS", "inventory"),

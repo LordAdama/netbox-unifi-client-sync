@@ -14,13 +14,23 @@ import requests
 from pynetbox.core.query import Request
 
 from .devicetype_library import normalize_model
+from .macs import (
+    EXTRA_MACS_FIELD,
+    PRIMARY_MAC_FIELD,
+    VIA_FIELD,
+    VIA_INTERFACE,
+    index_owned_macs,
+    mac_object_claim,
+    normalize_mac,
+)
 from .models import UnifiPort
 from .naming import normalize_key, slugify
 
 logger = logging.getLogger(__name__)
 
 CLIENT_INTERFACE_NAME = "eth0"
-UNIFI_MAC_FIELD = "unifi_mac"
+UNIFI_MAC_FIELD = PRIMARY_MAC_FIELD
+UNIFI_MACS_FIELD = EXTRA_MACS_FIELD
 # unifi_site_id has always stored the UniFi *API site name* — the short id
 # used in /s/{name}/ paths ("default", "7xk2p9qr"), not the Mongo ``_id``.
 # That meaning is kept so existing NetBox data still matches. The two fields
@@ -446,6 +456,18 @@ class PynetboxGateway:
         self._pref_by_id: dict[Any, Any] = {}
         self._pref_mac_complete = False
         self._pref_ifaces_by_mac: dict[str, list[Any]] | None = None
+        # Extra MACs (unifi_macs and interface addresses) owned by one device.
+        # The exact unifi_mac join is unchanged. This index is global.
+        self._match_owned_macs = True
+        self._owned_index: dict[str, tuple[Any, str]] | None = None
+        self._owned_conflicts: dict[str, list[str]] = {}
+        self._owned_index_complete = False
+        self._mac_objects_indexed = False
+        self._mac_object_by_mac: dict[str, Any] | None = None
+        self._mac_object_api_unusable = False
+        self._owned_field_index: dict[str, Any] | None = None
+        self._owned_field_failed = False
+        self._owned_live_memo: dict[str, tuple[Any, str] | None] = {}
 
     def _memoized(self, memo: dict[str, Any], key: str, fetch: Callable[[], Any]) -> Any:
         with self._memo_lock:
@@ -474,6 +496,15 @@ class PynetboxGateway:
         )
 
         self._ensure_custom_field(UNIFI_MAC_FIELD, "UniFi MAC", ["dcim.device"])
+        self._ensure_custom_field(
+            UNIFI_MACS_FIELD,
+            "UniFi MACs",
+            ["dcim.device"],
+            description=(
+                "Additional UniFi MAC addresses for this device, separated by commas, "
+                "semicolons, or spaces. The primary MAC stays in unifi_mac."
+            ),
+        )
         self.ensure_site_identity_field()
 
         manufacturer = self.api.dcim.manufacturers.get(slug=manufacturer_slug)
@@ -493,7 +524,9 @@ class PynetboxGateway:
 
         self._ensure_device_role(role_slug)
 
-    def _ensure_custom_field(self, name: str, label: str, object_types: list[str]) -> None:
+    def _ensure_custom_field(
+        self, name: str, label: str, object_types: list[str], description: str | None = None
+    ) -> None:
         existing = self.api.extras.custom_fields.get(name=name)
         if existing:
             self._extend_custom_field_types(existing, object_types)
@@ -503,7 +536,7 @@ class PynetboxGateway:
             type="text",
             name=name,
             label=label,
-            description=label,
+            description=description or label,
             filter_logic="exact",
         )
 
@@ -596,13 +629,19 @@ class PynetboxGateway:
         """Like ``find_switch_device_by_mac``, plus the join that won.
 
         The strategy is ``interface MAC``, ``unifi_mac custom field``,
-        ``serial``, or ``device name``. Uplink cabling uses it when two
-        UniFi devices resolve to one NetBox device and the MAC match should
-        be the one that is cabled.
+        ``unifi_macs custom field``, ``serial``, or ``device name``. Uplink
+        cabling uses it when two UniFi devices resolve to one NetBox device
+        and the MAC match should be the one that is cabled.
+
+        ``unifi_macs`` is only reached when the interface address and the
+        exact ``unifi_mac`` both miss, so a single-MAC switch still matches
+        the way it did before. Interface MAC address objects are part of the
+        interface join, tried only after the ``mac_address`` filter is empty.
         """
         for strategy, finder in (
             ("interface MAC", lambda: self._switch_by_interface_mac(mac)),
             ("unifi_mac custom field", lambda: self._switch_by_unifi_mac(mac)),
+            ("unifi_macs custom field", lambda: self._switch_by_unifi_macs(mac)),
             ("serial", lambda: self._switch_by_serial(mac, hints)),
             ("device name", lambda: self._switch_by_name(hints)),
         ):
@@ -624,6 +663,18 @@ class PynetboxGateway:
         # Always the live filter. A site-scoped interface prefetch can miss a
         # port MAC that lives on some other device, and the first hit has to
         # stay the one this filter would return.
+        device = self._switch_by_interface_field(mac)
+        if device is not None:
+            return device
+        # NetBox 4.2+ stores the address on a MAC address object instead of
+        # the interface field. Only consulted when that field missed, and
+        # only when owned-MAC matching is on, so a single-MAC install that
+        # turns the option off keeps the previous four joins.
+        if not self._match_owned_macs:
+            return None
+        return self._device_from_mac_objects_only(mac)
+
+    def _switch_by_interface_field(self, mac: str) -> Any | None:
         matches = list(self.api.dcim.interfaces.filter(mac_address=mac, limit=getattr(self, "page_size", 1000)))
         if not matches:
             return None
@@ -680,6 +731,202 @@ class PynetboxGateway:
         return self._first(
             self.api.dcim.devices.filter(**{f"cf_{UNIFI_MAC_FIELD}": mac}, limit=getattr(self, "page_size", 1000))
         )
+
+    def configure_match_owned_macs(self, enabled: bool) -> None:
+        """Turn additional-MAC ownership on or off for this run.
+
+        The exact ``unifi_mac`` join is unaffected. Off skips ``unifi_macs``,
+        interface addresses, and MAC address objects when deciding that a
+        client or adopted device already belongs to a NetBox device.
+        """
+        self._match_owned_macs = bool(enabled)
+
+    def find_owned_mac_device(self, mac: str) -> tuple[Any, str] | None:
+        """Device that owns ``mac`` through something other than exact ``unifi_mac``.
+
+        Returns ``(device, via)`` or None. ``via`` is ``unifi_macs`` or
+        ``interface MAC``. Exact ``unifi_mac`` is not returned here; callers
+        check that first so a single-address device is unchanged.
+
+        The lookup is global, the same scope as the ``unifi_mac`` duplicate
+        check. An explicit ``unifi_macs`` list wins over an interface address
+        when they name different devices. The first device in list order wins
+        when two devices declare the same address.
+        """
+        if not self._match_owned_macs:
+            return None
+        key = normalize_mac(mac)
+        if not key:
+            return None
+        if self._owned_index_complete and self._owned_index is not None:
+            self._warn_owned_conflict(key)
+            return self._owned_index.get(key)
+        with self._memo_lock:
+            if key in self._owned_live_memo:
+                return self._owned_live_memo[key]
+        found = self._owned_live(key)
+        with self._memo_lock:
+            self._owned_live_memo[key] = found
+        return found
+
+    def _owned_live(self, key: str) -> tuple[Any, str] | None:
+        device = self._owned_field_device(key)
+        if device is not None:
+            return device, VIA_FIELD
+        iface_device = self._switch_by_interface_field(key)
+        if iface_device is not None:
+            return iface_device, VIA_INTERFACE
+        obj_device = self._device_from_mac_objects_only(key)
+        if obj_device is not None:
+            return obj_device, VIA_INTERFACE
+        return None
+
+    def _switch_by_unifi_macs(self, mac: str) -> Any | None:
+        """Device whose extra-MAC list contains ``mac``, not an interface hit.
+
+        Reached only after the interface join and the exact ``unifi_mac``
+        join miss, so it cannot steal a match those already made.
+        """
+        if not self._match_owned_macs:
+            return None
+        key = normalize_mac(mac)
+        if not key:
+            return None
+        if self._owned_index_complete and self._owned_index is not None:
+            hit = self._owned_index.get(key)
+            if hit is not None and hit[1] == VIA_FIELD:
+                self._warn_owned_conflict(key)
+                return hit[0]
+            return None
+        return self._owned_field_device(key)
+
+    def _owned_field_device(self, key: str) -> Any | None:
+        index = self._ensure_owned_field_index()
+        if index is None:
+            return None
+        return index.get(key)
+
+    def _ensure_owned_field_index(self) -> dict[str, Any] | None:
+        with self._memo_lock:
+            if self._owned_field_index is not None or self._owned_field_failed:
+                return self._owned_field_index
+        devices: list[Any] = []
+        primary = self.bulk_devices_with_unifi_mac()
+        extra = self.bulk_devices_with_extra_macs()
+        if primary is None and extra is None:
+            with self._memo_lock:
+                self._owned_field_failed = True
+                self._owned_field_index = {}
+            return {}
+        if primary:
+            devices.extend(primary)
+        if extra:
+            devices.extend(extra)
+        unique: list[Any] = []
+        seen: set[Any] = set()
+        for device in devices:
+            marker = getattr(device, "id", None)
+            if marker is not None and marker in seen:
+                continue
+            if marker is not None:
+                seen.add(marker)
+            unique.append(device)
+        indexed, conflicts = index_owned_macs(unique, [], [])
+        field_index = {mac: device for mac, (device, _via) in indexed.items()}
+        with self._memo_lock:
+            self._owned_field_index = field_index
+            for mac, names in conflicts.items():
+                self._owned_conflicts.setdefault(mac, [])
+                for name in names:
+                    if name not in self._owned_conflicts[mac]:
+                        self._owned_conflicts[mac].append(name)
+        return field_index
+
+    def _warn_owned_conflict(self, key: str) -> None:
+        names = (self._owned_conflicts or {}).get(key) or []
+        if not names:
+            return
+        self._warn_once(
+            f"owned-mac:{key}",
+            "MAC %s is claimed by more than one NetBox device; using the first and ignoring %s",
+            key,
+            ", ".join(names),
+        )
+
+    def _device_from_mac_objects_only(self, mac: str) -> Any | None:
+        """Device that owns ``mac`` via a MAC address object on an interface."""
+        key = normalize_mac(mac)
+        if not key:
+            return None
+        if self._mac_objects_indexed:
+            if not self._mac_object_by_mac:
+                return None
+            device = self._mac_object_by_mac.get(key)
+            if device is not None:
+                self._warn_owned_conflict(key)
+            return device
+        if self._mac_object_api_unusable:
+            return None
+        return self._device_from_mac_object_live(key)
+
+    def _device_from_mac_object_live(self, key: str) -> Any | None:
+        endpoint = getattr(getattr(self.api, "dcim", None), "mac_addresses", None)
+        if endpoint is None:
+            self._mac_object_api_unusable = True
+            return None
+        try:
+            matches = list(endpoint.filter(mac_address=key, limit=getattr(self, "page_size", 1000)))
+        except pynetbox.RequestError as exc:
+            status = getattr(getattr(exc, "req", None), "status_code", None)
+            if status != 404:
+                self._warn_once(
+                    "mac-objects-unavailable",
+                    "Could not look up NetBox MAC address objects (%s); interface mac_address will be used",
+                    exc,
+                )
+            self._mac_object_api_unusable = True
+            return None
+        except Exception as exc:
+            self._warn_once(
+                "mac-objects-unavailable",
+                "Could not look up NetBox MAC address objects (%s); interface mac_address will be used",
+                exc,
+            )
+            self._mac_object_api_unusable = True
+            return None
+        devices: list[Any] = []
+        for obj in matches:
+            parsed = mac_object_claim(obj)
+            if parsed is None:
+                continue
+            _mac, dev_id = parsed
+            device = self._pref_by_id.get(dev_id)
+            if device is None:
+                try:
+                    device = self.api.dcim.devices.get(dev_id)
+                except Exception as exc:
+                    logger.warning("Could not load NetBox device %s for MAC %s (%s)", dev_id, key, exc)
+                    device = None
+                if device is not None:
+                    self._pref_by_id[dev_id] = device
+            if device is None:
+                continue
+            device_id = getattr(device, "id", None)
+            if any(getattr(existing, "id", None) == device_id for existing in devices):
+                continue
+            devices.append(device)
+        if not devices:
+            return None
+        if len(devices) > 1:
+            self._warn_once(
+                f"owned-mac-object:{key}",
+                "MAC %s is assigned to interfaces on %d NetBox devices (%s); using %s",
+                key,
+                len(devices),
+                ", ".join(str(getattr(device, "name", "") or "") for device in devices),
+                getattr(devices[0], "name", ""),
+            )
+        return devices[0]
 
     def find_interface_by_name_candidates(self, device: Any, candidates: list[str]) -> Any | None:
         for name in candidates:
@@ -781,6 +1028,56 @@ class PynetboxGateway:
             logger.info("Bulk-loaded %d NetBox device(s) with %s set", len(devices), UNIFI_MAC_FIELD)
         return devices
 
+    def bulk_devices_with_extra_macs(self) -> list[Any] | None:
+        """Devices with ``unifi_macs`` set, or None if the query failed.
+
+        An ignored filter returns the whole device table. That list is still
+        safe to index: addresses that are not on any record are not owned.
+        """
+        try:
+            devices = list(
+                self.api.dcim.devices.filter(
+                    **{f"cf_{UNIFI_MACS_FIELD}__empty": "false"},
+                    limit=getattr(self, "page_size", 1000),
+                )
+            )
+        except pynetbox.RequestError as exc:
+            logger.warning(
+                "Could not bulk-load devices by %s (%s); extra MACs on devices "
+                "without %s will be read from the site list only",
+                UNIFI_MACS_FIELD,
+                exc,
+                UNIFI_MAC_FIELD,
+            )
+            return None
+        logger.info("Bulk-loaded %d NetBox device(s) with %s set", len(devices), UNIFI_MACS_FIELD)
+        return devices
+
+    def bulk_mac_address_objects(self) -> list[Any] | None:
+        """MAC address objects, or an empty list when NetBox has none.
+
+        None means the query failed and the index must not treat that as
+        "no objects". A 404 means this NetBox still stores the address on
+        the interface field only.
+        """
+        endpoint = getattr(getattr(self.api, "dcim", None), "mac_addresses", None)
+        if endpoint is None:
+            return []
+        try:
+            objects = list(endpoint.filter(limit=getattr(self, "page_size", 1000)))
+        except pynetbox.RequestError as exc:
+            status = getattr(getattr(exc, "req", None), "status_code", None)
+            if status == 404:
+                logger.info("NetBox has no MAC address objects; interface mac_address will be used")
+                return []
+            logger.warning("Could not bulk-load MAC address objects (%s)", exc)
+            return None
+        except Exception as exc:
+            logger.warning("Could not bulk-load MAC address objects (%s)", exc)
+            return None
+        logger.info("Bulk-loaded %d NetBox MAC address object(s)", len(objects))
+        return objects
+
     def bulk_devices_at_site(self, site_slug: str) -> list[Any] | None:
         """Every device at ``site_slug``, or None if the query failed.
 
@@ -853,6 +1150,78 @@ class PynetboxGateway:
             by_mac.setdefault(str(raw).lower(), []).append(iface)
         with self._memo_lock:
             self._pref_ifaces_by_mac = by_mac
+
+    def note_owned_mac_sources(
+        self,
+        devices: list[Any],
+        interfaces: list[Any],
+        mac_objects: list[Any] | None,
+        *,
+        complete: bool,
+        mac_objects_indexed: bool,
+    ) -> None:
+        """Build the global extra-MAC index from a prefetch.
+
+        ``complete`` means a miss is authoritative: a client MAC that is not
+        in the index is not owned, and no per-client filter is issued.
+        ``mac_objects_indexed`` means the MAC address object list was loaded
+        (including an empty list when the endpoint does not exist).
+        """
+        if not complete:
+            with self._memo_lock:
+                self._owned_index = None
+                self._owned_conflicts = {}
+                self._owned_index_complete = False
+                self._mac_objects_indexed = False
+                self._mac_object_by_mac = None
+            return
+        collected = list(devices)
+        by_id: dict[Any, Any] = {}
+        for device in collected:
+            dev_id = getattr(device, "id", None)
+            if dev_id is not None and dev_id not in by_id:
+                by_id[dev_id] = device
+        missing: list[Any] = []
+        for iface in interfaces:
+            dev_id = getattr(getattr(iface, "device", None), "id", None)
+            if dev_id is not None and dev_id not in by_id:
+                missing.append(dev_id)
+        for obj in mac_objects or []:
+            parsed = mac_object_claim(obj)
+            if parsed is not None and parsed[1] not in by_id:
+                missing.append(parsed[1])
+        for dev_id in dict.fromkeys(missing):
+            try:
+                full = self.api.dcim.devices.get(dev_id)
+            except Exception as exc:
+                logger.warning("Could not load NetBox device %s for an owned MAC (%s)", dev_id, exc)
+                full = None
+            if full is None:
+                continue
+            collected.append(full)
+            by_id[getattr(full, "id", dev_id)] = full
+        index, conflicts = index_owned_macs(collected, interfaces, mac_objects or [])
+        mac_object_index: dict[str, Any] = {}
+        if mac_objects_indexed:
+            for obj in mac_objects or []:
+                parsed = mac_object_claim(obj)
+                if parsed is None:
+                    continue
+                obj_mac, dev_id = parsed
+                device = by_id.get(dev_id)
+                if device is not None and obj_mac not in mac_object_index:
+                    mac_object_index[obj_mac] = device
+        with self._memo_lock:
+            self._owned_index = index
+            self._owned_conflicts = conflicts
+            self._owned_index_complete = True
+            self._mac_objects_indexed = mac_objects_indexed
+            self._mac_object_by_mac = mac_object_index if mac_objects_indexed else None
+            # The prefetched field list replaces the lazy bulk index.
+            self._owned_field_index = {
+                mac: device for mac, (device, via) in index.items() if via == VIA_FIELD
+            }
+            self._owned_live_memo = {}
 
     def find_device_name_conflict(self, name: str, site_slug: str, exclude_id: Any) -> Any | None:
         """Another device already named ``name`` at ``site_slug``, or None.
@@ -1455,6 +1824,20 @@ class PynetboxGateway:
         by_mac = self._device_by_unifi_mac(mac) if mac else None
         if by_mac is not None:
             return by_mac, "mac"
+        if mac and self._match_owned_macs:
+            # After the exact field, before a device whose name is the MAC.
+            # A placeholder named after the address must not hide the device
+            # that already owns the address on a port or in unifi_macs.
+            owned = self.find_owned_mac_device(mac)
+            if owned is not None:
+                device, via = owned
+                logger.info(
+                    "Matched UniFi device %s to NetBox device %r via %s",
+                    mac,
+                    getattr(device, "name", ""),
+                    via,
+                )
+                return device, "owned-mac"
         for candidate in (compact, mac):
             if not candidate:
                 continue
@@ -1673,6 +2056,14 @@ class PynetboxGateway:
             return existing, False, False
 
         identity = self._source_site_fields(mac, source_site_name, source_site_internal_id)
+        if (
+            existing is not None
+            and match == "owned-mac"
+            and _custom_field(existing, UNIFI_MAC_FIELD)
+        ):
+            # The address we matched is already on an interface or in
+            # unifi_macs. Replacing unifi_mac would drop the primary.
+            identity.pop(UNIFI_MAC_FIELD, None)
         if existing is None:
             device = self.api.dcim.devices.create(
                 name=name,
