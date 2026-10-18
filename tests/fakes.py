@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
 from itertools import count
+
+logger = logging.getLogger(__name__)
 
 from unifi_netbox_sync.models import UnifiClient, UnifiKnownClient, UnifiSite, UnifiSwitchDevice
 
@@ -22,7 +25,14 @@ class FakeDeviceRef:
 
 
 class FakeInterface:
-    def __init__(self, device: "FakeDevice", name: str, wired: bool = True) -> None:
+    def __init__(
+        self,
+        device: "FakeDevice",
+        name: str,
+        wired: bool = True,
+        mac_address: str | None = None,
+        mac_addresses: list[str] | None = None,
+    ) -> None:
         self.id = next(_id_counter)
         self.device = FakeDeviceRef(device.id, device.name)
         self.name = name
@@ -30,6 +40,9 @@ class FakeInterface:
         self.cable = None
         self.link_peers: list["FakeInterface"] = []
         self.ips: list[FakeIP] = []
+        # Hardware address of this port, not the MAC of whatever is plugged in.
+        self.mac_address = mac_address
+        self.mac_addresses = list(mac_addresses or [])
 
 
 class FakeDevice:
@@ -104,6 +117,8 @@ class FakeNetboxGateway:
         self.existing_sites: dict[str, FakeSite] = {}
         self.cable_tags: dict[tuple[int, int], list[str]] = {}
         self.site_identity_field_ready = False
+        # Extra MACs (unifi_macs and interface addresses). Exact unifi_mac is separate.
+        self._match_owned_macs = True
 
     def seed_switch(self, mac: str, name: str, ports: list[str]) -> FakeDevice:
         device = FakeDevice(name=name)
@@ -124,12 +139,23 @@ class FakeNetboxGateway:
     def match_switch_device(self, mac: str, hints=None):
         """Same device as ``find_switch_device_by_mac``, plus the join used.
 
-        A direct ``switches[mac]`` hit is the MAC join. Name is checked
-        before serial on each candidate, matching the previous fake order.
+        A direct ``switches[mac]`` hit is the ``unifi_mac`` join. An interface
+        address is tried first when owned-MAC matching is on, then
+        ``unifi_macs``. Name is checked before serial on each candidate,
+        matching the previous fake order. Devices with no interface address
+        still hit ``switches[mac]`` exactly as before.
         """
+        if self._match_owned_macs:
+            by_interface = self._device_for_interface_mac(mac)
+            if by_interface is not None:
+                return by_interface, "interface MAC"
         device = self.switches.get(mac)
         if device is not None:
             return device, "unifi_mac custom field"
+        if self._match_owned_macs:
+            owned = self.find_owned_mac_device(mac)
+            if owned is not None and owned[1] == "unifi_macs":
+                return owned[0], "unifi_macs custom field"
         # Mirror the real gateway's name/serial fallbacks, which are the only
         # way to reach a switch whose interfaces carry no MAC address.
         if hints is not None:
@@ -238,6 +264,10 @@ class FakeNetboxGateway:
             stored = (device.custom_fields or {}).get("unifi_mac") or ""
             if stored.lower() == mac:
                 return device, "mac"
+        if mac and self._match_owned_macs:
+            owned = self.find_owned_mac_device(mac)
+            if owned is not None:
+                return owned[0], "owned-mac"
         for device in devices:
             if device.name and device.name.lower() in {compact, mac} and compact:
                 return device, "mac-name"
@@ -349,7 +379,10 @@ class FakeNetboxGateway:
                 return existing, False, False
 
             def _identity(device: FakeDevice) -> None:
-                device.custom_fields["unifi_mac"] = mac
+                primary = (device.custom_fields or {}).get("unifi_mac") or ""
+                # A secondary address must not replace the primary unifi_mac.
+                if not (match == "owned-mac" and primary and primary.lower() != mac):
+                    device.custom_fields["unifi_mac"] = mac
                 if source_site_name:
                     device.custom_fields["unifi_site_name"] = source_site_name
                 if source_site_internal_id:
@@ -426,6 +459,45 @@ class FakeNetboxGateway:
 
     def list_device_interfaces(self, device: FakeDevice):
         return list(device.interfaces.values())
+
+    def configure_match_owned_macs(self, enabled: bool) -> None:
+        self._match_owned_macs = bool(enabled)
+
+    def _device_for_interface_mac(self, mac: str):
+        from unifi_netbox_sync.macs import interface_macs, normalize_mac
+
+        key = normalize_mac(mac)
+        if not key:
+            return None
+        for device in self._iter_devices():
+            for iface in device.interfaces.values():
+                if key in interface_macs(iface):
+                    return device
+        return None
+
+    def find_owned_mac_device(self, mac: str):
+        """Device that owns ``mac`` via ``unifi_macs`` or an interface address.
+
+        Exact ``unifi_mac`` is not returned. ``unifi_macs`` wins over an
+        interface address. The scan is every device, not one site.
+        """
+        if not self._match_owned_macs:
+            return None
+        from unifi_netbox_sync.macs import index_owned_macs, normalize_mac
+
+        key = normalize_mac(mac)
+        if not key:
+            return None
+        devices = self._iter_devices()
+        interfaces = [iface for device in devices for iface in device.interfaces.values()]
+        index, conflicts = index_owned_macs(devices, interfaces, [])
+        if key in conflicts:
+            logger.warning(
+                "MAC %s is claimed by more than one NetBox device; using the first and ignoring %s",
+                key,
+                ", ".join(conflicts[key]),
+            )
+        return index.get(key)
 
     def find_client_device_by_mac(self, mac: str):
         # Production filters dcim.devices by cf_unifi_mac, which hits a switch

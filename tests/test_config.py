@@ -277,6 +277,18 @@ def test_managed_client_roles_and_opt_out_tag_are_configurable(monkeypatch):
     assert settings.sync_unmanaged_tag == "leave-alone"
 
 
+def test_match_owned_macs_defaults_on_and_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("MATCH_OWNED_MACS", raising=False)
+
+    assert Settings.from_env().match_owned_macs is True
+
+    monkeypatch.setenv("MATCH_OWNED_MACS", "false")
+    assert Settings.from_env().match_owned_macs is False
+
+
 def test_page_size_rejects_zero(monkeypatch):
     monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
     for key, value in REQUIRED_ENV.items():

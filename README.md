@@ -62,7 +62,7 @@ interface.
 | --- | --- |
 | Switch MAC address | Four strategies, first match wins — see "Finding your switches" |
 | Switch port index (`sw_port`) | Looked up on the matched switch by `PORT_MODEL_TEMPLATES` (if this UniFi model has any), then `PORT_NAME_TEMPLATES` (`"Port 4"`, `"4"`, `"GE4"`, `"Gi4"`, …). Comparison ignores case and leading zeros. If nothing hits and the model has no templates of its own, a unique structural match is used: `Gi1/0/4`, `1/1/4`, `ge-0/0/4`, `Ethernet1/4`, and an SFP ordinal such as `SFP 1` when the controller says that index is an SFP |
-| Client MAC address | Stored in a `unifi_mac` custom field on the NetBox client device, created automatically on first run |
+| Client MAC address | Stored in a `unifi_mac` custom field on the NetBox client device, created automatically on first run. A second MAC that a device already owns (see "One device, several MACs") is not created again |
 
 If a switch or matching port can't be found, the client device is still
 synced — only the cable is skipped. Every skip is one log line (site,
@@ -103,7 +103,78 @@ structural guess and these last two fallbacks for a known port.
 If two UniFi devices resolve to the same NetBox device, one by MAC and one
 by name, only the MAC match is cabled. The check covers every UniFi site in
 the run, not one site at a time. The other uplink is skipped and logged, so
-a dry-run does not plan the same cable twice.
+a dry-run does not plan the same cable twice. `unifi_macs` counts as a MAC
+match for that check, the same as `unifi_mac` and an interface MAC.
+
+## One device, several MACs
+
+A gateway or router has one address per port. UniFi often reports the extra
+addresses as separate clients (consecutive MACs, sometimes on different
+VLANs). NetBox's `unifi_mac` field holds one address, so a sync that only
+looks at that field does not recognise the others. It creates a placeholder
+device named after the MAC (`00005e005311` for `00:00:5e:00:53:11`). Deleting
+the placeholder does not help: the next pass creates it again.
+
+A device now owns every address in this list. The check is global, the same
+scope as the existing `unifi_mac` duplicate check, not limited to one site.
+
+1. **`unifi_mac`**, exact, one address. This is unchanged. If any device has
+   this field equal to the MAC, that device wins, including across sites.
+2. **`unifi_macs`**, a text field of additional addresses separated by
+   commas, semicolons, or whitespace. A `unifi_mac` value that already
+   lists more than one address is read the same way, so an existing
+   comma-separated field keeps working. A `unifi_mac` value that is a single
+   address is still only that address.
+3. **Interface hardware addresses**: the interface `mac_address` field, and
+   a NetBox MAC address object assigned to an interface. These are the
+   device's own port addresses, not the address of a client plugged into
+   the port.
+
+`unifi_macs` wins over an interface address when they name different
+devices. If two devices list the same extra address, the first one in
+NetBox's list order is used and the run logs the others.
+
+When a UniFi client presents an owned address, the sync does not create a
+device, interface, cable, or IP. The client's address is not copied onto the
+owner: that would move the owner's primary IP or add a client port the owner
+does not have. The log line names the owner and how the address matched
+(`unifi_macs` or `interface MAC`). A dry-run logs the same line and writes
+nothing.
+
+An adopted UniFi device whose MAC is one of those extra addresses is the
+same device. It is not created again, and a non-empty `unifi_mac` is left
+as the primary. Uplink matching is unchanged for a single-MAC device: the
+interface address is still tried first, then exact `unifi_mac`, then
+`unifi_macs`, then serial, then name. `unifi_macs` ranks with the other MAC
+joins, so it still beats a name match when two UniFi devices land on one
+NetBox device.
+
+`MATCH_OWNED_MACS=false` turns the extra joins off and restores the previous
+single-field behaviour. The interface `mac_address` join used to find a
+switch is unchanged either way.
+
+Do not put a downstream client's MAC in `unifi_macs` or on a switch port's
+`mac_address` if that client should stay its own device. Those fields mean
+"this device owns this address".
+
+### Migration
+
+No rewrite of existing `unifi_mac` values. Leave the chassis MAC there.
+
+On the next apply, the sync creates the `unifi_macs` custom field (text) if
+it is missing, the same way it creates `unifi_mac`. A dry-run does not
+create custom fields.
+
+To claim the other port addresses, either:
+
+- set them on the device's interfaces (`mac_address`, or a MAC address
+  object assigned to the interface), or
+- put them in `unifi_macs`, for example `00:00:5e:00:53:11, 00:00:5e:00:53:12`
+
+Then delete the placeholder devices those addresses created. The next sync
+will not recreate them while the address stays owned by the real device. A
+placeholder that still has `unifi_mac` set to that address is still found by
+the exact match; delete it, or clear that field, once the owner is recorded.
 
 ## Syncing UniFi devices (switches, APs, gateways, PDUs)
 
@@ -262,17 +333,22 @@ are used instead of a generated outlet list.
 ## Finding your switches
 
 Cables can only be created once the tool knows which NetBox device is the
-switch UniFi is reporting. It tries four joins, in descending order of
+switch UniFi is reporting. It tries these joins, in descending order of
 precision, and logs which one matched:
 
 0. If `SYNC_UNIFI_DEVICES=true`, the switch was very likely created by this
    tool with an exact `unifi_mac`, so strategy 2 below matches immediately
    and none of this is a concern.
-1. A NetBox **interface** whose `mac_address` equals the switch MAC.
+1. A NetBox **interface** whose `mac_address` equals the switch MAC. If that
+   field is empty, a MAC address object assigned to an interface is tried
+   next (`MATCH_OWNED_MACS=true`, the default).
 2. A NetBox **device** with a `unifi_mac` custom field equal to the switch MAC.
-3. A NetBox **device serial** matching the switch's serial, or its MAC in
+3. A NetBox **device** whose `unifi_macs` field (or a multi-value `unifi_mac`)
+   lists the switch MAC. See "One device, several MACs". Turned off with
+   `MATCH_OWNED_MACS=false`.
+4. A NetBox **device serial** matching the switch's serial, or its MAC in
    either `aa:bb:cc:…` or `aabbcc…` form.
-4. A NetBox **device name** equal to the switch's name in UniFi.
+5. A NetBox **device name** equal to the switch's name in UniFi.
 
 Strategy 1 alone was the original behavior, and it is the reason cables were
 often not created despite the switches being present: switch interfaces
@@ -511,6 +587,7 @@ full list and defaults. Key ones:
 | `UNIFI_GATEWAY_ROLE_SLUG` | Role for gateways (default `router`; recommended `gateway`) |
 | `UNIFI_POWER_ROLE_SLUG` | Role for PDUs, RPS, and UPS hardware (default `pdu`) |
 | `MERGE_CLIENT_INFRA` | Convert a tagged client device into the adopted UniFi device with the same MAC (default `true`). `false` leaves it and does not create a duplicate |
+| `MATCH_OWNED_MACS` | `true` (default). A device also owns MACs listed in `unifi_macs` and MACs on its interfaces, so those UniFi clients are not created as placeholders. `false` keeps the single `unifi_mac` join. See "One device, several MACs" |
 | `UNIFI_INVENTORY_SITES` | Comma-separated UniFi API names and/or `_id`s whose devices are staging stock (default empty) |
 | `INVENTORY_DEVICE_STATUS` | NetBox status for devices synced from an inventory site (default `inventory`) |
 | `USE_OUI_MANUFACTURER` | Give clients a device type carrying their real vendor (default `true`) — see "Manufacturers" |
@@ -962,6 +1039,9 @@ every push/PR.
 
 ## Design notes
 
+- `macs.py` — extra MAC ownership: `unifi_macs`, a multi-value `unifi_mac`,
+  interface `mac_address`, and MAC address objects. Exact `unifi_mac` stays
+  a single address.
 - `unifi_client.py` — thin REST client for the UniFi controller (login,
   active clients, client history with `last_seen`, infrastructure devices).
 - `portmatch.py` — UniFi port index to NetBox interface name: templates,

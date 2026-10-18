@@ -202,6 +202,18 @@ class CachingNetboxGateway:
     def legacy_eth0_plan(self, device: Any, interface_names: list[str]) -> str:
         return self._inner.legacy_eth0_plan(device, interface_names)
 
+    def configure_match_owned_macs(self, enabled: bool) -> None:
+        configure = getattr(self._inner, "configure_match_owned_macs", None)
+        if configure is not None:
+            configure(enabled)
+
+    def find_owned_mac_device(self, mac: str) -> tuple[Any, str] | None:
+        """Delegate. The inner gateway holds the prefetched extra-MAC index."""
+        finder = getattr(self._inner, "find_owned_mac_device", None)
+        if finder is None:
+            return None
+        return finder(mac)
+
     def find_client_device_by_mac(self, mac: str) -> Any | None:
         devices = self._mac_snapshot()
         matcher = getattr(self._inner, "match_client_device", None)
@@ -364,11 +376,17 @@ class CachingNetboxGateway:
 
         Failures degrade to the per-object lookups. A partial index is not
         treated as complete: only a successful bulk load sets the snapshot.
+
+        Extra MAC ownership (``unifi_macs`` and interface addresses) is indexed
+        from the same load. A miss there does not issue a per-client filter
+        when that index is complete.
         """
         start = time.monotonic()
         self._active = True
+        self._interface_load_failed = False
         slugs = list(dict.fromkeys(site_slugs))
         mac_devices = self._load_mac_index()
+        extra_devices = self._load_extra_mac_devices()
         site_devices: list[Any] = []
         interfaces: list[Any] = []
         for slug in slugs:
@@ -377,13 +395,34 @@ class CachingNetboxGateway:
                 continue
             site_devices.extend(loaded)
             interfaces.extend(self._load_interfaces(loaded))
+        # Devices known by MAC but living at a site this run is not syncing
+        # still own their port addresses. Load only the ones not already fetched.
+        # Do not remember those interfaces on the per-device cache: a switch
+        # found later by MAC still pays the one list_device_interfaces call
+        # the port matcher expects, and this load is only for the owned-MAC index.
+        interfaces.extend(
+            self._load_interfaces(
+                self._devices_missing_interfaces((mac_devices or []) + (extra_devices or [])),
+                remember=False,
+            )
+        )
+        mac_objects = self._load_mac_objects()
         self._publish_switch_index(mac_devices, site_devices, interfaces)
+        self._publish_owned_index(
+            mac_devices,
+            site_devices,
+            extra_devices,
+            interfaces,
+            mac_objects,
+        )
         self.prefetch_seconds = time.monotonic() - start
         logger.info(
             "Prefetched NetBox index for %d site(s) in %.2fs (%d device record(s), %d interface(s))",
             len(slugs),
             self.prefetch_seconds,
-            len(site_devices) + (0 if mac_devices is None else len(mac_devices)),
+            len(site_devices)
+            + (0 if mac_devices is None else len(mac_devices))
+            + (0 if not extra_devices else len(extra_devices)),
             len(interfaces),
         )
 
@@ -421,7 +460,7 @@ class CachingNetboxGateway:
             self._site_devices[site_slug] = list(devices)
         return devices
 
-    def _load_interfaces(self, devices: list[Any]) -> list[Any]:
+    def _load_interfaces(self, devices: list[Any], *, remember: bool = True) -> list[Any]:
         loader = getattr(self._inner, "bulk_interfaces", None)
         if loader is None or not devices:
             return []
@@ -432,9 +471,76 @@ class CachingNetboxGateway:
             logger.warning("Bulk interface load failed (%s); interfaces will be fetched per device", exc)
             return []
         if interfaces is None:
+            self._interface_load_failed = True
             return []
-        self._store_interfaces(devices, interfaces)
+        if remember:
+            self._store_interfaces(devices, interfaces)
         return list(interfaces)
+
+    def _devices_missing_interfaces(self, devices: list[Any]) -> list[Any]:
+        with self._lock:
+            have = set(self._device_interfaces)
+        missing: list[Any] = []
+        seen: set[Any] = set()
+        for device in devices:
+            device_id = getattr(device, "id", None)
+            if device_id is None or device_id in have or device_id in seen:
+                continue
+            seen.add(device_id)
+            missing.append(device)
+        return missing
+
+    def _load_extra_mac_devices(self) -> list[Any] | None:
+        loader = getattr(self._inner, "bulk_devices_with_extra_macs", None)
+        if loader is None:
+            return []
+        try:
+            devices = loader()
+        except Exception as exc:
+            logger.warning("Bulk load of extra MACs failed (%s); unifi_macs on other devices may be missed", exc)
+            return None
+        return devices
+
+    def _load_mac_objects(self) -> list[Any] | None:
+        loader = getattr(self._inner, "bulk_mac_address_objects", None)
+        if loader is None:
+            return []
+        try:
+            return loader()
+        except Exception as exc:
+            logger.warning("Bulk load of MAC address objects failed (%s)", exc)
+            return None
+
+    def _publish_owned_index(
+        self,
+        mac_devices: list[Any] | None,
+        site_devices: list[Any],
+        extra_devices: list[Any] | None,
+        interfaces: list[Any],
+        mac_objects: list[Any] | None,
+    ) -> None:
+        note = getattr(self._inner, "note_owned_mac_sources", None)
+        if note is None:
+            return
+        # A failed MAC bulk means we do not know every unifi_mac, so an owned
+        # miss must not be treated as proof. Interface load failure is the same.
+        complete = mac_devices is not None and not getattr(self, "_interface_load_failed", False)
+        seen: set[Any] = set()
+        devices: list[Any] = []
+        for device in (mac_devices or []) + site_devices + (extra_devices or []):
+            marker = getattr(device, "id", None)
+            key = marker if marker is not None else id(device)
+            if key in seen:
+                continue
+            seen.add(key)
+            devices.append(device)
+        note(
+            devices,
+            interfaces,
+            mac_objects if isinstance(mac_objects, list) else [],
+            complete=complete,
+            mac_objects_indexed=isinstance(mac_objects, list),
+        )
 
     def _store_interfaces(self, devices: list[Any], interfaces: list[Any]) -> None:
         by_device: dict[Any, list[Any]] = {}

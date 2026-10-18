@@ -67,7 +67,7 @@ def _interface_type_value(interface: object) -> str:
 
 def _switch_match_rank(strategy: str) -> int:
     """Lower is a better claim on a NetBox device. MAC beats name."""
-    if strategy in ("interface MAC", "unifi_mac custom field"):
+    if strategy in ("interface MAC", "unifi_mac custom field", "unifi_macs custom field"):
         return 0
     if strategy == "serial":
         return 1
@@ -381,6 +381,9 @@ class SyncEngine:
     def run(self) -> SyncSummary:
         start = time.monotonic()
         self._uplink_queue = []
+        configure = getattr(self.netbox, "configure_match_owned_macs", None)
+        if configure is not None:
+            configure(self.settings.match_owned_macs)
         if self.settings.sync_all_sites:
             pairs = self._discover_site_pairs()
         else:
@@ -421,12 +424,13 @@ class SyncEngine:
         workers = max(1, min(self.settings.max_workers, len(groups)))
         logger.info(
             "Policies: site=%s, device_update=%s, cable_conflict=%s, merge_client_infra=%s, "
-            "inventory_sites=%s | %d pair(s) in %d NetBox site group(s), %d worker(s), "
-            "prefetch=%s, fast_path=%s",
+            "match_owned_macs=%s, inventory_sites=%s | %d pair(s) in %d NetBox site group(s), "
+            "%d worker(s), prefetch=%s, fast_path=%s",
             self.settings.site_policy,
             self.settings.device_update_policy,
             self.settings.cable_conflict_policy,
             self.settings.merge_client_infra,
+            self.settings.match_owned_macs,
             ",".join(self.settings.inventory_site_ids) or "(none)",
             len(pairs),
             len(groups),
@@ -1607,7 +1611,8 @@ class SyncEngine:
             hints = self._switch_hints.get(mac)
         logger.warning(
             "No NetBox device found for UniFi switch %s%s, so its cables are skipped. Tried: "
-            "interface mac_address, device custom field unifi_mac, device serial, device name. "
+            "interface mac_address, MAC address objects on interfaces, device custom field "
+            "unifi_mac, device custom field unifi_macs, device serial, device name. "
             "No infrastructure device will be created. Match an existing NetBox device "
             "(same name as UniFi, its serial, or a unifi_mac custom field) or inventory the "
             "switch yourself.",
@@ -1821,6 +1826,13 @@ class SyncEngine:
         iface_name = _interface_name(client, self.settings.client_wired_interface_name)
         try:
             existing = self.netbox.find_client_device_by_mac(client.mac)
+            if existing is None:
+                owned = self._owned_client(client.mac)
+                if owned is not None:
+                    # Not the primary unifi_mac. Do not create a placeholder and
+                    # do not rewrite the device that already owns the address.
+                    self._skip_owned_client(client, owned[0], owned[1], result)
+                    return result
             if existing is not None and not device_has_tag(existing, s.sync_tag):
                 logger.warning(
                     "Leaving NetBox device %r (%s) untouched: it is not tagged %r. "
@@ -1941,6 +1953,50 @@ class SyncEngine:
             listed = ", ".join(sorted(managed)) or "(none)"
             reasons.append(f"role {role!r} is not a managed client role ({listed})")
         return "; ".join(reasons) if reasons else "not a managed client device"
+
+    def _owned_client(self, mac: str) -> tuple[object, str] | None:
+        """Device that owns ``mac`` via ``unifi_macs`` or an interface address.
+
+        None when the feature is off, the gateway has no such lookup, or the
+        address is not owned. Exact ``unifi_mac`` is resolved by the caller
+        before this runs.
+        """
+        if not self.settings.match_owned_macs:
+            return None
+        finder = getattr(self.netbox, "find_owned_mac_device", None)
+        if finder is None or not callable(finder):
+            return None
+        found = finder(mac)
+        if not found:
+            return None
+        try:
+            device, via = found
+        except (TypeError, ValueError):
+            return None
+        if device is None:
+            return None
+        return device, str(via or "owned MAC")
+
+    def _skip_owned_client(
+        self, client: UnifiClient, device: object, via: str, result: ClientSyncResult
+    ) -> None:
+        """The MAC belongs to a device that already exists. No second device.
+
+        The client's IP is not written onto the owner. That address is often
+        a second port of a gateway, and copying it would move the owner's
+        primary IP or add a client interface the owner does not use.
+        """
+        result.name = getattr(device, "name", None) or result.name
+        result.unchanged = True
+        prefix = "[dry-run] " if self.settings.dry_run else ""
+        logger.info(
+            "%sUniFi client %s is owned by NetBox device %r via %s; not creating a placeholder "
+            "device. Its IP is not copied onto that device.",
+            prefix,
+            client.mac,
+            result.name,
+            via,
+        )
 
     def _skip_client_placeholder(self, client: UnifiClient, existing: object, result: ClientSyncResult) -> None:
         """One log line. No interface, IP, cable, or second device."""
