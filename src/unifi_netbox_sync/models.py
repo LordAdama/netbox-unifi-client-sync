@@ -200,8 +200,11 @@ class SyncSummary:
     infra_moved: int = 0
     # MAC/serial matches that were not created again (inventory or other site).
     infra_duplicates_avoided: int = 0
-    # Legacy merges skipped because another device already holds the target
-    # name at the site. Also counted in infra_duplicates_avoided.
+    # A same-site name that is not this UniFi device: a legacy merge that would
+    # rename onto a name someone else holds, or a name fallback refused because
+    # the manufacturer, serial, or unifi_mac disagrees. The refused device is
+    # left alone. A new UniFi device is created under a MAC-suffixed name.
+    # Legacy merges are also counted in infra_duplicates_avoided.
     infra_name_conflicts: int = 0
     # Infra-to-infra cables from UniFi uplink data.
     uplink_cables_created: int = 0

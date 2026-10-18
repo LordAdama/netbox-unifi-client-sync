@@ -14,6 +14,7 @@ import requests
 from pynetbox.core.query import Request
 
 from .devicetype_library import normalize_model
+from .identity import name_fallback_conflict
 from .macs import (
     EXTRA_MACS_FIELD,
     PRIMARY_MAC_FIELD,
@@ -702,7 +703,7 @@ class PynetboxGateway:
             ("unifi_mac custom field", lambda: self._switch_by_unifi_mac(mac)),
             ("unifi_macs custom field", lambda: self._switch_by_unifi_macs(mac)),
             ("serial", lambda: self._switch_by_serial(mac, hints)),
-            ("device name", lambda: self._switch_by_name(hints)),
+            ("device name", lambda: self._switch_by_name(mac, hints)),
         ):
             device = finder()
             if device is not None:
@@ -776,10 +777,31 @@ class PynetboxGateway:
                 return device
         return None
 
-    def _switch_by_name(self, hints: SwitchHints | None) -> Any | None:
+    def _switch_by_name(self, mac: str, hints: SwitchHints | None) -> Any | None:
         if not hints or not hints.name:
             return None
-        return self._first(self.api.dcim.devices.filter(name=hints.name, limit=getattr(self, "page_size", 1000)))
+        device = self._first(
+            self.api.dcim.devices.filter(name=hints.name, limit=getattr(self, "page_size", 1000))
+        )
+        if device is None:
+            return None
+        # The first row is the one this filter returns. A rejected hit is not
+        # replaced with a later device of the same name: that device may live
+        # at another site.
+        reason = name_fallback_conflict(device, mac=mac, serial=hints.serial or "")
+        if not reason:
+            return device
+        self._warn_once(
+            f"name-fallback:{getattr(device, 'id', hints.name)}",
+            "Not matching UniFi device %s %r to NetBox device id=%s %r by name: %s. "
+            "That device will not be updated or cabled as this UniFi device.",
+            mac,
+            hints.name,
+            getattr(device, "id", ""),
+            getattr(device, "name", ""),
+            reason,
+        )
+        return None
 
     def _switch_by_unifi_mac(self, mac: str) -> Any | None:
         index = self._pref_by_mac
@@ -1889,8 +1911,10 @@ class PynetboxGateway:
         4. Name, and only inside ``site_slug``.
 
         Name is same-site on purpose: two sites may both have a device called
-        "core-switch". MAC and serial are the chassis, so they are global and
-        a hit means "do not create another one".
+        "core-switch". A name hit is kept only when the device is Ubiquiti (or
+        has no manufacturer recorded) and its serial and ``unifi_mac`` do not
+        disagree with this UniFi device. MAC and serial joins stay global: a
+        hit means "do not create another one".
         """
         mac = (mac or "").lower()
         compact = mac.replace(":", "")
@@ -1924,7 +1948,19 @@ class PynetboxGateway:
         if name and site_slug and name.lower() not in {compact, mac} and self._site_exists(site_slug):
             by_name = self._first(self.api.dcim.devices.filter(name=name, site=site_slug))
             if by_name is not None:
-                return by_name, "name"
+                reason = name_fallback_conflict(by_name, mac=mac, serial=serial)
+                if not reason:
+                    return by_name, "name"
+                self._warn_once(
+                    f"name-fallback:{getattr(by_name, 'id', name)}",
+                    "Not matching UniFi device %s %r to NetBox device id=%s %r by name: %s. "
+                    "That device will not be updated or cabled as this UniFi device.",
+                    mac,
+                    name,
+                    getattr(by_name, "id", ""),
+                    getattr(by_name, "name", ""),
+                    reason,
+                )
         return None, ""
 
     def _device_by_unifi_mac(self, mac: str) -> Any | None:

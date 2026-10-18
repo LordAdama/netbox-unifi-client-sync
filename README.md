@@ -284,7 +284,14 @@ one of the inventory sites. A move between two real sites happens only when
 is and the run logs that the duplicate was avoided.
 
 Name matching stays inside one NetBox site. The same name at another site
-is a different device.
+is a different device. A same-site name is used only when that NetBox device
+is Ubiquiti, or its manufacturer was not recorded, and any serial or
+`unifi_mac` both sides have does not disagree. Another vendor that shares
+the name is not the UniFi device: the run logs the reason, leaves that
+device unchanged, does not cable it as the UniFi device, and creates the
+UniFi device under a name with the MAC's last four hex digits when the
+original name is already taken. That conflict is counted in
+`infra_name_conflicts`.
 
 ### devicetype-library
 
@@ -352,13 +359,21 @@ precision, and logs which one matched:
    `MATCH_OWNED_MACS=false`.
 4. A NetBox **device serial** matching the switch's serial, or its MAC in
    either `aa:bb:cc:…` or `aabbcc…` form.
-5. A NetBox **device name** equal to the switch's name in UniFi.
+5. A NetBox **device name** equal to the switch's name in UniFi, when that
+   device is Ubiquiti (or has no manufacturer recorded) and its serial and
+   `unifi_mac` do not disagree with UniFi. A device from another vendor that
+   only shares the name is not selected.
 
 Strategy 1 alone was the original behavior, and it is the reason cables were
 often not created despite the switches being present: switch interfaces
 usually have no `mac_address` populated, and where they do, a port's MAC is
-not the chassis MAC UniFi reports. The other three fix that; **naming the
-NetBox device the same as UniFi does is usually all that's needed.**
+not the chassis MAC UniFi reports. The other joins fix that. **Naming the
+NetBox device the same as UniFi does is usually all that's needed** when that
+device is the Ubiquiti chassis. Number-only port guesses (a structural name
+such as `GigabitEthernet1/0/4`, or an interface whose trailing number equals
+the port) are not applied to a device whose manufacturer is some other
+vendor. Exact template names still match. An untagged device in the same
+site is logged as a same-site match, not a cross-site one.
 
 If a switch still can't be found, the run logs a warning naming it and
 listing what was tried. If the switch is found but a port isn't, the warning
@@ -1043,6 +1058,9 @@ every push/PR.
 
 ## Design notes
 
+- `identity.py` — name fallback. A shared name matches only a Ubiquiti device
+  (or one with no manufacturer recorded) whose serial and `unifi_mac` do not
+  disagree. Number-only port guesses are not used on another vendor.
 - `macs.py` — extra MAC ownership: `unifi_macs`, a multi-value `unifi_mac`,
   interface `mac_address`, and MAC address objects. Exact `unifi_mac` stays
   a single address.

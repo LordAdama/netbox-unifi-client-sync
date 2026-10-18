@@ -8,6 +8,7 @@ from itertools import count
 
 logger = logging.getLogger(__name__)
 
+from unifi_netbox_sync.identity import name_fallback_conflict
 from unifi_netbox_sync.models import UnifiClient, UnifiKnownClient, UnifiSite, UnifiSwitchDevice
 
 _id_counter = count(1)
@@ -56,6 +57,8 @@ class FakeDevice:
         self.interfaces: dict[str, FakeInterface] = {}
         self.site_slug = site_slug
         self.serial: str | None = None
+        # Empty means the vendor was not recorded. A name match still applies.
+        self.manufacturer: str = ""
         self.device_type = None
         self.role_slug: str | None = None
         self.device_type_slug: str | None = None
@@ -161,6 +164,18 @@ class FakeNetboxGateway:
         if hints is not None:
             for candidate in list(self.switches.values()) + self.switches_without_mac:
                 if hints.name and candidate.name == hints.name:
+                    reason = name_fallback_conflict(candidate, mac=mac, serial=hints.serial or "")
+                    if reason:
+                        logger.warning(
+                            "Not matching UniFi device %s %r to NetBox device id=%s %r by name: %s. "
+                            "That device will not be updated or cabled as this UniFi device.",
+                            mac,
+                            hints.name,
+                            candidate.id,
+                            candidate.name,
+                            reason,
+                        )
+                        continue
                     return candidate, "device name"
                 if hints.serial and candidate.serial == hints.serial:
                     return candidate, "serial"
@@ -278,6 +293,18 @@ class FakeNetboxGateway:
         if name and name.lower() not in {compact, mac}:
             for device in devices:
                 if device.name == name and device.site_slug in (site_slug, None, ""):
+                    reason = name_fallback_conflict(device, mac=mac, serial=serial or "")
+                    if reason:
+                        logger.warning(
+                            "Not matching UniFi device %s %r to NetBox device id=%s %r by name: %s. "
+                            "That device will not be updated or cabled as this UniFi device.",
+                            mac,
+                            name,
+                            device.id,
+                            device.name,
+                            reason,
+                        )
+                        continue
                     return device, "name"
         return None, ""
 

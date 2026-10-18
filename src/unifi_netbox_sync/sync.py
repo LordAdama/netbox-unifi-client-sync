@@ -15,6 +15,7 @@ import requests
 
 from .config import Settings
 from .devicetype_library import DeviceTypeLibrary, spec_from_unifi_device
+from .identity import allows_number_only_ports, name_fallback_conflict
 from .model_map import device_kind
 from .metrics import log_json_summary, write_prometheus_textfile
 from .models import CableSkip, ClientSyncResult, SitePair, SiteSyncStats, SyncSummary, UnifiClient
@@ -1086,10 +1087,15 @@ class SyncEngine:
 
         if existing is not None and not tagged:
             summary.infra_duplicates_avoided += 1
+            # Name, MAC, and serial can all hit a device in this same site.
+            # Call it cross-site only when the NetBox device actually lives
+            # somewhere else.
+            scope = "cross-site" if cross_site else "same-site"
             logger.info(
-                "%scross-site match avoided: UniFi %s %r (%s) matches untagged NetBox device "
+                "%s%s match avoided: UniFi %s %r (%s) matches untagged NetBox device "
                 "id=%s %r at site %r by %s; not creating a duplicate",
                 prefix,
+                scope,
                 kind,
                 device.name,
                 device.model,
@@ -1191,6 +1197,31 @@ class SyncEngine:
         if legacy:
             eth0_plan = self.netbox.legacy_eth0_plan(existing, interface_names)
 
+        create_name = device.name
+        if existing is None and device.name:
+            holder = self.netbox.find_device_name_conflict(
+                device.name, pair.netbox_site_slug, None
+            )
+            conflict = (
+                name_fallback_conflict(holder, mac=mac, serial=serial) if holder is not None else ""
+            )
+            if holder is not None and conflict:
+                create_name = mac_suffixed_name(device.name, mac)
+                summary.infra_name_conflicts += 1
+                logger.warning(
+                    "%sUniFi %s %r was not matched to NetBox device id=%s %r at site %r (%s). "
+                    "Creating it as %r. The existing device is left unchanged and is not cabled "
+                    "as this UniFi device.",
+                    prefix,
+                    kind,
+                    device.name,
+                    getattr(holder, "id", ""),
+                    getattr(holder, "name", ""),
+                    pair.netbox_site_slug,
+                    conflict,
+                    create_name,
+                )
+
         if s.dry_run:
             # Count on the local summary so the site line shows the plan.
             # The caller discards these counts for a dry-run.
@@ -1244,7 +1275,7 @@ class SyncEngine:
                     "[dry-run] would create %s %r (%s) role=%r status=%s type=%r source=%s "
                     "interfaces=%d power_outlets=%d",
                     kind,
-                    device.name,
+                    create_name,
                     device.model,
                     role_slug,
                     status,
@@ -1272,7 +1303,7 @@ class SyncEngine:
         type_slug = self.netbox.ensure_device_type_from_spec(spec)
         _dev, created, updated = self.netbox.upsert_infrastructure_device(
             mac,
-            device.name,
+            create_name,
             pair.netbox_site_slug,
             role_slug,
             type_slug,
@@ -1301,7 +1332,7 @@ class SyncEngine:
                 "Created %s %r (%s) role=%r status=%s type=%r source=%s "
                 "interfaces=%d power_outlets=%d",
                 kind,
-                device.name,
+                create_name,
                 device.model,
                 role_slug,
                 status,
@@ -1492,12 +1523,16 @@ class SyncEngine:
         interfaces = self._interfaces(netbox_device)
         names = [getattr(iface, "name", "") for iface in interfaces]
         types = [_interface_type_value(iface) for iface in interfaces]
+        # Number-only guesses (structural names and a trailing port number)
+        # stay off for a device whose manufacturer is not Ubiquiti. Exact
+        # template names still match.
+        number_guess = allows_number_only_ports(netbox_device)
         outcome = match_uplink_port(
             names,
             candidates,
             port_no,
             sfp_index,
-            allow_fallback=not model_templates,
+            allow_fallback=(not model_templates) and number_guess,
             interface_types=types,
             pinned_count=model_candidate_count(model_templates, port_no, sfp_index),
         )
@@ -1627,8 +1662,9 @@ class SyncEngine:
             "interface mac_address, MAC address objects on interfaces, device custom field "
             "unifi_mac, device custom field unifi_macs, device serial, device name. "
             "No infrastructure device will be created. Match an existing NetBox device "
-            "(same name as UniFi, its serial, or a unifi_mac custom field) or inventory the "
-            "switch yourself.",
+            "(a Ubiquiti device with the same name, its serial, or a unifi_mac custom field) "
+            "or inventory the switch yourself. A device from another vendor that shares the "
+            "name is not used.",
             mac,
             f" (named {hints.name!r} in UniFi)" if hints and hints.name else "",
         )
@@ -2451,7 +2487,7 @@ class SyncEngine:
             candidates,
             port_no,
             sfp_index,
-            allow_structural=not model_templates,
+            allow_structural=(not model_templates) and allows_number_only_ports(switch_device),
             zero_based=False,
         )
         if outcome.via == "ambiguous" or outcome.name is None:
