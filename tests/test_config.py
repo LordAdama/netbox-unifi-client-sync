@@ -277,6 +277,18 @@ def test_managed_client_roles_and_opt_out_tag_are_configurable(monkeypatch):
     assert settings.sync_unmanaged_tag == "leave-alone"
 
 
+def test_create_suffixed_on_name_conflict_defaults_off(monkeypatch):
+    monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("CREATE_SUFFIXED_ON_NAME_CONFLICT", raising=False)
+
+    assert Settings.from_env().create_suffixed_on_name_conflict is False
+
+    monkeypatch.setenv("CREATE_SUFFIXED_ON_NAME_CONFLICT", "true")
+    assert Settings.from_env().create_suffixed_on_name_conflict is True
+
+
 def test_match_owned_macs_defaults_on_and_can_be_disabled(monkeypatch):
     monkeypatch.setenv("UNIFI_API_KEY", "secret-key")
     for key, value in REQUIRED_ENV.items():

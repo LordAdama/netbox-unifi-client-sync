@@ -316,6 +316,11 @@ def test_uplink_gateway_port_2_uses_eth1():
 
 
 def test_uplink_name_match_does_not_plan_a_second_cable(caplog):
+    """A second UniFi device with the same name but another serial is not gw-lab.
+
+    Only the device whose serial matches plans an uplink. The other is not
+    cabled onto those interfaces.
+    """
     netbox = FakeNetboxGateway()
     _seed(netbox, SWITCH_MAC, "core-switch", ["Port 4"], "F09FC2AAAA01")
     mac_match = "aa:bb:cc:dd:ee:51"
@@ -344,14 +349,17 @@ def test_uplink_name_match_does_not_plan_a_second_cable(caplog):
     assert caplog.text.count("would create uplink cable") == 1
     assert "gw-lab:eth0" in caplog.text
     assert name_match in caplog.text
-    assert "Skipping the uplink cable" in caplog.text
+    # A different serial is a different chassis, so the shared name is not a
+    # match and the second uplink is not planned onto gw-lab.
+    assert "serial differs" in caplog.text
+    assert "not found in NetBox" in caplog.text
 
 
 def test_uplink_duplicate_across_sites_keeps_the_mac_match(caplog):
-    """A name match in one UniFi site and a MAC match in another share a device.
+    """A same name in another site with a different serial is not that device.
 
-    The duplicate check is for the whole run, so the name match is skipped
-    and the dry-run plans the uplink once.
+    The MAC match still plans one uplink. The other chassis is not cabled
+    onto it.
     """
     netbox = FakeNetboxGateway()
     _seed(netbox, SWITCH_MAC, "core-switch", ["Port 4"], "F09FC2AAAA01")
@@ -397,7 +405,8 @@ def test_uplink_duplicate_across_sites_keeps_the_mac_match(caplog):
     assert "gw-lab:eth0" in caplog.text
     assert name_match in caplog.text
     assert "site-b" in caplog.text
-    assert "Skipping the uplink cable" in caplog.text
+    assert "serial differs" in caplog.text
+    assert "not found in NetBox" in caplog.text
 
 
 def test_client_wired_interface_name_is_configurable():

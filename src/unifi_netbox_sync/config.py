@@ -321,6 +321,12 @@ class Settings:
     # is not created as a second device. Exact unifi_mac matching is unchanged.
     # false keeps the previous single-field join.
     match_owned_macs: bool = True
+    # When a same-site name is already held by a device this UniFi device must
+    # not be linked to, create another device whose name ends in the MAC.
+    # Off by default: a stale hand-made record, or two UniFi devices that share
+    # a name, must not grow a duplicate on the first pass. The conflict is
+    # still logged and counted.
+    create_suffixed_on_name_conflict: bool = False
     # UniFi site ids (API name and/or internal _id) whose adopted devices are
     # inventory or failed-unit staging. Empty disables the behaviour.
     inventory_site_ids: tuple[str, ...] = ()
@@ -442,6 +448,9 @@ class Settings:
             unifi_power_role_slug=os.environ.get("UNIFI_POWER_ROLE_SLUG", "pdu"),
             merge_client_infra=_bool(os.environ.get("MERGE_CLIENT_INFRA", "true")),
             match_owned_macs=_bool(os.environ.get("MATCH_OWNED_MACS", "true")),
+            create_suffixed_on_name_conflict=_bool(
+                os.environ.get("CREATE_SUFFIXED_ON_NAME_CONFLICT", "false")
+            ),
             inventory_site_ids=_csv_tokens(os.environ.get("UNIFI_INVENTORY_SITES", "")),
             inventory_device_status=_device_status(
                 os.environ.get("INVENTORY_DEVICE_STATUS", "inventory"),
