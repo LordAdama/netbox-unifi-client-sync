@@ -4,7 +4,7 @@ Name is the weakest join. It is accepted when the NetBox device looks like
 the same chassis: manufacturer is Ubiquiti or was not recorded, and a serial
 or ``unifi_mac`` that both sides have does not disagree. A recorded
 manufacturer other than Ubiquiti is a different device that happens to share
-a name.
+a name. A serial that is a MAC address is compared to the UniFi MAC.
 """
 
 from __future__ import annotations
@@ -14,6 +14,9 @@ from typing import Any
 
 _UNIFI_VENDOR = re.compile(r"ubiquiti|ubnt", re.IGNORECASE)
 _TOKEN = re.compile(r"[^a-z0-9]")
+# 12 hex digits after separators are stripped. Ubiquiti often stores the MAC
+# in the serial field; a longer or shorter hex string stays a serial.
+_MAC_SHAPE = re.compile(r"^[0-9a-f]{12}$")
 
 
 def _text(value: object) -> str:
@@ -90,16 +93,23 @@ def name_fallback_conflict(device: Any, *, mac: str, serial: str) -> str:
 
     Serial and ``unifi_mac`` are checked only when both sides have a value.
     A missing serial does not reject a same-vendor name match.
+
+    A NetBox serial that normalizes to a MAC (12 hex digits, separators
+    ignored) is that chassis MAC, not a sticker serial. It is compared to
+    the UniFi MAC. A mismatch is a different or replaced device.
     """
     if is_unifi_vendor(device) is False:
         labels = ", ".join(manufacturer_labels(device)) or "unknown"
         return f"manufacturer is {labels}, not Ubiquiti"
     theirs = _norm(getattr(device, "serial", None))
     ours = _norm(serial)
-    if theirs and ours and theirs != ours:
+    wanted = _norm(mac)
+    if theirs and _MAC_SHAPE.fullmatch(theirs):
+        if wanted and theirs != wanted:
+            return "serial differs from the UniFi MAC"
+    elif theirs and ours and theirs != ours:
         return "serial differs"
     stored = _norm(_custom_field(device, "unifi_mac"))
-    wanted = _norm(mac)
     if stored and wanted and stored != wanted:
         return "unifi_mac differs"
     return ""

@@ -286,11 +286,16 @@ is and the run logs that the duplicate was avoided.
 Name matching stays inside one NetBox site. The same name at another site
 is a different device. A same-site name is used only when that NetBox device
 is Ubiquiti, or its manufacturer was not recorded, and any serial or
-`unifi_mac` both sides have does not disagree. Another vendor that shares
-the name is not the UniFi device: the run logs the reason, leaves that
-device unchanged, does not cable it as the UniFi device, and creates the
-UniFi device under a name with the MAC's last four hex digits when the
-original name is already taken. That conflict is counted in
+`unifi_mac` both sides have does not disagree. A serial that is a MAC (12
+hex digits, with or without separators) is compared to the UniFi MAC rather
+than to the UniFi serial. That is how Ubiquiti gear is often recorded, and
+it keeps a stale hand-made record of replaced hardware from being treated as
+the new device. Another vendor that shares the name, or a serial or MAC that
+disagrees, is not the UniFi device: the run logs the reason, leaves that
+device unchanged, does not cable it as the UniFi device, and does not create
+a second one. Set `CREATE_SUFFIXED_ON_NAME_CONFLICT=true` to create the UniFi
+device under a name with the MAC's last four hex digits when the original
+name is already taken. Either way the conflict is counted in
 `infra_name_conflicts`.
 
 ### devicetype-library
@@ -361,8 +366,9 @@ precision, and logs which one matched:
    either `aa:bb:cc:…` or `aabbcc…` form.
 5. A NetBox **device name** equal to the switch's name in UniFi, when that
    device is Ubiquiti (or has no manufacturer recorded) and its serial and
-   `unifi_mac` do not disagree with UniFi. A device from another vendor that
-   only shares the name is not selected.
+   `unifi_mac` do not disagree with UniFi. A serial written as a MAC is
+   compared to the UniFi MAC. A device from another vendor that only shares
+   the name is not selected.
 
 Strategy 1 alone was the original behavior, and it is the reason cables were
 often not created despite the switches being present: switch interfaces
@@ -607,6 +613,7 @@ full list and defaults. Key ones:
 | `UNIFI_POWER_ROLE_SLUG` | Role for PDUs, RPS, and UPS hardware (default `pdu`) |
 | `MERGE_CLIENT_INFRA` | Convert a tagged client device into the adopted UniFi device with the same MAC (default `true`). `false` leaves it and does not create a duplicate |
 | `MATCH_OWNED_MACS` | `true` (default). A device also owns MACs listed in `unifi_macs` and MACs on its interfaces, so those UniFi clients are not created as placeholders. `false` keeps the single `unifi_mac` join. See "One device, several MACs" |
+| `CREATE_SUFFIXED_ON_NAME_CONFLICT` | `false` (default). When a same-site name is already held by a device this UniFi device must not be linked to, skip it, log the reason, and count `infra_name_conflicts`. `true` creates that UniFi device under a name ending in the MAC's last four hex digits. See "Inventory and staging sites" |
 | `UNIFI_INVENTORY_SITES` | Comma-separated UniFi API names and/or `_id`s whose devices are staging stock (default empty) |
 | `INVENTORY_DEVICE_STATUS` | NetBox status for devices synced from an inventory site (default `inventory`) |
 | `USE_OUI_MANUFACTURER` | Give clients a device type carrying their real vendor (default `true`) — see "Manufacturers" |
@@ -1060,7 +1067,9 @@ every push/PR.
 
 - `identity.py` — name fallback. A shared name matches only a Ubiquiti device
   (or one with no manufacturer recorded) whose serial and `unifi_mac` do not
-  disagree. Number-only port guesses are not used on another vendor.
+  disagree. A MAC-shaped serial is compared to the UniFi MAC. A refused name
+  does not create a device unless `CREATE_SUFFIXED_ON_NAME_CONFLICT` is set.
+  Number-only port guesses are not used on another vendor.
 - `macs.py` — extra MAC ownership: `unifi_macs`, a multi-value `unifi_mac`,
   interface `mac_address`, and MAC address objects. Exact `unifi_mac` stays
   a single address.

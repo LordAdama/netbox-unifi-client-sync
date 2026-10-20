@@ -1913,8 +1913,9 @@ class PynetboxGateway:
         Name is same-site on purpose: two sites may both have a device called
         "core-switch". A name hit is kept only when the device is Ubiquiti (or
         has no manufacturer recorded) and its serial and ``unifi_mac`` do not
-        disagree with this UniFi device. MAC and serial joins stay global: a
-        hit means "do not create another one".
+        disagree with this UniFi device. A serial that is a MAC is compared
+        to this device's MAC. MAC and serial joins stay global: a hit means
+        "do not create another one".
         """
         mac = (mac or "").lower()
         compact = mac.replace(":", "")

@@ -1206,21 +1206,39 @@ class SyncEngine:
                 name_fallback_conflict(holder, mac=mac, serial=serial) if holder is not None else ""
             )
             if holder is not None and conflict:
-                create_name = mac_suffixed_name(device.name, mac)
                 summary.infra_name_conflicts += 1
-                logger.warning(
-                    "%sUniFi %s %r was not matched to NetBox device id=%s %r at site %r (%s). "
-                    "Creating it as %r. The existing device is left unchanged and is not cabled "
-                    "as this UniFi device.",
-                    prefix,
-                    kind,
-                    device.name,
-                    getattr(holder, "id", ""),
-                    getattr(holder, "name", ""),
-                    pair.netbox_site_slug,
-                    conflict,
-                    create_name,
-                )
+                suffixed = mac_suffixed_name(device.name, mac)
+                if s.create_suffixed_on_name_conflict:
+                    create_name = suffixed
+                    logger.warning(
+                        "%sUniFi %s %r was not matched to NetBox device id=%s %r at site %r (%s). "
+                        "Creating it as %r (CREATE_SUFFIXED_ON_NAME_CONFLICT). The existing device "
+                        "is left unchanged and is not cabled as this UniFi device.",
+                        prefix,
+                        kind,
+                        device.name,
+                        getattr(holder, "id", ""),
+                        getattr(holder, "name", ""),
+                        pair.netbox_site_slug,
+                        conflict,
+                        create_name,
+                    )
+                else:
+                    logger.warning(
+                        "%sUniFi %s %r was not matched to NetBox device id=%s %r at site %r (%s). "
+                        "Not creating a device; the name is already taken. Set "
+                        "CREATE_SUFFIXED_ON_NAME_CONFLICT=true to create %r instead. The existing "
+                        "device is left unchanged and is not cabled as this UniFi device.",
+                        prefix,
+                        kind,
+                        device.name,
+                        getattr(holder, "id", ""),
+                        getattr(holder, "name", ""),
+                        pair.netbox_site_slug,
+                        conflict,
+                        suffixed,
+                    )
+                    return
 
         if s.dry_run:
             # Count on the local summary so the site line shows the plan.

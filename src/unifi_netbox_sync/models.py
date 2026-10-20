@@ -203,8 +203,9 @@ class SyncSummary:
     # A same-site name that is not this UniFi device: a legacy merge that would
     # rename onto a name someone else holds, or a name fallback refused because
     # the manufacturer, serial, or unifi_mac disagrees. The refused device is
-    # left alone. A new UniFi device is created under a MAC-suffixed name.
-    # Legacy merges are also counted in infra_duplicates_avoided.
+    # left alone. A MAC-suffixed device is created only when
+    # CREATE_SUFFIXED_ON_NAME_CONFLICT is on; otherwise the UniFi device is
+    # skipped. Legacy merges are also counted in infra_duplicates_avoided.
     infra_name_conflicts: int = 0
     # Infra-to-infra cables from UniFi uplink data.
     uplink_cables_created: int = 0

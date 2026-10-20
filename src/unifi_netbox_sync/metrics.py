@@ -25,7 +25,7 @@ _HELP_TEXT = {
     "infra_moved": "Infrastructure devices moved to the UniFi site where they are adopted in the last sync run",
     "uplink_cables_created": "Infra-to-infra cables created from UniFi uplink data in the last sync run",
     "legacy_eth0_found": "Legacy eth0 interfaces reported on infrastructure devices in the last dry-run",
-    "infra_name_conflicts": "Same-site names that were not this UniFi device in the last sync run (legacy merge blocked, or a name fallback refused for manufacturer, serial, or MAC)",
+    "infra_name_conflicts": "Same-site names that were not this UniFi device in the last sync run (legacy merge blocked, or a name fallback refused for manufacturer, serial, or MAC). A suffixed device is created only when CREATE_SUFFIXED_ON_NAME_CONFLICT is set",
     "infra_duplicates_avoided": "Adopted UniFi devices not created because MAC or serial already existed in the last sync run",
     "infra_type_library": "Infrastructure device types taken from devicetype-library in the last sync run",
     "infra_type_generated": "Infrastructure device types built from UniFi data in the last sync run",
